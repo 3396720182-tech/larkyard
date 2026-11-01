@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>@LABEL@</string>
+  <key>ProgramArguments</key><array><string>@REPO@/bin/ticketd</string></array>
+  <key>WorkingDirectory</key><string>@TICKETD_HOME@</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ExitTimeOut</key><integer>45</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>@HOME@</string>
+    <key>PATH</key><string>@PATH@</string>
+    <key>LANG</key><string>zh_CN.UTF-8</string>
+    <key>TICKETD_HOME</key><string>@TICKETD_HOME@</string>
+    <key>LARK_CHANNEL</key><string>1</string>
+    <key>LARK_CHANNEL_HOME</key><string>@LC_HOME@</string>
+    <key>LARK_CHANNEL_PROFILE</key><string>@LC_PROFILE@</string>
+    <key>LARK_CHANNEL_CONFIG</key><string>@LC_HOME@/profiles/@LC_PROFILE@/lark-cli-source/config.json</string>
+    <key>LARKSUITE_CLI_CONFIG_DIR</key><string>@LC_HOME@/profiles/@LC_PROFILE@/lark-cli</string>
+  </dict>
+  <key>StandardOutPath</key><string>@TICKETD_HOME@/logs/daemon.out.log</string>
+  <key>StandardErrorPath</key><string>@TICKETD_HOME@/logs/daemon.err.log</string>
+</dict>
+</plist>

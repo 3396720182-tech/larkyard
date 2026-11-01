@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+# 个人配置不进仓库
+config.env
+CLAUDE.local.md
