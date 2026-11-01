@@ -74,7 +74,7 @@ UI strings (receipts, cards, prompts) are currently in Chinese.
 # 0. Install lark-channel-bridge per its README, bind the bot, and make sure you can chat with Claude Code from Feishu.
 #    Note the bridge workspace directory (the profile's workspaces.default, or what you passed to --workspace).
 
-git clone <your Larkyard repo URL> ~/larkyard && cd ~/larkyard
+git clone https://github.com/3396720182-tech/larkyard.git ~/larkyard && cd ~/larkyard
 scripts/install.sh                               # installs the daemon; creates ~/.ticketd/config.env on first run
 $EDITOR ~/.ticketd/config.env                    # set TICKETD_OWNER (your open_id) at minimum
 scripts/setup-workspace.sh <bridge workspace>    # add --force if a CLAUDE.md already exists (it is backed up first)

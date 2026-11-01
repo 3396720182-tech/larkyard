@@ -75,7 +75,7 @@ Larkyard 的做法：**bridge 里的会话只做判断和派单**，长任务交
 #    记下 bridge 的工作目录（profile 的 workspaces.default，或你用 --workspace 指定的目录）。
 
 # 1. 取代码
-git clone <你的 Larkyard 仓库地址> ~/larkyard && cd ~/larkyard
+git clone https://github.com/3396720182-tech/larkyard.git ~/larkyard && cd ~/larkyard
 
 # 2. 安装 ticketd 服务（首次会生成 ~/.ticketd/config.env）
 scripts/install.sh
