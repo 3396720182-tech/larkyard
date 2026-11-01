@@ -81,6 +81,31 @@ def claude_bin() -> str:
     return _env("TICKETD_CLAUDE", "claude")
 
 
+def executor() -> str:
+    """新单默认用哪个执行器（ticket new 不带 --executor 时）。"""
+    return _env("TICKETD_EXECUTOR", "claude")
+
+
+def codex_bin() -> str:
+    return _env("TICKETD_CODEX", "codex")
+
+
+def codex_model() -> str:
+    """Codex worker 的模型；空为 CODEX_HOME/config.toml 里的默认。和 TICKETD_MODEL 分开：两家模型名不通用。"""
+    return _env("TICKETD_CODEX_MODEL", "")
+
+
+def codex_home() -> str:
+    """ticketd 专用的 CODEX_HOME；空则沿用用户的 ~/.codex（此时不写 execpolicy 规则）。"""
+    return _env("TICKETD_CODEX_HOME", "")
+
+
+def codex_git_writable() -> bool:
+    """1（默认）= 让 Codex worker 能在授权仓库里 git commit（把 <授权目录>/.git 也列为可写根），和 Claude worker 一致；
+    0 = 保留 Codex 自带的 .git 只读保护。"""
+    return _env("TICKETD_CODEX_GIT_WRITABLE", "1") != "0"
+
+
 def lark_bin() -> str:
     return _env("TICKETD_LARK", "lark-cli")
 

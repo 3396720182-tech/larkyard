@@ -67,7 +67,8 @@ MIGRATIONS = [
     ("tickets", "card_closed", "INTEGER NOT NULL DEFAULT 0"),    # 1 = 当前状态卡已收起成终态，不再改动
     ("tickets", "card_round", "REAL"),                            # 当前状态卡显示的是哪一轮（该轮的 started_at）
     ("tickets", "card_sent_at", "REAL"),                          # 当前状态卡的发出时间（飞书只能编辑 14 天内的消息）
-    ("outbox", "card_json", "TEXT"),                              # 非空 = 发卡片（text 是卡片发不出去时的兜底）
+    ("tickets", "executor", "TEXT NOT NULL DEFAULT 'claude'"),   # 建单时定下，之后不变（会话不能跨执行器迁移）
+    ("outbox", "card_json", "TEXT"),                             # 非空 = 发卡片（text 是卡片发不出去时的兜底）
     ("outbox", "report_id", "INTEGER"),                           # 这条消息对应的汇报
 ]
 

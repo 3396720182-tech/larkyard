@@ -13,8 +13,10 @@ for t in node lark-cli claude; do command -v "$t" >/dev/null 2>&1 || { echo "ins
 NODE_DIR="$(dirname "$(command -v node)")"
 LARK_DIR="$(dirname "$(command -v lark-cli)")"
 CLAUDE_DIR="$(dirname "$(command -v claude)")"
-echo "node=$NODE_DIR lark-cli=$LARK_DIR claude=$CLAUDE_DIR" >&2
-P="$REPO/bin:$LARK_DIR:$NODE_DIR:$CLAUDE_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
+CODEX_DIR=""  # 可选：装了 codex 就把它所在目录也放进 PATH（Codex 执行器用）
+if command -v codex >/dev/null 2>&1; then CODEX_DIR="$(dirname "$(command -v codex)"):"; fi
+echo "node=$NODE_DIR lark-cli=$LARK_DIR claude=$CLAUDE_DIR codex=${CODEX_DIR%:}" >&2
+P="$REPO/bin:$LARK_DIR:$NODE_DIR:$CLAUDE_DIR:$CODEX_DIR/usr/bin:/bin:/usr/sbin:/sbin"
 case "$LABEL" in *[!A-Za-z0-9._-]*|'') echo "install: TICKETD_LABEL 只能含字母、数字和 . _ -" >&2; exit 1;; esac
 case "$REPO$HOME$P$LC_HOME$LC_PROFILE$TICKETD_HOME" in *'&'*|*'|'*|*'<'*|*'>'*) echo "install: unsupported character (& | < >) in paths" >&2; exit 1;; esac
 render() {
