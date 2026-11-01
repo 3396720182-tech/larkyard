@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 from helpers import TicketdTestCase
+
+# 按环境变量匹配的用例不能用 /bin/sleep：macOS 15 起 ps -E 看不到系统自带程序的环境变量
+SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
 
 
 class SchedulerTest(TicketdTestCase):
@@ -413,7 +417,7 @@ class SchedulerTest(TicketdTestCase):
         try:
             for val in (spool, spool + "2"):
                 env["TICKETD_SPOOL"] = val
-                procs.append(subprocess.Popen(["sleep", "60"], env=dict(env)))
+                procs.append(subprocess.Popen(SLEEPER, env=dict(env)))
             import time
             time.sleep(0.2)
             self.assertEqual(_sweep_orphans(spool, 15), 1)
@@ -431,7 +435,7 @@ class SchedulerTest(TicketdTestCase):
         from ticketd.scheduler import _sweep_orphans
         spool = str(self.tmp / "工单 x" / "T0001-测试" / ".reports")
         saved = {k: os.environ.pop(k) for k in ("LANG", "LC_ALL", "LC_CTYPE") if k in os.environ}
-        proc = subprocess.Popen(["sleep", "60"], env=dict(os.environ, TICKETD_SPOOL=spool))
+        proc = subprocess.Popen(SLEEPER, env=dict(os.environ, TICKETD_SPOOL=spool))
         try:
             time.sleep(0.2)
             self.assertEqual(_sweep_orphans(spool, 15), 1)
@@ -441,3 +445,54 @@ class SchedulerTest(TicketdTestCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+    # ---------- 环境变量看不到时（系统自带程序）：按目录清理被收养的进程 ----------
+    def _orphan_in(self, cwd):
+        """在 cwd 里起一个 /bin/sleep，父 shell 立即退出：它被 launchd 收养、没有控制终端。"""
+        import subprocess
+        os.makedirs(cwd, exist_ok=True)
+        out = subprocess.run(["/bin/sh", "-c", "/bin/sleep 60 >/dev/null 2>&1 </dev/null & echo $!"], cwd=cwd,
+                             capture_output=True, text=True, start_new_session=True).stdout
+        pid = int(out.strip())
+        self.addCleanup(self._kill_quiet, pid)
+        return pid
+
+    @staticmethod
+    def _kill_quiet(pid):
+        try:
+            os.kill(pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _wait_reparented(self, pid):
+        import subprocess
+        import time
+        for _ in range(100):
+            if subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True).stdout.strip() == "1":
+                return
+            time.sleep(0.05)
+        self.fail("进程 %d 没有被 launchd 收养" % pid)
+
+    def test_sweep_by_cwd_catches_adopted_system_binary(self):
+        from ticketd.scheduler import _sweep_orphans
+        wd = self.tmp / "工单 x" / "T0001-测试"
+        inside = self._orphan_in(str(wd / "sub"))
+        sibling = self._orphan_in(str(self.tmp / "工单 x" / "T0001-测试2"))
+        self._wait_reparented(inside)
+        self._wait_reparented(sibling)
+        self.assertEqual(_sweep_orphans(str(wd / ".reports"), 15), 1)
+        self.assertTrue(self._wait_gone(inside))
+        os.kill(sibling, 0)  # 相邻目录前缀相同，也不能误杀
+
+    def test_sweep_by_cwd_skips_process_with_live_parent(self):
+        import subprocess
+        from ticketd.scheduler import _sweep_orphans
+        wd = self.tmp / "w"
+        os.makedirs(wd)
+        proc = subprocess.Popen(["/bin/sleep", "60"], cwd=str(wd), start_new_session=True)
+        try:
+            self.assertEqual(_sweep_orphans(str(wd / ".reports"), 15), 0)
+            self.assertIsNone(proc.poll())
+        finally:
+            proc.kill()
+            proc.wait()
