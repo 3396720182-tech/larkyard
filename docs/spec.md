@@ -109,6 +109,17 @@ ticket new --chat <chat_id> --message <om_id> --title <标题> --slug <短名> \
    - 释放写锁。
 5. **任务卡内容**：原话、路由备注、可写目录、工单号、工单目录、汇报方式。不含任何主会话写的计划。
 
+### 5.2.1 执行器（2026-11-01，T0004）
+
+每张单在建单时定下执行器（`tickets.executor`，`ticket new --executor claude|codex`，默认 `TICKETD_EXECUTOR`，未设为 `claude`），之后不变——会话不能跨执行器迁移。主会话只在用户明确说「用 codex」时加 `--executor codex`。
+
+- 代码在 `ticketd/executors.py`。调度器只认 Claude stream-json 的事件形状；Codex 的 `codex exec --json` 事件由 `CodexNormalizer` 翻译成同一形状（`thread.started`→`system/init`，`item.started/completed`→`tool_use`/`tool_result`，`agent_message`→assistant 文本，`turn.completed/failed`→`result`），所以卡死检测、状态卡、linger、重试逻辑两边共用。`.stream.jsonl` 存的始终是原始输出。
+- **Codex 首轮**：`codex exec -C <工单目录> --json --skip-git-repo-check <沙箱 -c 参数> --disable shell_snapshot -c developer_instructions=<worker.md + worker.codex.md> -`（任务卡走 stdin）。
+- **Codex 续做**：`codex exec resume <thread_id> --json …同上… -`。`exec resume` 不接受 `-s/-C/--add-dir`，沙箱参数一律走 `-c`。
+- **会话 ID**：Codex 不能预先指定。建单时仍写一个 uuid 占位；首个 `thread.started` 到达时回写真实 `thread_id` 并置 `session_started=1`。首轮在拿到 thread_id 之前临时失败：按「会话未建立」重跑任务卡。
+- **重启恢复的 pid 校验**：Codex 认「工单目录」或「thread_id」任一出现在命令行里（首轮进程拿到 thread_id 后命令行里仍只有 `-C <工单目录>`）。
+- 配置：`TICKETD_CODEX`（codex 路径；launchd 的 PATH 里没有 nvm，要写绝对路径）、`TICKETD_CODEX_MODEL`、`TICKETD_CODEX_HOME`（ticketd 专用 CODEX_HOME，放 execpolicy 规则；空则沿用 `~/.codex` 且不写规则）、`TICKETD_CODEX_GIT_WRITABLE`（默认 1）。
+
 ### 5.3 汇报（worker 收尾）
 
 ```
@@ -168,11 +179,17 @@ ticket report --status ready|blocked|failed|dropped|waiting \
   - lark-cli 在沙箱里需要两项配置：一是 allowWrite 加上 `~/Library/Application Support/lark-cli` 和 `$LARKSUITE_CLI_CONFIG_DIR`（令牌刷新要写）；二是 `sandbox.network.allowMachLookup` 加上 `com.apple.trustd.agent`、`com.apple.trustd`、`com.apple.SecurityServer`、`com.apple.securityd`（TLS 证书校验要用）。配好后 lark-cli 可以正常读消息，**不需要把它排除出沙箱**。
   - `Bash(lark-cli im +messages-send:*)` 这类 deny 规则生效。
   - launchd 环境注入 §3 的环境变量后，`lark-cli im +messages-reply --as bot` 发送成功。发件箱使用 `--idempotency-key <outbox-id>` 防止重复发送。
+- **Codex 执行器（2026-11-01，T0004，codex-cli 0.134.0 实测）**：
+  - 沙箱：`sandbox_mode=workspace-write`，`writable_roots` = 工单目录 + grants + lark-cli 配置目录，`network_access=true`，`approval_policy=never`（越权直接失败、不挂起）。实测：工单目录、grant、/tmp 可写；可写根以外、家目录被拒；联网可用；`.reports/` 可写。
+  - **grant 下的 `.git` 是只读的**（Codex 自带保护），授权仓库里 `git commit` 失败。默认（`TICKETD_CODEX_GIT_WRITABLE=1`）把 `<grant>/.git` 也列为可写根，实测 commit 成功、越界写仍被拒；设为 `0` 则保留 Codex 的只读保护。
+  - 防误发：execpolicy 规则写在 `$TICKETD_CODEX_HOME/rules/ticketd.rules`，`lark-cli im +messages-send/+messages-reply` 等实测被拒。规则按词精确匹配，写不出 `/open-apis/im` 前缀，所以 `lark-cli api` 的 POST/PUT/PATCH/DELETE 全部拦住（比 Claude 宽）。被规则拒绝的命令不出现在事件流里。
+  - 必须 `--disable shell_snapshot`：否则 Codex 重放用户登录 shell 的环境，PATH 被改写，`shell_environment_policy` 不生效。关掉后再用 `shell_environment_policy.exclude=["*TOKEN*","*KEY*","*SECRET*"]` 挡住守护进程环境里的凭据。
+  - lark-cli 只读 API 在 Codex 沙箱里失败（exit=3），原因待查；同一命令在 Claude worker 沙箱里也失败（`keychain Get failed: keychain not initialized`，lark-cli 1.0.86），与执行器无关。
 
 ## 7. 可观测性
 
 - 服务把 worker 的 stream-json 原样保存到 `<工单目录>/.stream.jsonl`，同时转写成人话写入 `<工单目录>/过程.log`。每行一个事件：时间、动作、对象、结果摘要。
-- 终端接管：`claude --resume <session_id>`。session_id 用 `ticket show` 查。
+- 终端接管：`claude --resume <session_id>`。session_id 用 `ticket show` 查。Codex 单为 `codex resume <thread_id>`（配了专用 CODEX_HOME 时要带上 `CODEX_HOME=…`），`ticket show` 会按执行器给出完整命令。
 - `ticket show` / `ticket ls` 显示与状态卡同一套口径：显示状态、阶段、用时、最近一步、最后动作。
 
 ### 7.1 状态卡（2026-11-01，T0005；T0007、T0017 调整）

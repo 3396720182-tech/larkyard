@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import card, config, core, db, safefs, templates
+from . import card, config, core, db, executors, safefs, templates, worker
 
 HEARTBEAT_STALE = 60
 
@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--note")
     n.add_argument("--grant", action="append", default=[])
     n.add_argument("--sender")
+    n.add_argument("--executor", choices=executors.NAMES,
+                   help="worker 用哪个 agent（默认 TICKETD_EXECUTOR，未设为 claude）")
 
     s = sub.add_parser("send", help="把用户追问转给工单")
     s.add_argument("ticket")
@@ -95,7 +97,7 @@ def _with_warning(out: str) -> str:
 def cmd_new(con, a) -> str:
     tid = core.create_ticket(con, chat_id=a.chat, message_id=a.message, title=a.title, slug=a.slug,
                              request_text=_text(a, "request"), ack_text=a.ack, note=a.note,
-                             grant_paths=a.grant, sender=a.sender)
+                             grant_paths=a.grant, sender=a.sender, executor=a.executor)
     return _with_warning(templates.ack_message(tid, a.title))
 
 
@@ -199,7 +201,8 @@ def cmd_show(con, a) -> str:
     tail = _log_tail(log)
     info = _status_lines(con, t) + [
         "目录：%s" % t["workdir"],
-        "终端接管：cd %s && claude --resume %s" % (t["workdir"], t["session_id"]),
+        "执行器：%s" % worker.executor_of(t),
+        "终端接管：%s" % executors.get(worker.executor_of(t)).takeover_hint(t),
         "可写：%s" % templates.scope_text(core.grants(con, t["id"])),
         "最近汇报：%s" % _report_line(con, t["id"]),
         "过程（最后 20 行）：",

@@ -73,7 +73,8 @@ def add_input(con: sqlite3.Connection, ticket_id: str, kind: str, text: str,
 
 def create_ticket(con: sqlite3.Connection, *, chat_id: str, message_id: str, title: str, slug: str,
                   request_text: str, ack_text: str, note: Optional[str] = None,
-                  grant_paths: Iterable[str] = (), sender: Optional[str] = None) -> str:
+                  grant_paths: Iterable[str] = (), sender: Optional[str] = None,
+                  executor: Optional[str] = None) -> str:
     if sender is not None:
         if not config.owner():
             raise TicketError("没有配置主用户：在 %s 里写 TICKETD_OWNER=<你的 open_id>" % config.config_file())
@@ -85,6 +86,9 @@ def create_ticket(con: sqlite3.Connection, *, chat_id: str, message_id: str, tit
         raise TicketError("短名不合法：%r" % slug)
     if not request_text.strip():
         raise TicketError("用户原话为空")
+    executor = executor or config.executor()
+    if executor not in ("claude", "codex"):  # 与 executors.NAMES 一致；core 不 import executors，保持轻量
+        raise TicketError("未知执行器：%r（可选 claude / codex）" % executor)
     paths = [_norm_grant(p) for p in grant_paths]
     with db.tx(con):
         if con.execute("SELECT 1 FROM bindings WHERE message_id=?", (message_id,)).fetchone():
@@ -94,10 +98,10 @@ def create_ticket(con: sqlite3.Connection, *, chat_id: str, message_id: str, tit
         t = db.now()
         con.execute(
             "INSERT INTO tickets(id, slug, title, chat_id, origin_message_id, request_text, router_note,"
-            " ack_text, workdir, session_id, state, card_wanted, created_at, updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
+            " ack_text, workdir, session_id, state, card_wanted, created_at, updated_at, executor)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
             (tid, slug, title, chat_id, message_id, request_text, note, ack_text, workdir,
-             str(uuid.uuid4()), "queued", t, t))
+             str(uuid.uuid4()), "queued", t, t, executor))
         for p in paths:
             con.execute("INSERT INTO grants VALUES(?,?,?)", (tid, p, t))
         con.execute("INSERT INTO bindings VALUES(?,?)", (message_id, tid))

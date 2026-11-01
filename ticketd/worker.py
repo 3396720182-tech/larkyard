@@ -32,7 +32,9 @@ REMINDER = """---
 
 TRANSIENT_MARKERS = ("overloaded", "timed out", "timeout",
                      "econnreset", "econnrefused", "etimedout", "socket hang up", "connection error",
-                     "fetch failed", "network error")
+                     "fetch failed", "network error",
+                     # Codex：网关断流 / 请求发不出去（重连 5 次后以 turn.failed 结束）
+                     "stream disconnected", "error sending request")
 TRANSIENT_RE = re.compile(r"\b(?:api error|error|status|http)\b[^\n]{0,20}?\b(?:408|429|5\d\d)\b")
 
 
@@ -121,6 +123,7 @@ def compose_card(ticket, grant_paths: List[str], inputs, include_assignment: boo
 
 
 def build_command(ticket, settings_path, prompt_text: str) -> List[str]:
+    """旧接口（只给 Claude 用，保留给现有测试）；调度器走 executors.get(...).build_command。"""
     cmd = [config.claude_bin(), "-p", "--setting-sources", "user"]
     if ticket["session_started"]:
         cmd += ["--resume", ticket["session_id"]]
@@ -138,7 +141,16 @@ def worker_env(ticket) -> dict:
     env["TICKETD_TICKET"] = ticket["id"]
     env["TICKETD_SPOOL"] = str(Path(ticket["workdir"]) / ".reports")
     env["PATH"] = str(config.bin_dir()) + os.pathsep + env.get("PATH", "")
+    if executor_of(ticket) == "codex" and config.codex_home():
+        env["CODEX_HOME"] = config.codex_home()
     return env
+
+
+def executor_of(ticket) -> str:
+    try:
+        return ticket["executor"] or "claude"
+    except (KeyError, IndexError):
+        return "claude"
 
 
 def _result_text(content) -> str:
@@ -152,6 +164,8 @@ def summarize_event(d: dict) -> List[str]:
     out: List[str] = []
     if t == "system" and d.get("subtype") == "init":
         out.append("会话就绪 %s" % d.get("session_id"))
+    elif t == "system" and d.get("subtype") == "notice":  # Codex 的 error 事件（含自动重连提示）
+        out.append("提示：%s" % _short(d.get("text"), 200))
     elif t == "assistant":
         msg = d.get("message")
         content = msg.get("content") if isinstance(msg, dict) else None

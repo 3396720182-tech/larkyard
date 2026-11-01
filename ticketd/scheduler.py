@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import card as status_card, config, core, db, perms, safefs, templates, worker
+from . import card as status_card, config, core, db, executors, safefs, templates, worker
 
 RECOVERY_TEXT = ("服务重启打断了上一轮。先检查工单目录和已发出的消息，确认哪些外部动作已经完成，"
                  "再决定是否重做；不要重复发送或重复创建。")
@@ -21,12 +21,13 @@ def overlaps(a: str, b: str) -> bool:
     return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
-def _pid_matches(pid: int, session_id: str) -> bool:
+def _pid_matches(pid: int, markers) -> bool:
+    """markers 由执行器给出（Claude：session_id；Codex：工单目录或 thread_id），命令行里出现任何一个即可。"""
     try:
         out = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True).stdout
     except OSError:
         return False
-    return session_id in out
+    return any(m and m in out for m in markers)
 
 
 def _signal_group(proc_or_pid, sig: int, fallback: bool = True) -> None:
@@ -104,8 +105,10 @@ def _read_from(path: Path, offset: int) -> str:
 
 class Running:
     def __init__(self, proc, ticket_id: str, workdir: str, input_ids: List[int], report_mark: int,
-                 stream_offset: int, stderr_offset: int):
+                 stream_offset: int, stderr_offset: int, executor: str = "claude", session_id: str = ""):
         self.proc = proc
+        self.normalize = executors.get(executor).normalizer()
+        self.session_id = session_id
         self.ticket_id = ticket_id
         self.workdir = workdir
         self.input_ids = input_ids
@@ -147,7 +150,7 @@ class Scheduler:
     # ---------- 生命周期 ----------
     def recover(self) -> None:
         for t in self.con.execute("SELECT * FROM tickets WHERE state='running'").fetchall():
-            if t["pid"] and _pid_matches(t["pid"], t["session_id"]):
+            if t["pid"] and _pid_matches(t["pid"], executors.get(worker.executor_of(t)).pid_markers(t)):
                 _signal_group(t["pid"], signal.SIGKILL)
             _sweep_orphans(_spool_of(t["workdir"]), signal.SIGKILL)
             core.ingest_spool(self.con, t["id"], str(Path(t["workdir"]) / ".reports"))
@@ -220,8 +223,8 @@ class Scheduler:
             n = len(list(workdir.glob(".input-*.md"))) + 1
             card_path = workdir / (".input-%03d-%d.md" % (n, time.time_ns()))
             safefs.create_excl(card_path, card.encode("utf-8"))
-            settings = perms.write_settings(tid, str(workdir), gp)
-            cmd = worker.build_command(t, settings, config.prompt_file().read_text(encoding="utf-8"))
+            ex = executors.get(worker.executor_of(t))
+            cmd = ex.build_command(t, gp, executors.prompt_text(ex.name))
             env = worker.worker_env(t)
             fin = safefs.open_read(card_path)
             if fin is None:
@@ -247,7 +250,7 @@ class Scheduler:
         # 不写 state：可能已被停止/暂停
         t0 = db.now()
         core.touch(self.con, tid, pid=proc.pid, started_at=t0, last_action_at=t0, last_step=None, stall_alerted=0)
-        self.running[tid] = Running(proc, tid, str(workdir), ids, mark, so, eo)
+        self.running[tid] = Running(proc, tid, str(workdir), ids, mark, so, eo, ex.name, t["session_id"])
         self.log(str(workdir), "开始第 %d 轮（输入 %d 条）" % (n, len(inputs)))
         return True
 
@@ -268,7 +271,13 @@ class Scheduler:
             r.last_action_at = db.now()
             r.activity_dirty = r.action_moved = True
         if ev.get("type") == "system" and ev.get("subtype") == "init":
-            core.touch(self.con, r.ticket_id, session_started=1)
+            sid = ev.get("session_id")
+            if isinstance(sid, str) and sid and sid != r.session_id:
+                # Codex 不能预先指定会话 ID：首轮从 thread.started 拿到真实 ID 再回写
+                r.session_id = sid
+                core.touch(self.con, r.ticket_id, session_started=1, session_id=sid)
+            else:
+                core.touch(self.con, r.ticket_id, session_started=1)
         elif ev.get("type") == "assistant":
             msg = ev.get("message")
             content = msg.get("content") if isinstance(msg, dict) else None
@@ -291,9 +300,10 @@ class Scheduler:
         self.log(r.workdir, "中止进程：%s" % why)
 
     def _handle_events(self, r: Running) -> None:
-        for ev in r.tail.read_events():
+        for raw in r.tail.read_events():
             try:
-                self._on_event(r, ev)
+                for ev in r.normalize(raw):  # 非 Claude 执行器的事件先翻译成 Claude 形状
+                    self._on_event(r, ev)
             except Exception as e:  # 单个坏事件不能打断整个 tick
                 self.log(r.workdir, "事件处理出错：%r" % e)
 
