@@ -81,13 +81,17 @@ A few details about Codex workers:
 
 ```
 you ──Feishu──▶ lark-channel-bridge ──▶ bridge session (Claude Code, reads workspace CLAUDE.md)
-                                           │ ticket new / send / stop / hold / release / grant
-                                           ▼
-                                SQLite (~/.ticketd/db) ◀──poll── ticketd (launchd / systemd)
-                                                                 ├─ worker: Claude Code (claude -p) or Codex (codex exec),
-                                                                 │         routed per ticket, one session + dir + sandbox each
-                                                                 ├─ status card: edited in place, result overwrites it
-                                                                 └─ outbox: lark-cli replies to the origin message (or the chat if it was withdrawn), with backoff
+▲                                          │ ticket new / send / stop / hold / release / grant
+│                                          ▼
+│                               SQLite (~/.ticketd/db) ◀──poll── ticketd (launchd / systemd)
+│                                                                ├─ worker: Claude Code (claude -p) or Codex (codex exec),
+│                                                                │         routed per ticket, one session + dir + sandbox each
+│                                                                ├─ status card: edited in place, result overwrites it
+│                                                                └─ outbox: prepares artifacts, then sends via lark-cli
+│                                                                   ├─ images go into the card; videos go to your Drive as you (uploaded once per video); docs become Feishu docs
+│                                                                   ├─ network down: back off and wait; degrade only after 10+ minutes of failures
+│                                                                   ├─ replies to the origin message, or posts to the chat if it was withdrawn
+└──◀── result card / pings ─────────────────────────────────────────┘
 ```
 
 ## The conventions in short

@@ -81,13 +81,17 @@ Codex worker 的几点细节：
 
 ```
 你 ──飞书──▶ lark-channel-bridge ──▶ 主会话（Claude Code，读工作区 CLAUDE.md）
-                                        │ ticket new / send / stop / hold / release / grant
-                                        ▼
-                             SQLite（~/.ticketd/db） ◀──轮询── ticketd（launchd / systemd）
-                                                               ├─ worker：Claude Code（claude -p）或 Codex（codex exec），
-                                                               │          按单路由，每单一个会话 + 目录 + 沙箱
-                                                               ├─ 状态卡：原地刷新，结果覆盖
-                                                               └─ 发件箱：lark-cli 回复原消息（已撤回则发到会话），失败退避重试
+▲                                       │ ticket new / send / stop / hold / release / grant
+│                                       ▼
+│                            SQLite（~/.ticketd/db） ◀──轮询── ticketd（launchd / systemd）
+│                                                              ├─ worker：Claude Code（claude -p）或 Codex（codex exec），
+│                                                              │          按单路由，每单一个会话 + 目录 + 沙箱
+│                                                              ├─ 状态卡：原地刷新，结果覆盖
+│                                                              └─ 发件箱：处理产物，再用 lark-cli 发回飞书
+│                                                                 ├─ 图片放进卡里；视频以你的身份传云空间（同一视频只传一次）；稿子导入云文档
+│                                                                 ├─ 断网时退避重试，等网络恢复；连续失败 10 分钟以上才降级
+│                                                                 ├─ 回复原消息；原消息已撤回则改发到会话
+└──◀── 结果卡 / 提醒 ─────────────────────────────────────────────┘
 ```
 
 ## 工作区约定的核心
