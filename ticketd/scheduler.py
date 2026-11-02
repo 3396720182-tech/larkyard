@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import card as status_card, config, core, db, executors, safefs, templates, worker
+from . import card as status_card, config, core, db, executors, procs, safefs, templates, worker
 
 RECOVERY_TEXT = ("服务重启打断了上一轮。先检查工单目录和已发出的消息，确认哪些外部动作已经完成，"
                  "再决定是否重做；不要重复发送或重复创建。")
@@ -23,10 +23,7 @@ def overlaps(a: str, b: str) -> bool:
 
 def _pid_matches(pid: int, markers) -> bool:
     """markers 由执行器给出（Claude：session_id；Codex：工单目录或 thread_id），命令行里出现任何一个即可。"""
-    try:
-        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True).stdout
-    except OSError:
-        return False
+    out = procs.command_line(pid)
     return any(m and m in out for m in markers)
 
 
@@ -52,33 +49,6 @@ def _spool_of(workdir: str) -> str:
     return str(Path(workdir) / ".reports")  # 与 worker.worker_env 设置的 TICKETD_SPOOL 完全一致
 
 
-def _has_marker(text: str, needle: str) -> bool:
-    i = text.find(needle)
-    while i >= 0:
-        end = i + len(needle)
-        if (i == 0 or text[i - 1] == " ") and (end == len(text) or text[end] == " "):
-            return True
-        i = text.find(needle, i + 1)
-    return False
-
-
-def _cwd_within(pids, workdir: str, env: dict) -> set:
-    """pids 里当前目录在 workdir 之内的那些（lsof 给的是真实路径，所以 workdir 也先取真实路径）。"""
-    root = os.path.realpath(workdir)
-    out = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()), "-d", "cwd",
-                          "-p", ",".join(str(p) for p in sorted(pids)), "-Fpn"],
-                         capture_output=True, text=True, errors="replace", timeout=10, env=env).stdout
-    found, pid = set(), None
-    for line in out.splitlines():
-        if line.startswith("p"):
-            pid = int(line[1:]) if line[1:].isdigit() else None
-        elif line.startswith("n") and pid is not None:
-            path = line[1:]
-            if path == root or path.startswith(root + "/"):
-                found.add(pid)
-    return found
-
-
 def _sweep_orphans(spool: str, sig: int) -> int:
     """真实 Bash 工具让每条命令自成进程组，`cmd &` 会被 PID 1 收养而逃过 killpg；
     但它们继承了 worker 环境，按 TICKETD_SPOOL 标记找出来补发信号。
@@ -86,27 +56,10 @@ def _sweep_orphans(spool: str, sig: int) -> int:
     已被 launchd 收养、没有控制终端、当前目录在工单目录内的进程也算残留
     （有终端的是用户自己的 shell / claude --resume，ppid 不是 1 的有正常的父进程，都不碰）。永不抛异常。"""
     try:
-        # 非 UTF-8 locale 下 ps / lsof 会把中文路径转义成 M-eM-7… / \xe5…，导致一个都匹配不上
-        env = dict(os.environ, LC_ALL="en_US.UTF-8")
-        out = subprocess.run(["ps", "-axE", "-o", "pid=,ppid=,tty=,command="], capture_output=True, text=True,
-                             errors="replace", timeout=10, env=env).stdout
-        needle = "TICKETD_SPOOL=" + spool
-        me = os.getpid()
-        targets, orphans = set(), set()
-        for line in out.splitlines():
-            parts = line.strip().split(None, 3)
-            if len(parts) < 3 or not parts[0].isdigit():
-                continue
-            pid = int(parts[0])
-            if pid == me:
-                continue
-            if len(parts) == 4 and _has_marker(parts[3], needle):
-                targets.add(pid)
-            elif parts[1] == "1" and parts[2] == "??":
-                orphans.add(pid)
+        targets, orphans = procs.scan(spool)
         if orphans:
             try:
-                targets |= _cwd_within(orphans, os.path.dirname(spool), env)
+                targets |= procs.cwd_within(orphans, os.path.dirname(spool))
             except Exception:
                 pass
         n = 0
@@ -126,11 +79,9 @@ def _wait_exited(pid: int, timeout: float = 3.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            stat = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
-                                  timeout=5).stdout.strip()
+            if procs.is_gone(pid):
+                return
         except Exception:
-            return
-        if not stat or stat.startswith("Z"):
             return
         time.sleep(0.05)
 
