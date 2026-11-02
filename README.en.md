@@ -1,5 +1,7 @@
 # Larkyard
 
+![Larkyard](docs/assets/social-preview.jpg)
+
 > The workshop behind your Lark/Feishu chat: hand off a task in one message, let **Claude Code or Codex** on your own machine finish it in the yard, and get pinged only when it's ready.
 
 [中文](./README.md)

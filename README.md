@@ -1,5 +1,7 @@
 # Larkyard
 
+![Larkyard](docs/assets/social-preview.jpg)
+
 > 飞书背后的作坊：在飞书里一句话派活，本机的 **Claude Code 或 Codex** 在后院把它做完，做好了再叫你。
 
 [English](./README.en.md)
