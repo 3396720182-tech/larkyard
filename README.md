@@ -211,7 +211,7 @@ sudo loginctl enable-linger "$USER"
 - 依赖 lark-channel-bridge 注入的 `<bridge_context>` 字段（`chatId`、`messageIds`、`senderId`）；bridge 改了格式时，工作区约定里的派单命令需要跟着改。
 - 主会话（bridge 里做判断和派单的那个会话）目前只在 Claude Code 上写过、验证过：工作区约定是 `CLAUDE.md`。bridge 的 Codex 主会话（profile `agentKind: "codex"`）还没验证；能路由给 Codex 的是 worker。
 - worker 的沙箱和权限依赖 Claude Code 的 `--permission-mode dontAsk` 与 sandbox 设置，Claude Code 升级后建议按 `docs/spec.md` §6 的实测结论复核一遍。
-- 飞书卡片没有视频组件，视频不能在卡片里直接播放：卡里放封面和按钮，点开走云空间播放器。云空间一次性上传最大 20MB，更大的视频（≤30MB）改为卡片后另发一条视频消息，再大就只给本机路径。
+- 飞书卡片没有视频组件，视频不能在卡片里直接播放：卡里放封面和按钮，点开走云空间播放器。100MB 以内的视频传云空间（超过 20MB 时 lark-cli 自动分片上传）；传不上去时，≤30MB 的改为卡片后另发一条视频消息，再大就只给本机路径。
 - Codex 执行器依赖 `codex exec --json` 的事件格式和配置键（在 0.134.0 上实测，真实输出存在 `tests/fixtures/`）；Codex 升级后先跑 `tests/test_codex.py`，并按 spec §6 复核沙箱。
 
 ## 许可

@@ -204,7 +204,7 @@ Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (
 - Relies on the `<bridge_context>` fields injected by lark-channel-bridge (`chatId`, `messageIds`, `senderId`); if the bridge changes them, the dispatch command in the workspace conventions must follow.
 - The bridge session (the one that triages and dispatches) has only been written for and tested on Claude Code: the workspace conventions are a `CLAUDE.md`. A Codex bridge session (profile `agentKind: "codex"`) is untested; what can be routed to Codex is the worker.
 - Worker sandboxing relies on Claude Code's `--permission-mode dontAsk` and sandbox settings; re-check the findings in `docs/spec.md` §6 after upgrading Claude Code.
-- Feishu cards have no video component, so videos don't play inline: the card has a cover and a button that opens Drive's player. Drive's one-shot upload caps at 20MB; larger videos (up to 30MB) go out as a separate video message after the card, and beyond that only the local path is given.
+- Feishu cards have no video component, so videos don't play inline: the card has a cover and a button that opens Drive's player. Videos up to 100MB go to Drive (lark-cli switches to multipart upload above 20MB); if the Drive upload fails, videos up to 30MB go out as a separate video message after the card, and beyond that only the local path is given.
 - The Codex executor relies on the `codex exec --json` event format and config keys (measured on 0.134.0; real output is kept in `tests/fixtures/`). After upgrading Codex, run `tests/test_codex.py` first and re-check the sandbox per spec §6.
 
 ## License

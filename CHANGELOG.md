@@ -2,6 +2,13 @@
 
 ## 0.2.0 — 未发布
 
+- 修复：被回复的那条消息已经撤回时（飞书 230011），结果和状态卡会一直发不出去，最后被丢弃。现在这一单还没发出的消息改为直接发到会话里，卡片和视频原样改投。
+- 修复：发件箱在上传媒体之后遇到意外异常（如 lark-cli 输出非 UTF-8）会把结果直接丢掉。现在 lark-cli 输出按容错方式解码，标记失败之前也会先试一次文字兜底。
+- 修复：读产物时，如果拿不到已打开文件的真实路径（Linux 上 `/proc` 不可用），并发把中间目录换成符号链接可以读到工单目录外的文件。现在从工单目录起逐级 `openat` + `O_NOFOLLOW` 打开，不再依赖事后核对。
+- 断网时媒体不再很快降级：要失败满 3 次、且已经等了 10 分钟，图片才换成灰字、视频才改另发消息（原来断网约 35 秒就降级）。限流等可重试的飞书错误也按退避处理，不再当成卡片被拒。
+- 同一工单里同一个视频再次汇报时复用之前的云空间链接，不重复上传（新表 `drive_links`）。云空间视频上限从 20MB 放宽到 100MB，超时按文件大小放宽。
+- 一行结果卡在一个 tick 里开始新上传的时间上限为 60 秒，超时后保存进度、下个 tick 继续，减少守护进程主循环被卡住的时间。
+
 - 支持 Linux（含 WSL2）：`scripts/install.sh` 在 Linux 上装成 systemd 用户服务（`systemd/ticketd.service.in`），macOS 仍是 launchd，生成的 plist 不变。`uninstall.sh` 同样按平台处理。WSL1、WSL2 里用了 Windows 盘上的 node / lark-cli / claude、没有 systemd 用户实例时拒绝安装；缺 bwrap / socat、Ubuntu 24.04 的 AppArmor 限制、没开 linger 时给出提示。
 - Linux 上查看和清理 worker 进程直接读 `/proc`（新文件 `ticketd/procs.py`、`ticketd/host.py`），不依赖 ps / lsof；按环境变量标记找残留进程不再受「看不到系统程序环境变量」的限制，按目录补的那一道把「父进程是 PID 1 或 ticketd 的祖先（如 `systemd --user`）」当作被收养。
 - Linux 上 worker 沙箱的可写目录换成 lark-cli 在 Linux 的数据目录（`~/.local/share/lark-cli`）和 `/tmp`，不存在的附带路径不写（bubblewrap 绑不上不存在的路径），不写 macOS 才有的 `allowMachLookup`。macOS 上生成的设置不变。
