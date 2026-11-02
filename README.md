@@ -1,6 +1,6 @@
 # Larkyard
 
-> 飞书背后的作坊：在飞书里一句话派活，本机的 Claude Code（也可以按单换成 Codex）在后院把它做完，做好了再叫你。
+> 飞书背后的作坊：在飞书里一句话派活，本机的 **Claude Code 或 Codex** 在后院把它做完，做好了再叫你。
 
 [English](./README.en.md)
 
@@ -8,16 +8,18 @@
 > 飞书消息的收发、会话、`<bridge_context>`、bot 身份和 lark-cli 环境都来自 lark-channel-bridge（npm 包 `lark-channel-bridge`，MIT 协议）。
 > Larkyard 不 fork、不修改、也不内置它的代码，而是把它当作依赖，在它上面加一层：派单服务、状态卡和一套工作区约定。详见 [NOTICE.md](./NOTICE.md)。
 
+**两种 worker，一句话切换**：每张工单可以交给 **Claude Code** 或 **Codex CLI** 来做。在飞书里说「用 codex 做…」，这张单就派给 Codex；不说就走默认执行器（默认是 Claude Code，也可以配成 Codex）。两种 worker 共用同一套排队、状态卡、权限边界、追问续做和结果推送。见 [路由：Claude Code 还是 Codex](#路由claude-code-还是-codex)。
+
 ## 它解决什么问题
 
-lark-channel-bridge 让你在飞书里直接和本机的 Claude Code 对话。日常用下来会碰到几件事：
+lark-channel-bridge 让你在飞书里直接和本机的 AI 编程助手对话。日常用下来会碰到几件事：
 
 - 长任务把对话占住，跑完之前没法再交代别的事；
 - 网络一抖，流式卡片推不过去，任务其实做完了，看起来却像卡死或失败；
 - 多件事并行时，过程消息刷屏，真正需要你拍板的问题被淹掉；
 - bridge、电脑或服务重启后，做到一半的事没人接着做。
 
-Larkyard 的做法：**bridge 里的会话只做判断和派单**，长任务交给本机常驻的派单服务 `ticketd`，每张工单一个独立的 worker 会话（默认 Claude Code，可按单指定 Codex）和目录，结果由服务主动推回飞书。
+Larkyard 的做法：**bridge 里的会话只做判断和派单**，长任务交给本机常驻的派单服务 `ticketd`，每张工单一个独立的 worker 会话（Claude Code 或 Codex，按单路由）和目录，结果由服务主动推回飞书。
 
 ## 你会看到什么
 
@@ -27,6 +29,35 @@ Larkyard 的做法：**bridge 里的会话只做判断和派单**，长任务交
 2. 一张状态卡：运行中原地刷新（阶段轨迹、最近一步、用时，编辑不产生推送提醒）；结束时结果直接覆盖到这张卡上，稿子类产物（.md / .docx / .xlsx …）会导入成飞书云文档，卡上有「打开」按钮。
 
 只有需要你回答时（受阻、带问题）才会另推一条短提醒。引用工单里的任意一条消息回复，就是对这张单的追问；说「停」「先别动」「继续」「授权某目录」，就是控制这张单。
+
+## 路由：Claude Code 还是 Codex
+
+| 你在飞书里怎么说 | 谁来做 |
+|---|---|
+| 「帮我整理一下 X」（不提执行器） | 默认执行器：`TICKETD_EXECUTOR`，不配就是 **Claude Code** |
+| 「用 codex 帮我整理一下 X」/「这单交给 codex」 | **Codex**：主会话派单时加 `--executor codex` |
+| 引用某张单的消息追问 | 沿用这张单原来的执行器，接着同一个会话做 |
+
+- **路由由你说了算**：主会话只看你有没有明确点名 codex，不会自己判断哪种活更适合哪个执行器，免得路由不稳定。在终端里也可以直接 `bin/ticket new … --executor claude|codex`。
+- **执行器在建单时定下，之后不变**：Claude Code 和 Codex 的会话不能互相迁移。想换执行器就开一张新单。`ticket show` 会显示这张单的执行器，以及在终端里接管它的命令。
+- **想默认全走 Codex**：在 `config.env` 里写 `TICKETD_EXECUTOR=codex`，这时不点名的单也交给 Codex。
+
+两种 worker 的对照：
+
+| | Claude Code worker | Codex worker |
+|---|---|---|
+| 怎么跑 | `claude -p --session-id/--resume …`（stream-json） | `codex exec --json …` / `codex exec resume <thread_id> …` |
+| 系统提示 | `prompts/worker.md`，用 `--append-system-prompt` 注入 | `worker.md` + `worker.codex.md`，用 `developer_instructions` 注入 |
+| 沙箱 | Claude Code 的 Seatbelt 沙箱 + 权限规则（`dontAsk`） | Codex 自带的 Seatbelt 沙箱（`workspace-write`，`approval_policy=never`） |
+| 能写哪里 | 工单目录、你授权的目录、临时目录、lark-cli 配置目录 | 同左；授权仓库里的 `.git` 默认也能写（`TICKETD_CODEX_GIT_WRITABLE=1`），所以能 `git commit` |
+| 防误发飞书消息 | 权限 deny 规则拦 `lark-cli im +messages-send` 等 | 专用 `CODEX_HOME` 里的 execpolicy 规则拦同一批命令，外加所有 `lark-cli api` 写操作（规则只能按词精确匹配，所以更严） |
+| 状态卡「最近一步」 | 显示每条命令的中文说明（如「跑全部单测」） | 只能显示程序名（如「运行 pytest」），所以 worker 会更勤地报阶段 |
+| 验证过的版本 | Claude Code 2.1.300 | codex-cli 0.134.0 |
+
+Codex worker 的几点细节：
+- **建议配一个专用的 `CODEX_HOME`**：设 `TICKETD_CODEX_HOME`，目录里放一份能用的 `config.toml`。ticketd 每次启动 Codex worker 时会往里写防误发规则。不配也能跑，但没有这道护栏。
+- **worker 的环境可预期**：ticketd 会关掉 Codex 的 shell 快照，不重放你登录 shell 的环境；名字里带 `TOKEN` / `KEY` / `SECRET` 的环境变量也挡在 worker 的 shell 外面。
+- 被规则拒绝的命令不会出现在过程日志里。每个参数的实测依据见 `docs/spec.md` §5.2.1 和 §6。
 
 ## 组成
 
@@ -45,7 +76,8 @@ Larkyard 的做法：**bridge 里的会话只做判断和派单**，长任务交
                                         │ ticket new / send / stop / hold / release / grant
                                         ▼
                              SQLite（~/.ticketd/db） ◀──轮询── ticketd（launchd）
-                                                               ├─ worker：claude -p 或 codex exec，每单一个会话 + 目录 + 沙箱
+                                                               ├─ worker：Claude Code（claude -p）或 Codex（codex exec），
+                                                               │          按单路由，每单一个会话 + 目录 + 沙箱
                                                                ├─ 状态卡：原地刷新，结果覆盖
                                                                └─ 发件箱：lark-cli 回复原消息，失败重试
 ```
@@ -61,12 +93,12 @@ Larkyard 的做法：**bridge 里的会话只做判断和派单**，长任务交
 
 ## 环境要求
 
-- macOS（用 launchd 托管服务，用 Claude Code 的 Seatbelt 沙箱限制 worker）
+- macOS（用 launchd 托管服务，用 Claude Code / Codex 各自的 Seatbelt 沙箱限制 worker）
 - `/usr/bin/python3`（3.9+，只用标准库）
 - Node.js ≥ 20.12，已装好并能正常对话的 [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge)（在 0.7.0 上验证）
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart)（`claude` 已登录；在 2.1.300 上验证）
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart)（`claude` 已登录；在 2.1.300 上验证）：必需，主会话和默认 worker 都用它
 - lark-cli（`npm i -g @larksuite/cli`），在 PATH 上；稿子导入云文档需要它以 user 身份登录过（可选）
-- 可选：[Codex CLI](https://github.com/openai/codex)（`codex` 已登录或已配置 provider；在 codex-cli 0.134.0 上验证），想让部分工单交给 Codex 跑时才需要
+- [Codex CLI](https://github.com/openai/codex)（`codex` 已登录或已配置 provider；在 codex-cli 0.134.0 上验证）：可选，要把工单路由给 Codex 时才需要。先装好再跑 `scripts/install.sh`，安装脚本会把它加进服务的 PATH
 
 界面文案（回执、状态卡、提示）目前是中文。
 
@@ -108,7 +140,7 @@ scripts/setup-workspace.sh <bridge 工作目录>
 | `TICKETD_WORKROOT` | `~/larkyard-tickets` | 工单目录的根，每张单一个子目录 |
 | `TICKETD_MAX_WORKERS` | `3` | 同时运行的 worker 数 |
 | `TICKETD_TURN_TIMEOUT` | `7200` | 单轮超时（秒） |
-| `TICKETD_MODEL` | 空 | worker 用的模型，空为 claude 默认 |
+| `TICKETD_MODEL` | 空 | Claude Code worker 用的模型，空为 claude 默认 |
 | `TICKETD_EXECUTOR` | `claude` | 新单默认的执行器：`claude` 或 `codex`（`ticket new --executor` 可逐单指定） |
 | `TICKETD_CODEX` | `codex` | Codex CLI 路径。launchd 的 PATH 由 `install.sh` 生成，只含 node、lark-cli、claude（以及安装时找得到的 codex）所在目录；找不到时写绝对路径 |
 | `TICKETD_CODEX_MODEL` | 空 | Codex worker 的模型，空为 `config.toml` 里的默认 |
@@ -116,17 +148,6 @@ scripts/setup-workspace.sh <bridge 工作目录>
 | `TICKETD_CODEX_GIT_WRITABLE` | `1` | Codex worker 能否在授权仓库里 `git commit`；`0` = 保留 Codex 自带的 `.git` 只读保护 |
 
 安装时的变量：`TICKETD_HOME`（默认 `~/.ticketd`）、`TICKETD_LABEL`（默认 `dev.larkyard.ticketd`）、`LARK_CHANNEL_HOME`、`LARK_CHANNEL_PROFILE`。
-
-## 用 Codex 做 worker（可选）
-
-默认每张单由 Claude Code 跑。装了 Codex CLI 后，可以让某张单改由 Codex 跑：
-
-- **派单时指定**：在飞书里明确说「用 codex 做…」，主会话会给 `ticket new` 加 `--executor codex`（工作区约定里有这条规则）；也可以在终端直接 `bin/ticket new … --executor codex`。不说就仍是 Claude Code。想默认全走 Codex，设 `TICKETD_EXECUTOR=codex`。
-- **一张单的执行器建单时定下，之后不变**：追问续做走同一个 Codex 会话（`codex exec resume <thread_id>`）；两家的会话不能互相迁移。`ticket show` 会显示执行器和对应的终端接管命令。
-- **权限对齐 Claude worker**：Codex 用自带的 Seatbelt 沙箱（`workspace-write`）：只能写工单目录、授权目录、临时目录和 lark-cli 配置目录，联网放开，越权直接失败、不会挂起等审批。Codex 默认把授权仓库的 `.git` 设成只读，Larkyard 默认把它放开（`TICKETD_CODEX_GIT_WRITABLE=1`），worker 才能在授权仓库里提交。
-- **防误发**：建议给 ticketd 配一个专用的 `CODEX_HOME`（`TICKETD_CODEX_HOME`，里面放一份能用的 `config.toml`）。ticketd 每次启动 Codex worker 时会在里面写入 execpolicy 规则，禁止 `lark-cli im +messages-send/+messages-reply` 等发消息命令。这些规则按词精确匹配，写不出「`/open-apis/im` 开头」这样的前缀，所以 Codex worker 的 `lark-cli api` 写操作（POST/PUT/PATCH/DELETE）会全部被拦，比 Claude worker 更严。不配专用 `CODEX_HOME` 也能跑，但没有这道护栏。
-- **和 Claude worker 的差别**：状态卡的「最近一步」只能显示程序名（如「运行 pytest」），因为 Codex 的 shell 调用没有说明文字，所以 `worker.codex.md` 会提醒 worker 勤报阶段；被规则拒绝的命令不会出现在过程日志里；系统提示通过 `developer_instructions` 注入；为了让 worker 的环境可预期，ticketd 会关掉 Codex 的 shell 快照，并把名字里带 `TOKEN` / `KEY` / `SECRET` 的环境变量挡在 worker 的 shell 外面。
-- 实测结论和每个参数的理由见 `docs/spec.md` §5.2.1 和 §6。
 
 ## 开发
 
@@ -143,6 +164,7 @@ scripts/setup-workspace.sh <bridge 工作目录>
 
 - 只支持 macOS；只服务一个主用户。
 - 依赖 lark-channel-bridge 注入的 `<bridge_context>` 字段（`chatId`、`messageIds`、`senderId`）；bridge 改了格式时，工作区约定里的派单命令需要跟着改。
+- 主会话（bridge 里做判断和派单的那个会话）目前只在 Claude Code 上写过、验证过：工作区约定是 `CLAUDE.md`。bridge 的 Codex 主会话（profile `agentKind: "codex"`）还没验证；能路由给 Codex 的是 worker。
 - worker 的沙箱和权限依赖 Claude Code 的 `--permission-mode dontAsk` 与 sandbox 设置，Claude Code 升级后建议按 `docs/spec.md` §6 的实测结论复核一遍。
 - Codex 执行器依赖 `codex exec --json` 的事件格式和配置键（在 0.134.0 上实测，真实输出存在 `tests/fixtures/`）；Codex 升级后先跑 `tests/test_codex.py`，并按 spec §6 复核沙箱。
 
