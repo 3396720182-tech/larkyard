@@ -185,7 +185,7 @@ class OutboxTest(TicketdTestCase):
         self.assertEqual(rows[0]["status"], "dead")
         self.assertIn("ValueError", rows[0]["last_error"])
         self.assertEqual(rows[1]["status"], "sent")
-        self.assertEqual(calls, ["om_1", "om_2"])
+        self.assertEqual(calls, ["om_1", "om_1", "om_2"])  # 标 dead 之前先试过一次文字兜底
 
     # ---------- 稿子链接 ----------
     def _ready_with(self, tid, *names, extra=()):

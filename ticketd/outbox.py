@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -41,27 +43,59 @@ def _is_network_failure(info: str) -> bool:
 
 
 def _is_transient(info: str) -> bool:
-    """网络/超时这类「过一会儿可能就好」的失败（不论出现在错误信息的哪个位置，如「上传云空间失败：调用 lark-cli 失败…」）。"""
-    return "调用 lark-cli 失败" in (info or "") or '"type": "network"' in (info or "")
+    """网络/超时这类「过一会儿可能就好」的失败（不论出现在错误信息的哪个位置，如「上传云空间失败：调用 lark-cli 失败…」）。
+    lark-cli 标了 retryable 的业务错误（如 api/rate_limit 限流）也算。"""
+    info = info or ""
+    return "调用 lark-cli 失败" in info or '"type": "network"' in info or '"retryable": true' in info
 
 
 def _is_api_error(info: str) -> bool:
-    """飞书已经明确回了业务错误（lark-cli 的 error.type == "api"），不是网络问题。"""
-    return '"type": "api"' in (info or "")
+    """飞书已经明确回了业务错误（lark-cli 的 error.type == "api"），不是网络问题；限流这类可重试的不算。"""
+    return '"type": "api"' in (info or "") and not _is_transient(info)
 
 
-MEDIA_MAX_ATTEMPTS = 3  # 媒体上传瞬时失败时最多退避重试这么多次，之后降级（图换灰字、视频另发）
+# 被回复的那条消息已经撤回/删除：回复永远发不出去，改成直接发到会话里（原来结果会因此被丢弃）
+REPLY_GONE_CODES = {230011}
+
+
+def _parse_error(info: str) -> dict:
+    """从「rc=1 {...}」形式的失败信息里取回 lark-cli 的 error 对象；取不到返回 {}。"""
+    i = (info or "").find("{")
+    if i < 0:
+        return {}
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(info, i)
+    except ValueError:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _reply_gone(info: str) -> bool:
+    err = _parse_error(info)
+    return err.get("type") == "api" and err.get("code") in REPLY_GONE_CODES
+
+
+def _target_args(to: str) -> list:
+    """om_ 开头：回复那条消息；oc_ 开头（回复目标被撤回后改投）：直接发到会话。"""
+    if (to or "").startswith("oc_"):
+        return ["im", "+messages-send", "--as", "bot", "--chat-id", to]
+    return ["im", "+messages-reply", "--as", "bot", "--message-id", to]
+
+
+MEDIA_MAX_ATTEMPTS = 3  # 媒体上传瞬时失败时至少退避重试这么多次……
+MEDIA_DEGRADE_AFTER = 600.0  # ……并且这一行已经等了这么久，才降级（图换灰字、视频另发）：断网半分钟不该永久丢图
+MEDIA_BUDGET = 60.0  # 一行结果卡在一个 tick 里开始新上传的时间上限（秒）；超了把进度写回、下个 tick 接着传
+_clock = time.monotonic  # 测试可替换
 
 
 def send_reply(reply_to: str, text: str, idem: str) -> Tuple[bool, str, bool]:
     """回复飞书消息。返回 (是否成功, message_id 或错误信息, 是否永久失败)。"""
-    return _run_lark([config.lark_bin(), "im", "+messages-reply", "--as", "bot", "--message-id", reply_to,
-                      "--idempotency-key", idem, "--text", text])
+    return _run_lark([config.lark_bin()] + _target_args(reply_to) + ["--idempotency-key", idem, "--text", text])
 
 
 def send_card(reply_to: str, card: dict, idem: str) -> Tuple[bool, str, bool]:
     """用交互卡片回复飞书消息（状态卡）。返回值同 send_reply。"""
-    return _run_lark([config.lark_bin(), "im", "+messages-reply", "--as", "bot", "--message-id", reply_to,
+    return _run_lark([config.lark_bin()] + _target_args(reply_to) + [
                       "--idempotency-key", idem, "--msg-type", "interactive",
                       "--content", json.dumps(card, ensure_ascii=False)])
 
@@ -124,7 +158,12 @@ def _read_workdir_file(path: str, workdir: Optional[str], limit: int) -> bytes:
     real = os.path.realpath(path)
     if not real.startswith(root + os.sep):
         raise OSError("不在工单目录内")
-    fd = safefs.open_read(path)
+    # 目录部分解析一次（允许工单目录里本来就有的、指向目录内的链接），最后一级保留原名，交给 open_read_under：
+    # 从工单目录起逐级 openat + O_NOFOLLOW，检查之后被并发换成符号链接的那一级会直接打开失败
+    lexical = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+    if not lexical.startswith(root + os.sep):
+        raise OSError("不在工单目录内")
+    fd = safefs.open_read_under(root, os.path.relpath(lexical, root))
     if fd is None:
         raise OSError("文件不存在")
     try:
@@ -133,7 +172,7 @@ def _read_workdir_file(path: str, workdir: Optional[str], limit: int) -> bytes:
         if (st.st_dev, st.st_ino) != (rst.st_dev, rst.st_ino):
             raise OSError("路径在读取过程中被替换")
         opened = _fd_path(fd)
-        # O_NOFOLLOW 只管最后一级：中间某级目录在检查和打开之间被换成符号链接时，按实际打开的文件再核一次
+        # 纵深防御：按实际打开的文件再核一次（逐级打开已经堵住了竞态，拿不到路径时不再是唯一防线）
         if opened is not None and not os.path.realpath(opened).startswith(root + os.sep):
             raise OSError("打开的文件不在工单目录内")
         if st.st_size > limit:
@@ -175,9 +214,40 @@ def resolve_card_videos(card: dict, workdir: Optional[str], ticket_id: str, driv
     return card, leftover
 
 
-def _resolve_videos(card, workdir, ticket_id, drive_uploader=None, uploader=None, degrade=True):
+BUDGET_STOP = "上传预算用完："  # 不是失败：不计 attempts、不退避、不挡其余行（flush 里单独处理）
+
+
+def _over_budget(deadline: Optional[float]) -> str:
+    """一行结果卡本 tick 的上传时间用完了：返回停下的原因（按网络失败处理：写回进度、退避、下次接着传）。"""
+    if deadline is not None and _clock() > deadline:
+        return BUDGET_STOP + "本轮上传已超过 %d 秒，先停下，下次接着传" % MEDIA_BUDGET
+    return ""
+
+
+DRIVE_LINK_TTL = 7 * 24 * 3600.0
+
+
+def _video_digest(video: str, workdir: Optional[str]) -> Optional[str]:
+    try:
+        return hashlib.sha256(_read_workdir_file(video, workdir, MAX_DRIVE_VIDEO_BYTES)).hexdigest()
+    except OSError:
+        return None
+
+
+def _cached_link(con, ticket_id: str, digest: Optional[str]) -> Optional[str]:
+    if con is None or not digest:
+        return None
+    row = con.execute("SELECT url FROM drive_links WHERE ticket_id=? AND sha256=? AND created_at>?",
+                      (ticket_id, digest, db.now() - DRIVE_LINK_TTL)).fetchone()
+    return row["url"] if row else None
+
+
+def _resolve_videos(card, workdir, ticket_id, drive_uploader=None, uploader=None, degrade=True,
+                    con=None, deadline=None):
     """返回 (新卡片, 降级成另发消息的视频, 瞬时失败信息或 "")。degrade=False 时遇到网络/超时就停下：
-    这个视频的占位原样保留（已拿到的云空间链接记在占位上，下次不重传），后面的视频也不再处理。"""
+    这个视频的占位原样保留（已拿到的云空间链接记在占位上，下次不重传），后面的视频也不再处理。
+    con 不为空时按「工单 + 内容哈希」复用传过的云空间链接（同一个视频再报一次不重复上传）。
+    deadline（_clock 时间）之后不再开始新的上传。"""
     drive_uploader = drive_uploader or upload_video_drive
     uploader = uploader or upload_image
     out, leftover, err = [], [], ""
@@ -187,10 +257,25 @@ def _resolve_videos(card, workdir, ticket_id, drive_uploader=None, uploader=None
             continue
         video = el[templates.VIDEO_KEY]
         url = el.get(templates.VIDEO_URL_KEY)
+        digest = None
+        if not url and con is not None:
+            digest = _video_digest(video, workdir)
+            url = _cached_link(con, ticket_id, digest)
         if not url:
+            err = _over_budget(deadline)
+            if err:
+                out.append(el)
+                continue
             ok, info = drive_uploader(video, workdir, ticket_id)
             if ok:
                 url = info
+                # 上传前后各算一次哈希，一致才缓存：上传途中文件被改写时不把旧哈希记到新内容的链接上
+                if con is not None and digest and _video_digest(video, workdir) == digest:
+                    try:
+                        con.execute("INSERT OR REPLACE INTO drive_links VALUES(?,?,?,?)",
+                                    (ticket_id, digest, url, db.now()))
+                    except sqlite3.OperationalError as e:  # 缓存是锦上添花：库被锁住时不影响这次发送
+                        alert("云空间链接缓存写入失败（%s）：%r" % (video, e))
             elif _is_transient(info) and not degrade:
                 err = info
                 out.append(el)
@@ -201,6 +286,10 @@ def _resolve_videos(card, workdir, ticket_id, drive_uploader=None, uploader=None
         cover = find_cover(video, workdir)
         key = ""
         if cover:
+            err = _over_budget(deadline)
+            if err:
+                out.append(dict(el, **({templates.VIDEO_URL_KEY: url} if url else {})))
+                continue
             key, why = _upload_workdir_image(cover, workdir, uploader)
             if not key and _is_transient(why) and not degrade:
                 err = why
@@ -222,9 +311,10 @@ def resolve_card_images(card: dict, workdir: Optional[str], uploader=None) -> di
     return _resolve_images(card, workdir, uploader, degrade=True)[0]
 
 
-def _resolve_images(card, workdir, uploader=None, degrade=True):
+def _resolve_images(card, workdir, uploader=None, degrade=True, deadline=None):
     """返回 (新卡片, 瞬时失败信息或 "")。上传的是读进来的字节的私有副本，不把 worker 可控的路径交给 lark-cli。
-    degrade=False 时第一张遇到网络/超时就停：这张和后面没传的都保留占位，已经成功的换好 img_key。"""
+    degrade=False 时第一张遇到网络/超时就停：这张和后面没传的都保留占位，已经成功的换好 img_key。
+    deadline（_clock 时间）之后不再开始新的上传（不论 degrade），没传的保留占位。"""
     uploader = uploader or upload_image
     state = {"err": ""}
 
@@ -235,6 +325,10 @@ def _resolve_images(card, workdir, uploader=None, degrade=True):
                 out.append(el)
                 continue
             if templates.UPLOAD_KEY in el:
+                state["err"] = _over_budget(deadline)
+                if state["err"]:
+                    out.append(el)
+                    continue
                 path = el[templates.UPLOAD_KEY]
                 key, why = _upload_workdir_image(path, workdir, uploader)
                 if key:
@@ -272,7 +366,14 @@ def _has_uploads(obj) -> bool:
     return False
 
 
-MAX_DRIVE_VIDEO_BYTES = 20 * 1024 * 1024  # 云空间一次性上传（upload_all）的上限
+# 云空间视频上限。lark-cli drive +upload 超过 20MB 自动走分片上传（upload_prepare/part/finish，
+# v1.0.86 源码 shortcuts/drive/drive_upload.go），20MB 不是接口上限；100MB 是为了限制守护进程的阻塞时间和内存。
+MAX_DRIVE_VIDEO_BYTES = 100 * 1024 * 1024
+
+
+def _drive_timeout(size: int) -> float:
+    """云空间上传的超时：20MB 以内 180 秒，之后每 MB 加 3 秒（100MB 约 420 秒）。"""
+    return VIDEO_TIMEOUT + max(0, size - 20 * 1024 * 1024) * 3 / (1024 * 1024)
 _DRIVE_URL = re.compile(r"^https://[A-Za-z0-9.-]+\.(feishu\.cn|larksuite\.com|feishu-pre\.net)/\S+$")
 
 
@@ -300,7 +401,7 @@ def upload_video_drive(video: str, workdir: Optional[str], ticket_id: str) -> Tu
                "--name", _safe_drive_name(ticket_id, video)]
         if config.video_folder():
             cmd += ["--folder-token", config.video_folder()]
-        ok, body, err = _lark_json(cmd, cwd=d, timeout=VIDEO_TIMEOUT)
+        ok, body, err = _lark_json(cmd, cwd=d, timeout=_drive_timeout(len(data)))
     if not ok:
         return False, "上传云空间失败：%s" % err
     url = _find_url(body)
@@ -342,7 +443,7 @@ def _find_url(obj) -> Optional[str]:
 def _lark_json(cmd, cwd: Optional[str] = None, timeout: float = 30) -> Tuple[bool, Optional[dict], str]:
     """跑 lark-cli，返回 (成功, data 字段, 失败信息)。"""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout, cwd=cwd)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, None, "调用 lark-cli 失败：%s" % e
     data = _parse_json(p.stdout) or _parse_json(p.stderr)
@@ -389,8 +490,7 @@ def send_video(reply_to: str, video: str, workdir: Optional[str], idem: str) -> 
         name = "video.mp4"  # 固定 ASCII 名：不把 worker 起的文件名交给 lark-cli
         with open(os.path.join(d, name), "wb") as f:
             f.write(data)
-        cmd = [config.lark_bin(), "im", "+messages-reply", "--as", "bot", "--message-id", reply_to,
-               "--idempotency-key", idem]
+        cmd = [config.lark_bin()] + _target_args(reply_to) + ["--idempotency-key", idem]
         if cover_data is not None:
             cname = "cover" + os.path.splitext(cover)[1].lower()
             with open(os.path.join(d, cname), "wb") as f:
@@ -404,7 +504,7 @@ def send_video(reply_to: str, video: str, workdir: Optional[str], idem: str) -> 
 
 def _run_lark(cmd, field: str = "message_id", cwd: Optional[str] = None, timeout: float = 30) -> Tuple[bool, str, bool]:
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout, cwd=cwd)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, "调用 lark-cli 失败：%s" % e, False
     data = _parse_json(p.stdout) or _parse_json(p.stderr)
@@ -437,8 +537,8 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None)
     video_sender = video_sender or send_video
     idem = _idem(r)
     media = r["media_json"] if "media_json" in r.keys() else None
-    if media and r["attempts"] >= VIDEO_MAX_ATTEMPTS:
-        # 网络/超时反复失败：每次都要阻塞守护进程最多 180 秒、还挡住同单后面的消息，不再硬发，改发文字
+    if media and r["attempts"] >= VIDEO_MAX_ATTEMPTS and db.now() - r["created_at"] >= MEDIA_DEGRADE_AFTER:
+        # 网络/超时反复失败且已等了 10 分钟：每次都要阻塞守护进程最多 180 秒、还挡住同单后面的消息，不再硬发，改发文字
         alert("outbox %d（%s）视频连续 %d 次没发出，改发文字：%s" % (r["id"], r["ticket_id"], r["attempts"], r["last_error"]))
         con.execute("UPDATE outbox SET media_json='' WHERE id=?", (r["id"],))
         media = ""
@@ -447,6 +547,8 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None)
         ok, info, permanent = video_sender(r["reply_to"], json.loads(media)["video"], t["workdir"] if t else None, idem)
         if ok or not permanent:
             return ok, info, permanent
+        if _reply_gone(info):  # 回复目标没了：不是视频的问题，由 flush 改投到会话后原样重发
+            return False, info, False
         # 视频发不出去（文件不合格或飞书永久拒收）：改发文字告诉用户文件在哪
         alert("outbox %d（%s）视频消息发送失败，改发文字：%s" % (r["id"], r["ticket_id"], info))
         con.execute("UPDATE outbox SET media_json='' WHERE id=?", (r["id"],))
@@ -462,17 +564,21 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None)
         # 先传视频（云空间）和图片，把换好链接/img_key 的卡片写回发件箱：重试时不重复上传
         t = con.execute("SELECT workdir FROM tickets WHERE id=?", (r["ticket_id"],)).fetchone()
         wd = t["workdir"] if t else None
-        # 网络/超时：只写回已经成功的部分，整行按 attempts 退避重试；连续 MEDIA_MAX_ATTEMPTS 次后才降级
-        degrade = r["attempts"] >= MEDIA_MAX_ATTEMPTS
-        card, leftover, err = _resolve_videos(card, wd, r["ticket_id"], degrade=degrade)
+        # 网络/超时：只写回已经成功的部分，整行按 attempts 退避重试；失败满 MEDIA_MAX_ATTEMPTS 次、
+        # 且这一行已经等了 MEDIA_DEGRADE_AFTER 秒后才降级（短暂断网不该让图片永久变灰字）
+        degrade = r["attempts"] >= MEDIA_MAX_ATTEMPTS and db.now() - r["created_at"] >= MEDIA_DEGRADE_AFTER
+        deadline = _clock() + MEDIA_BUDGET  # 一个 tick 里不在一行上耗太久（主循环还要调度、刷新状态卡）
+        card, leftover, err = _resolve_videos(card, wd, r["ticket_id"], degrade=degrade, con=con, deadline=deadline)
         if not err:
-            card, err = _resolve_images(card, wd, degrade=degrade)
+            card, err = _resolve_images(card, wd, degrade=degrade, deadline=deadline)
         with db.tx(con):
             con.execute("UPDATE outbox SET card_json=? WHERE id=?", (json.dumps(card, ensure_ascii=False), r["id"]))
             for v in leftover:  # 没进卡片的视频：卡片之后另发视频消息（id 更大，排在卡片后面）
                 con.execute("INSERT INTO outbox(ticket_id, reply_to, text, media_json, created_at) VALUES(?,?,?,?,?)",
                             (r["ticket_id"], r["reply_to"], templates.video_fallback(r["ticket_id"], v, wd),
                              json.dumps({"video": v}, ensure_ascii=False), db.now()))
+        if err.startswith(BUDGET_STOP):
+            return False, err, False  # 只是这个 tick 的时间用完了：flush 不计失败、下个 tick 接着传
         if err:
             # 以「调用 lark-cli 失败」开头：flush 按网络失败处理（退避、本 tick 不再试其余行）
             return False, "调用 lark-cli 失败：上传卡片媒体暂时失败，稍后重试（%s）" % err[:300], False
@@ -491,6 +597,8 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None)
     ok, info, permanent = card_sender(r["reply_to"], card, idem)
     if ok or not (permanent or _is_api_error(info)):
         return ok, info, permanent
+    if _reply_gone(info):  # 回复目标没了：卡片本身没问题，由 flush 改投到会话后原样重发
+        return False, info, False
     # 飞书明确拒收了卡片（任何业务错误，不只是白名单里的码）：马上改发文字兜底，结果不能丢
     alert("outbox %d（%s）结果卡片发送失败，改发文字：%s" % (r["id"], r["ticket_id"], info))
     con.execute("UPDATE outbox SET card_json='', text=? WHERE id=?", (text, r["id"]))
@@ -528,6 +636,33 @@ def _ping(con, r, message_id: str) -> Optional[str]:
     return templates.ping_message(r["ticket_id"], rep["status"], rep["summary"], rep["ask"]) if rep else None
 
 
+def _redirect_to_chat(con, r, info: str):
+    """被回复的消息已撤回/删除：这一单还没发出的消息都改为直接发到会话里。返回更新后的行；查不到会话返回 None。"""
+    t = con.execute("SELECT chat_id FROM tickets WHERE id=?", (r["ticket_id"],)).fetchone()
+    if not t or not (t["chat_id"] or "").startswith("oc_"):
+        return None
+    alert("outbox %d（%s）回复目标 %s 已撤回，改为直接发到会话：%s" % (r["id"], r["ticket_id"], r["reply_to"], info[:200]))
+    con.execute("UPDATE outbox SET reply_to=? WHERE ticket_id=? AND reply_to=? AND status='pending'",
+                (t["chat_id"], r["ticket_id"], r["reply_to"]))
+    return con.execute("SELECT * FROM outbox WHERE id=?", (r["id"],)).fetchone()
+
+
+def _poison(con, r, sender, e: Exception) -> None:
+    """发送这一行时抛了异常：先试一次文字兜底（送到了算 sent，并绑定消息以便追问），不行再标 dead。"""
+    tok, tinfo = False, None
+    try:
+        tok, tinfo, _ = sender(r["reply_to"], r["text"], _idem(r) + "-t")
+    except Exception:
+        pass
+    with db.tx(con):
+        con.execute("UPDATE outbox SET status=?, attempts=?, last_error=?, sent_message_id=? WHERE id=?",
+                    ("sent" if tok else "dead", r["attempts"] + 1, repr(e), tinfo if tok else None, r["id"]))
+        if tok and tinfo:
+            con.execute("INSERT OR IGNORE INTO bindings VALUES(?,?)", (tinfo, r["ticket_id"]))
+        con.execute("UPDATE tickets SET card_at=0 WHERE id=?", (r["ticket_id"],))
+    alert("outbox %d %s（%s）：发送异常 %r" % (r["id"], "已改发文字" if tok else "dead", r["ticket_id"], e))
+
+
 def flush(con, sender=None, limit: int = 5, card_sender=None, card_patcher=None) -> None:
     sender = sender or send_reply
     card_sender = card_sender or send_card
@@ -540,11 +675,27 @@ def flush(con, sender=None, limit: int = 5, card_sender=None, card_patcher=None)
     for r in rows:
         try:
             ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher=card_patcher)
-        except Exception as e:  # 毒丸行：发送器本身抛异常，标记 dead 后继续处理其余行
-            con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
-                        (r["attempts"] + 1, repr(e), r["id"]))
-            con.execute("UPDATE tickets SET card_at=0 WHERE id=?", (r["ticket_id"],))
-            alert("outbox %d dead（%s）：发送异常 %r" % (r["id"], r["ticket_id"], e))
+            if not ok and _reply_gone(info) and not r["reply_to"].startswith("oc_"):
+                moved = _redirect_to_chat(con, r, info)
+                if moved is not None:
+                    r = moved
+                    ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher=card_patcher)
+        except sqlite3.OperationalError as e:
+            if db.now() - r["created_at"] <= 24 * 3600:
+                # 库被别的写者锁住等：不是这一行的问题，稍后重试（不能当毒丸改发文字，会把卡片永久换掉）
+                alert("outbox %d（%s）写库失败，稍后重试：%r" % (r["id"], r["ticket_id"], e))
+                try:
+                    con.execute("UPDATE outbox SET next_at=?, last_error=? WHERE id=?", (db.now() + 30, repr(e), r["id"]))
+                except sqlite3.Error:
+                    pass
+                break
+            _poison(con, r, sender, e)
+            continue
+        except Exception as e:  # 毒丸行：发送器本身抛异常。标 dead 之前先试一次文字兜底，结果不能丢
+            _poison(con, r, sender, e)
+            continue
+        if not ok and info.startswith(BUDGET_STOP):  # 上传时间用完：进度已写回，下个 tick 接着传，不算失败
+            con.execute("UPDATE outbox SET next_at=0, last_error=? WHERE id=?", (info, r["id"]))
             continue
         attempts = r["attempts"] + 1
         if r["report_id"] is not None and (ok or permanent or db.now() - r["created_at"] > 24 * 3600):

@@ -160,6 +160,7 @@ class SendRobustnessTest(TicketdTestCase):
         self.write(os.path.join(wd, "a.png"), PNG)
         self.outbox.upload_image = lambda p: (False, NET, False)
         self.core.add_report(self.con, tid, "ready", "图好了", ["a.png"])
+        self.con.execute("UPDATE outbox SET created_at=created_at-?", (self.outbox.MEDIA_DEGRADE_AFTER + 1,))
         for _ in range(self.outbox.MEDIA_MAX_ATTEMPTS):
             self.tick()
         self.assertEqual(self.cards, [])
@@ -223,6 +224,7 @@ class SendRobustnessTest(TicketdTestCase):
         self.write(os.path.join(wd, "v.mp4"), MP4)
         self.outbox.upload_video_drive = lambda v, w, t: (False, "上传云空间失败：" + NET)
         self.core.add_report(self.con, tid, "ready", "视频好了", ["v.mp4"])
+        self.con.execute("UPDATE outbox SET created_at=created_at-?", (self.outbox.MEDIA_DEGRADE_AFTER + 1,))
         for _ in range(self.outbox.MEDIA_MAX_ATTEMPTS + 1):
             self.tick()
         self.assertEqual(len(self.cards), 1)

@@ -317,6 +317,8 @@ class CardVideosTest(TicketdTestCase):
         self.write(os.path.join(wd, "v.jpg"), JPG)
         self.core.add_report(self.con, tid, "ready", "好了", ["v.mp4"])
         self.outbox.flush(self.con)  # 卡片
+        # 失败满 3 次且这条视频消息已等了 10 分钟才改发文字
+        self.con.execute("UPDATE outbox SET created_at=created_at-?", (self.outbox.MEDIA_DEGRADE_AFTER + 1,))
         fail = self.tmp / "fail"
         fail.write_text("3")
         os.environ["FAKE_LARK_FAIL_FILE"] = str(fail)

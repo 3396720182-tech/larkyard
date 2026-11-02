@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS outbox(
   next_at REAL NOT NULL DEFAULT 0, last_error TEXT, sent_message_id TEXT, created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS locks(path TEXT PRIMARY KEY, ticket_id TEXT NOT NULL);
+-- 视频传到云空间后的链接（按工单 + 内容哈希）：同一个视频再次汇报时复用，不重复上传
+CREATE TABLE IF NOT EXISTS drive_links(
+  ticket_id TEXT NOT NULL, sha256 TEXT NOT NULL, url TEXT NOT NULL, created_at REAL NOT NULL,
+  PRIMARY KEY(ticket_id, sha256)
+);
 """
 
 # 上线后加的列：老库用 ALTER TABLE 补上（CLI 和守护进程都会跑，重复添加的报错忽略）

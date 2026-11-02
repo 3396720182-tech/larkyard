@@ -227,6 +227,9 @@ def _failed(con, t, info: str, permanent: bool, now: float, what: str, creating:
 def _create(con, t, v, now: float, create, reply_to: str, idem: str) -> str:
     card = render(t, v, core.grants(con, t["id"]), now)
     ok, info, permanent = create(reply_to, card, idem)
+    if not ok and outbox._reply_gone(info) and (t["chat_id"] or "").startswith("oc_"):
+        # 被回复的消息已撤回（230011）：状态卡改为直接发到会话里，不然整单都看不到进度
+        ok, info, permanent = create(t["chat_id"], card, idem)
     if ok and not info:
         # 可能其实已经发出去了：用同一个幂等键重试，飞书会返回同一条消息的 id
         ok, info, permanent = False, "发卡成功但没拿到 message_id，稍后用同一幂等键重试", False
