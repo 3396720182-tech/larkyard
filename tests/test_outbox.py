@@ -105,12 +105,27 @@ class OutboxTest(TicketdTestCase):
         self.core.add_report(self.con, tid, "ready", "好了")
 
     def test_old_row_marked_dead(self):
-        self._one_retryable_failure()
+        fail = self.tmp / "fail"
+        fail.write_text("2")  # 文字消息行：这次和兜底都失败 → 没有别的可试，dead
+        os.environ["FAKE_LARK_FAIL_FILE"] = str(fail)
+        tid = self.new_ticket()
+        self.core.enqueue_message(self.con, tid, "一条文字")
         self.con.execute("UPDATE outbox SET created_at=created_at-25*3600")
         self.outbox.flush(self.con)
         self.assertEqual(self.con.execute("SELECT status FROM outbox").fetchone()[0], "dead")
         from ticketd import config
         self.assertIn("仍失败", (config.logs_dir() / "alerts.log").read_text(encoding="utf-8"))
+
+    def test_old_card_row_tries_text_before_dead(self):
+        self._one_retryable_failure()  # 结果卡这次发送失败（网络）
+        self.con.execute("UPDATE outbox SET created_at=created_at-25*3600")
+        self.outbox.flush(self.con)
+        row = self.con.execute("SELECT * FROM outbox").fetchone()
+        self.assertEqual(row["status"], "sent")  # 24 小时到了：先试一次文字兜底，送到了就不 dead
+        last = self.sent()[-1]
+        self.assertIn("--text", last)
+        self.assertTrue(last[last.index("--idempotency-key") + 1].endswith("-t"))
+        self.assertEqual(self.core.lookup(self.con, row["sent_message_id"]), "T0001")
 
     def test_many_attempts_fresh_row_stays_pending(self):
         self._one_retryable_failure()

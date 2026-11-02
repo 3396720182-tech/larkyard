@@ -38,6 +38,7 @@ VIDEO_EXTS = (".mp4",)
 COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 MAX_VIDEOS = 2
 VIDEO_KEY = "ticketd_video"
+VIDEO_URL_KEY = "ticketd_video_url"  # 已经传好的云空间链接（封面瞬时失败时记在占位上，重试不再重传视频）
 
 
 def short(s, n: int = 160) -> str:

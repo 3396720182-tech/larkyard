@@ -40,6 +40,19 @@ def _is_network_failure(info: str) -> bool:
     return info.startswith("调用 lark-cli 失败") or '"type": "network"' in info
 
 
+def _is_transient(info: str) -> bool:
+    """网络/超时这类「过一会儿可能就好」的失败（不论出现在错误信息的哪个位置，如「上传云空间失败：调用 lark-cli 失败…」）。"""
+    return "调用 lark-cli 失败" in (info or "") or '"type": "network"' in (info or "")
+
+
+def _is_api_error(info: str) -> bool:
+    """飞书已经明确回了业务错误（lark-cli 的 error.type == "api"），不是网络问题。"""
+    return '"type": "api"' in (info or "")
+
+
+MEDIA_MAX_ATTEMPTS = 3  # 媒体上传瞬时失败时最多退避重试这么多次，之后降级（图换灰字、视频另发）
+
+
 def send_reply(reply_to: str, text: str, idem: str) -> Tuple[bool, str, bool]:
     """回复飞书消息。返回 (是否成功, message_id 或错误信息, 是否永久失败)。"""
     return _run_lark([config.lark_bin(), "im", "+messages-reply", "--as", "bot", "--message-id", reply_to,
@@ -141,7 +154,7 @@ def _read_workdir_file(path: str, workdir: Optional[str], limit: int) -> bytes:
 
 
 def _upload_workdir_image(path: str, workdir: Optional[str], uploader) -> Tuple[str, str]:
-    """上传工单目录里的一张图（私有副本），返回 (image_key, 失败原因)。"""
+    """上传工单目录里的一张图（私有副本），返回 (image_key, 失败原因)。失败原因可用 _is_transient 判断能不能重试。"""
     try:
         data = _read_workdir_image(path, workdir)
         with tempfile.TemporaryDirectory(prefix="ticketd-img-") as d:
@@ -157,41 +170,68 @@ def _upload_workdir_image(path: str, workdir: Optional[str], uploader) -> Tuple[
 def resolve_card_videos(card: dict, workdir: Optional[str], ticket_id: str, drive_uploader=None,
                         uploader=None) -> Tuple[dict, list]:
     """把卡片里的视频占位换成「可点击封面 + 播放按钮」（视频先以用户身份传到云空间拿链接）。
-    返回 (新卡片, 没能放进卡片的视频列表)——后者由调用方另排视频消息。"""
+    返回 (新卡片, 没能放进卡片的视频列表)——后者由调用方另排视频消息。瞬时失败也直接降级（给脚本/样卡用）。"""
+    card, leftover, _ = _resolve_videos(card, workdir, ticket_id, drive_uploader, uploader, degrade=True)
+    return card, leftover
+
+
+def _resolve_videos(card, workdir, ticket_id, drive_uploader=None, uploader=None, degrade=True):
+    """返回 (新卡片, 降级成另发消息的视频, 瞬时失败信息或 "")。degrade=False 时遇到网络/超时就停下：
+    这个视频的占位原样保留（已拿到的云空间链接记在占位上，下次不重传），后面的视频也不再处理。"""
     drive_uploader = drive_uploader or upload_video_drive
     uploader = uploader or upload_image
-    out, leftover = [], []
+    out, leftover, err = [], [], ""
     for el in card.get("body", {}).get("elements", []):
-        if not (isinstance(el, dict) and templates.VIDEO_KEY in el):
+        if err or not (isinstance(el, dict) and templates.VIDEO_KEY in el):
             out.append(el)
             continue
         video = el[templates.VIDEO_KEY]
-        ok, url = drive_uploader(video, workdir, ticket_id)
-        if not ok:
-            alert("视频没能传到云空间，改为卡片后另发视频消息（%s）：%s" % (video, url))
-            url = None
-            leftover.append(video)
+        url = el.get(templates.VIDEO_URL_KEY)
+        if not url:
+            ok, info = drive_uploader(video, workdir, ticket_id)
+            if ok:
+                url = info
+            elif _is_transient(info) and not degrade:
+                err = info
+                out.append(el)
+                continue
+            else:
+                alert("视频没能传到云空间，改为卡片后另发视频消息（%s）：%s" % (video, info))
+                url = None
         cover = find_cover(video, workdir)
         key = ""
         if cover:
             key, why = _upload_workdir_image(cover, workdir, uploader)
+            if not key and _is_transient(why) and not degrade:
+                err = why
+                out.append(dict(el, **({templates.VIDEO_URL_KEY: url} if url else {})))  # 链接留着，下次只补封面
+                continue
             if not key:
                 alert("视频封面未显示（%s）：%s" % (cover, why))
+        if url is None:
+            leftover.append(video)
         out.extend(templates.video_elements(video, url, key or None))
     card = dict(card)
     card["body"] = dict(card.get("body", {}), elements=out)
-    return card, leftover
+    return card, leftover, err
 
 
 def resolve_card_images(card: dict, workdir: Optional[str], uploader=None) -> dict:
     """把卡片里（含 column_set / 容器里嵌套的）待上传图片占位换成 img_key；上传不成的图换成一行灰字
-    「（xx 未能显示）」，结果不能因图片卡住。上传的是读进来的字节的私有副本，不把 worker 可控的路径交给 lark-cli。"""
+    「（xx 未能显示）」（瞬时失败也一样，给脚本/样卡用；发件箱用 _resolve_images 区分瞬时失败）。"""
+    return _resolve_images(card, workdir, uploader, degrade=True)[0]
+
+
+def _resolve_images(card, workdir, uploader=None, degrade=True):
+    """返回 (新卡片, 瞬时失败信息或 "")。上传的是读进来的字节的私有副本，不把 worker 可控的路径交给 lark-cli。
+    degrade=False 时第一张遇到网络/超时就停：这张和后面没传的都保留占位，已经成功的换好 img_key。"""
     uploader = uploader or upload_image
+    state = {"err": ""}
 
     def walk(els):
         out = []
         for el in els:
-            if not isinstance(el, dict):
+            if not isinstance(el, dict) or state["err"]:
                 out.append(el)
                 continue
             if templates.UPLOAD_KEY in el:
@@ -200,6 +240,8 @@ def resolve_card_images(card: dict, workdir: Optional[str], uploader=None) -> di
                 if key:
                     el = {k: v for k, v in el.items() if k != templates.UPLOAD_KEY}
                     el["img_key"] = key
+                elif _is_transient(why) and not degrade:
+                    state["err"] = why
                 else:
                     alert("结果卡图片未显示（%s）：%s" % (path, why))
                     el = templates.note("（%s 未能显示）" % ((el.get("alt") or {}).get("content") or "图片"))
@@ -216,7 +258,7 @@ def resolve_card_images(card: dict, workdir: Optional[str], uploader=None) -> di
 
     card = dict(card)
     card["body"] = dict(card.get("body", {}), elements=walk(card.get("body", {}).get("elements", [])))
-    return card
+    return card, state["err"]
 
 
 def _has_uploads(obj) -> bool:
@@ -387,9 +429,13 @@ def _run_lark(cmd, field: str = "message_id", cwd: Optional[str] = None, timeout
 CARD_HOLD = 120.0  # 新单的状态卡还没发出时，同单的消息先等它（保证卡片排在结果前面），最多等这么久
 
 
+def _idem(r) -> str:
+    return "ticketd-%s-%d-%d" % (r["ticket_id"], r["id"], int(r["created_at"] * 1000) % 10 ** 10)
+
+
 def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None) -> Tuple[bool, str, bool]:
     video_sender = video_sender or send_video
-    idem = "ticketd-%s-%d-%d" % (r["ticket_id"], r["id"], int(r["created_at"] * 1000) % 10 ** 10)
+    idem = _idem(r)
     media = r["media_json"] if "media_json" in r.keys() else None
     if media and r["attempts"] >= VIDEO_MAX_ATTEMPTS:
         # 网络/超时反复失败：每次都要阻塞守护进程最多 180 秒、还挡住同单后面的消息，不再硬发，改发文字
@@ -416,14 +462,20 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None)
         # 先传视频（云空间）和图片，把换好链接/img_key 的卡片写回发件箱：重试时不重复上传
         t = con.execute("SELECT workdir FROM tickets WHERE id=?", (r["ticket_id"],)).fetchone()
         wd = t["workdir"] if t else None
-        card, leftover = resolve_card_videos(card, wd, r["ticket_id"])
-        card = resolve_card_images(card, wd)
+        # 网络/超时：只写回已经成功的部分，整行按 attempts 退避重试；连续 MEDIA_MAX_ATTEMPTS 次后才降级
+        degrade = r["attempts"] >= MEDIA_MAX_ATTEMPTS
+        card, leftover, err = _resolve_videos(card, wd, r["ticket_id"], degrade=degrade)
+        if not err:
+            card, err = _resolve_images(card, wd, degrade=degrade)
         with db.tx(con):
             con.execute("UPDATE outbox SET card_json=? WHERE id=?", (json.dumps(card, ensure_ascii=False), r["id"]))
             for v in leftover:  # 没进卡片的视频：卡片之后另发视频消息（id 更大，排在卡片后面）
                 con.execute("INSERT INTO outbox(ticket_id, reply_to, text, media_json, created_at) VALUES(?,?,?,?,?)",
                             (r["ticket_id"], r["reply_to"], templates.video_fallback(r["ticket_id"], v, wd),
                              json.dumps({"video": v}, ensure_ascii=False), db.now()))
+        if err:
+            # 以「调用 lark-cli 失败」开头：flush 按网络失败处理（退避、本 tick 不再试其余行）
+            return False, "调用 lark-cli 失败：上传卡片媒体暂时失败，稍后重试（%s）" % err[:300], False
     links = _doc_links(con, r)
     if links:  # 稿子按钮每次按缓存现加，不写回发件箱
         card = templates.with_doc_links(card, links)
@@ -431,12 +483,15 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None)
     if r["report_id"] is not None:
         from . import card as status_card  # card 依赖本模块的发送函数
         res = status_card.deliver(con, r["ticket_id"], card, patch=card_patcher)
-        if res is not None:  # 本轮有状态卡：结果直接覆盖到卡上，不另发消息
+        if res is not None and (res[0] or not _is_api_error(res[1])):  # 本轮有状态卡：结果直接覆盖到卡上，不另发消息
             return res
+        if res is not None:
+            # 飞书明确拒绝了这次覆盖（业务错误）：不在状态卡上反复重试，改发新消息（再被拒就走下面的文字兜底）
+            alert("outbox %d（%s）结果覆盖状态卡被拒，改发新消息：%s" % (r["id"], r["ticket_id"], res[1]))
     ok, info, permanent = card_sender(r["reply_to"], card, idem)
-    if ok or not permanent:
+    if ok or not (permanent or _is_api_error(info)):
         return ok, info, permanent
-    # 卡片被飞书判为永久失败（多半是卡片结构不被接受）：改发文字兜底，结果不能丢
+    # 飞书明确拒收了卡片（任何业务错误，不只是白名单里的码）：马上改发文字兜底，结果不能丢
     alert("outbox %d（%s）结果卡片发送失败，改发文字：%s" % (r["id"], r["ticket_id"], info))
     con.execute("UPDATE outbox SET card_json='', text=? WHERE id=?", (text, r["id"]))
     return sender(r["reply_to"], text, idem + "-t")
@@ -509,6 +564,18 @@ def flush(con, sender=None, limit: int = 5, card_sender=None, card_patcher=None)
                         (attempts, info, r["id"]))
             alert("outbox %d dead（%s）：%s" % (r["id"], r["ticket_id"], info))
         elif db.now() - r["created_at"] > 24 * 3600:
+            media = r["media_json"] if "media_json" in r.keys() else None
+            if r["card_json"] or media:
+                # 卡片/视频重试了 24 小时都没发出：放弃前先试一次文字兜底，结果至少以文字送到
+                tok, tinfo, _ = sender(r["reply_to"], r["text"], _idem(r) + "-t")
+                if tok:
+                    alert("outbox %d（%s）24 小时没发出，已改发文字：%s" % (r["id"], r["ticket_id"], info))
+                    with db.tx(con):
+                        con.execute("UPDATE outbox SET status='sent', attempts=?, sent_message_id=?, last_error=?"
+                                    " WHERE id=?", (attempts, tinfo, info, r["id"]))
+                        if tinfo:
+                            con.execute("INSERT OR IGNORE INTO bindings VALUES(?,?)", (tinfo, r["ticket_id"]))
+                    continue
             con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
                         (attempts, info, r["id"]))
             alert("outbox %d dead（%s）：重试 %d 次仍失败：%s" % (r["id"], r["ticket_id"], attempts, info))
