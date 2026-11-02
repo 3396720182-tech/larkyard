@@ -23,11 +23,17 @@
 
 ```
 用户 ──飞书──▶ bridge 会话（主会话：只派单）
-                 │  ticket new / send / stop / hold / release / grant / show / ls
-                 ▼
-          SQLite（~/.ticketd/db/ticketd.db） ◀──轮询（1s）── ticketd（launchd 托管）
-                                                        ├─ worker：claude -p（每单一个会话 + 目录）
-                                                        └─ 发件箱：lark-cli 回复原消息，失败重试
+▲                │  ticket new / send / stop / hold / release / grant / show / ls
+│                ▼
+│         SQLite（~/.ticketd/db/ticketd.db） ◀──轮询（1s）── ticketd（launchd / systemd 托管）
+│                                                       ├─ worker：Claude Code（claude -p）或 Codex（codex exec），按单路由
+│                                                       │          每单一个会话 + 目录 + 沙箱，汇报写进 .reports/
+│                                                       ├─ 状态卡：原地刷新，结果覆盖
+│                                                       └─ 发件箱：处理产物，再用 lark-cli 发回飞书
+│                                                          ├─ 图片放进卡里；视频以用户身份传云空间（按内容缓存链接）；稿子导入云文档
+│                                                          ├─ 断网退避重试；媒体失败满 3 次且已等 10 分钟才降级
+│                                                          ├─ 回复原消息；原消息已撤回（230011）则改发到会话
+└──◀── 结果卡 / 提醒 ──────────────────────────────────────┘
 ```
 
 | 单元 | 职责 | 不负责 |
