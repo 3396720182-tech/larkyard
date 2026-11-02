@@ -53,8 +53,9 @@ def _sweep_orphans(spool: str, sig: int) -> int:
     """真实 Bash 工具让每条命令自成进程组，`cmd &` 会被 PID 1 收养而逃过 killpg；
     但它们继承了 worker 环境，按 TICKETD_SPOOL 标记找出来补发信号。
     macOS 15 起 ps -E 看不到系统自带程序（sh、sleep…）的环境变量，所以再按目录补一道：
-    已被 launchd 收养、没有控制终端、当前目录在工单目录内的进程也算残留
-    （有终端的是用户自己的 shell / claude --resume，ppid 不是 1 的有正常的父进程，都不碰）。永不抛异常。"""
+    已被收养（macOS：launchd；Linux：PID 1 或 ticketd 的祖先，如 systemd --user）、没有控制终端、当前目录在工单目录内的进程也算残留
+    （有终端的是用户自己的 shell / claude --resume，父进程还在的有正常的父进程，都不碰）。
+    进程怎么查见 procs.py。永不抛异常。"""
     try:
         targets, orphans = procs.scan(spool)
         if orphans:
@@ -75,7 +76,7 @@ def _sweep_orphans(spool: str, sig: int) -> int:
 
 
 def _wait_exited(pid: int, timeout: float = 3.0) -> None:
-    """等 pid 退出或变成僵尸：只有这之后它的脱组子进程才会被 launchd 收养，按目录清理才认得出。"""
+    """等 pid 退出或变成僵尸：只有这之后它的脱组子进程才会被 launchd / init 收养，按目录清理才认得出。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:

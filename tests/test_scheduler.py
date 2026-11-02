@@ -285,17 +285,15 @@ class SchedulerTest(TicketdTestCase):
 
     # ---------- 评审修复 F2：整组进程 ----------
     def _wait_gone(self, pid, timeout=5):
-        import subprocess
         import time
+        from ticketd import procs
 
         def alive():
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
                 return False
-            stat = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
-                                  capture_output=True, text=True).stdout.strip()
-            return bool(stat) and not stat.startswith("Z")
+            return not procs.is_gone(pid)
 
         end = time.time() + timeout
         while alive() and time.time() < end:
@@ -311,8 +309,8 @@ class SchedulerTest(TicketdTestCase):
         self.assertTrue(self._wait_gone(child))
 
     def test_stop_kills_whole_process_group(self):
-        import subprocess
         import time
+        from ticketd import procs
         tid = self.new_ticket(request="[[fake:sleep_child]]")
         marker = self.child_marker(tid)
         self.wait(lambda: self.state(tid) == "running" and os.path.exists(marker)
@@ -326,9 +324,7 @@ class SchedulerTest(TicketdTestCase):
                 os.kill(pid, 0)
             except ProcessLookupError:
                 return False
-            stat = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
-                                  capture_output=True, text=True).stdout.strip()
-            return bool(stat) and not stat.startswith("Z")
+            return not procs.is_gone(pid)
 
         end = time.time() + 5
         while alive(child) and time.time() < end:
@@ -448,7 +444,7 @@ class SchedulerTest(TicketdTestCase):
 
     # ---------- 环境变量看不到时（系统自带程序）：按目录清理被收养的进程 ----------
     def _orphan_in(self, cwd):
-        """在 cwd 里起一个 /bin/sleep，父 shell 立即退出：它被 launchd 收养、没有控制终端。"""
+        """在 cwd 里起一个 /bin/sleep，父 shell 立即退出：它被 launchd（Linux：init 或 subreaper）收养、没有控制终端。"""
         import subprocess
         os.makedirs(cwd, exist_ok=True)
         out = subprocess.run(["/bin/sh", "-c", "/bin/sleep 60 >/dev/null 2>&1 </dev/null & echo $!"], cwd=cwd,
@@ -465,13 +461,13 @@ class SchedulerTest(TicketdTestCase):
             pass
 
     def _wait_reparented(self, pid):
-        import subprocess
         import time
+        from ticketd import procs
         for _ in range(100):
-            if subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True).stdout.strip() == "1":
+            if pid in procs.scan(str(self.tmp / "no-such-spool"))[1]:
                 return
             time.sleep(0.05)
-        self.fail("进程 %d 没有被 launchd 收养" % pid)
+        self.fail("进程 %d 没有被 launchd / init 收养" % pid)
 
     def test_sweep_by_cwd_catches_adopted_system_binary(self):
         from ticketd.scheduler import _sweep_orphans
