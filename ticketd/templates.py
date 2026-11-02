@@ -26,7 +26,7 @@ LABELS["progress"] = "❓ 有问题问你"
 _URL = re.compile(r"^https?://[^\s<>\"]+$")
 
 # 结果卡里直接显示的图片产物。占位元素带 UPLOAD_KEY，由发件箱在发送前上传换成 img_key；
-# 换不成的占位会被整个删掉（产物路径仍在 📎 列表里），所以占位字段永远不会原样发给飞书。
+# 换不成的占位换成一行灰字「（图 N 未能显示）」（路径仍在本机文件列表里），所以占位字段永远不会原样发给飞书。
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 MAX_CARD_IMAGES = 6
 UPLOAD_KEY = "ticketd_upload"
@@ -151,33 +151,125 @@ def image_artifacts(artifacts: List[str]) -> List[str]:
             and a.lower() not in covers][:MAX_CARD_IMAGES]
 
 
-def result_elements(status: str, summary: str, artifacts: List[str], ask: Optional[str],
-                    workdir: Optional[str], images: bool = False) -> list:
-    """结果正文：一句话结果、需要你做的事、产物。images=True 时图片产物直接显示（只用于推送的结果卡，
-    状态卡原地 PATCH 不经发件箱，不能带待上传的占位）。"""
-    els = [text(clip(summary, 1200))]
-    if ask:
-        if status == "dropped":
-            els.append(text("说明：%s。不引用直接发我即可开新单。" % clip(ask, 400).rstrip("。")))
-        else:
-            els.append(text("👉 需要你：" + clip(ask, 600), color="orange" if status == "blocked" else None))
-    files = [a for a in artifacts if not _URL.match(a)]
-    links = [a for a in artifacts if _URL.match(a)]
-    if images:
-        for v in video_artifacts(artifacts):
-            els.append(dict(note("🎬 " + short(Path(v).name, 60)), **{VIDEO_KEY: v}))
-        for a in image_artifacts(artifacts):
-            name = short(Path(a).name, 60)
-            els.append(note(name))
-            els.append({"tag": "img", "img_key": "", UPLOAD_KEY: a,
-                        "alt": {"tag": "plain_text", "content": name}})
+_SENTENCE_END = re.compile(r"[。！？!?；;\n]")
+
+
+def split_summary(summary: str):
+    """摘要拆成「结论」（第一句，卡片里放大显示）和「细节」（其余，正常字号）。"""
+    s = clip(summary, 1200)
+    m = _SENTENCE_END.search(s)
+    if not m or m.start() > 120:
+        return (s, "") if len(s) <= 120 else (short(s, 60), s)
+    head = s[:m.start()].strip()
+    rest = s[m.end():].strip()
+    return (head or s, rest) if head else (s, "")
+
+
+def callout(label: str, body: str, color: str) -> dict:
+    """浅色底的提示块（需要你做的事）。"""
+    return {"tag": "column_set", "flex_mode": "none", "columns": [{
+        "tag": "column", "width": "weighted", "weight": 1, "background_style": color + "-50",
+        "padding": "8px 12px 8px 12px", "vertical_spacing": "4px",
+        "elements": [text(label, size="notation", color=color), text(body)]}]}
+
+
+def _img(path: str, name: str, **extra) -> dict:
+    return dict({"tag": "img", "img_key": "", UPLOAD_KEY: path, "alt": {"tag": "plain_text", "content": name}}, **extra)
+
+
+def _badge(n: int) -> dict:
+    """图下方居中的圆形编号（内容是我们自己生成的数字，不含 worker 文字，可以用 markdown）。"""
+    return {"tag": "markdown", "content": "<number_tag>%d</number_tag>" % n, "text_align": "center"}
+
+
+def image_grid(paths: List[str], grid: bool = False) -> list:
+    """画廊：单张图做主图（不裁剪、圆角、可点开放大）；多张图两列网格，每张不裁剪、下面一个圆形编号，
+    方便回复「选 2」；奇数张补空列保持等宽。grid=True（卡里已经有视频做主角）时，图片作为三列小缩略图跟在后面。"""
+    if grid:
+        cols = [{"tag": "column", "width": "weighted", "weight": 1,
+                 "elements": [_img(pth, short(Path(pth).name, 60), scale_type="crop_center", corner_radius="6px")]}
+                for pth in paths[:3]]
+        while len(cols) < 3:
+            cols.append({"tag": "column", "width": "weighted", "weight": 1, "elements": []})
+        return [{"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px", "columns": cols}]
+    if len(paths) == 1:
+        return [_img(paths[0], short(Path(paths[0]).name, 60), scale_type="fit_horizontal", corner_radius="8px")]
+    rows = []
+    for i in range(0, len(paths), 2):
+        cols = []
+        for j, pth in enumerate(paths[i:i + 2], start=i + 1):
+            cols.append({"tag": "column", "width": "weighted", "weight": 1, "vertical_spacing": "4px",
+                         "elements": [_img(pth, "图 %d" % j, scale_type="fit_horizontal", corner_radius="6px"),
+                                      _badge(j)]})
+        if len(cols) == 1:
+            cols.append({"tag": "column", "width": "weighted", "weight": 1, "elements": []})
+        rows.append({"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px", "columns": cols})
+    return rows
+
+
+def details_panel(rest: str, files: List[str], workdir: Optional[str]) -> dict:
+    """收起的「详情」：摘要里结论以外的话 + 本机文件路径（在飞书里点不开，只给需要时看）。"""
+    els = []
+    if rest:
+        els.append(text(rest))
     if files:
-        els.append(note("\n".join("📎 " + short(nice_path(a, workdir), 120) for a in files[:8])))
+        els.append(note("📎 本机文件\n" + "\n".join(short(nice_path(a, workdir), 120) for a in files[:8])
+                        + ("\n…" if len(files) > 8 else "")))
+    title = "详情" if rest else "📎 本机文件（%d）" % len(files)
+    return {"tag": "collapsible_panel", "expanded": False, "vertical_spacing": "4px",
+            "header": {"title": {"tag": "plain_text", "content": title, "text_size": "notation",
+                                 "text_color": "grey"}},
+            "elements": els}
+
+
+def _ask_element(status: str, ask: str) -> dict:
+    if status == "dropped":
+        return text("说明：%s。不引用直接发我即可开新单。" % clip(ask, 400).rstrip("。"), color="grey")
+    return callout("👉 需要你", clip(ask, 600), "orange" if status == "blocked" else "blue")
+
+
+def _link_buttons(links: List[str]) -> list:
+    out = []
     for u in links[:3]:
         host = re.sub(r"^https?://", "", u).split("/")[0]
-        els.append({"tag": "button", "text": {"tag": "plain_text", "content": "打开 " + short(host, 30)},
-                    "type": "default", "size": "small",
-                    "behaviors": [{"type": "open_url", "default_url": u}]})
+        out.append({"tag": "button", "text": {"tag": "plain_text", "content": "打开 " + short(host, 30)},
+                    "type": "default", "size": "small", "behaviors": [{"type": "open_url", "default_url": u}]})
+    return out
+
+
+def result_elements(status: str, summary: str, artifacts: List[str], ask: Optional[str],
+                    workdir: Optional[str], images: bool = False) -> list:
+    """结果正文，所有状态通用。worker 可控的文字一律 plain_text，不经 Markdown 解析。
+    有图片/视频（images=True，只用于推送的结果卡）→ 画廊：媒体占主体在最上面 → 一行结论 → 需要你（色块）
+      → 链接 → 收起的详情（其余文字 + 本机文件）。
+    没有媒体 → 文档：结论（放大）→ 需要你 → 细节 → 链接 → 收起的本机文件。
+    状态卡原地 PATCH 不经发件箱，不能带待上传的占位，所以 images=False 时不显示媒体。"""
+    head, rest = split_summary(summary)
+    files = [a for a in artifacts if not _URL.match(a)]
+    links = [a for a in artifacts if _URL.match(a)]
+    videos = video_artifacts(artifacts) if images else []
+    pics = image_artifacts(artifacts) if images else []
+    if videos or pics:
+        els = [dict(note("🎬 " + short(Path(v).name, 60)), **{VIDEO_KEY: v}) for v in videos]
+        if pics:
+            els += image_grid(pics, grid=bool(videos))
+        headline = text(head, size="heading-4")
+        headline["text"]["lines"] = 2
+        els.append(headline)
+        if ask:
+            els.append(_ask_element(status, ask))
+        els += _link_buttons(links)
+        if rest or files:
+            els.append(details_panel(rest, files, workdir))
+        return els
+    els = [text(head, size="heading-4")]
+    if ask:
+        els.append(_ask_element(status, ask))
+    if rest:
+        els.append(text(rest))
+    els += _link_buttons(links)
+    if files:
+        els.append(details_panel("", files, workdir))
     return els
 
 
@@ -190,9 +282,9 @@ def doc_buttons(links: List[tuple]) -> list:
 
 
 def with_doc_links(card: dict, links: List[tuple]) -> dict:
-    """把稿子按钮插到结果卡片正文末尾（分隔线之前）。"""
+    """把稿子按钮插到结果卡片的链接按钮之后：收起的详情面板之前；没有面板时在页脚（最后一行过程轨迹）之前。"""
     els = card["body"]["elements"]
-    at = next((i for i, e in enumerate(els) if e.get("tag") == "hr"), len(els))
+    at = next((i for i, e in enumerate(els) if e.get("tag") in ("collapsible_panel", "hr")), max(len(els) - 1, 0))
     els[at:at] = doc_buttons(links)
     return card
 
@@ -206,10 +298,11 @@ def result_card(ticket_id: str, title: str, workdir: Optional[str], status: str,
     if elapsed is not None:
         sub += " · 用时 %s" % dur(elapsed)
     els = result_elements(status, summary, artifacts, ask, workdir, images=True)
-    els.append(hr())
     els.append(note(("过程：%s · " % trail(phases, done=True, limit=6) if phases else "") + "引用此卡可追问"))
-    return card("%s %s %s：%s" % (emoji, ticket_id, word, short(summary, 40)),
-                title_of(ticket_id, title), sub, color, els)
+    c = card("%s %s %s：%s" % (emoji, ticket_id, word, short(summary, 40)),
+             title_of(ticket_id, title), sub, color, els)
+    c["body"].update({"padding": "12px 12px 16px 12px", "vertical_spacing": "12px"})
+    return c
 
 
 # ---------- 文字消息 ----------
@@ -219,26 +312,20 @@ def ack_message(ticket_id: str, title: str) -> str:
 
 
 def video_elements(video: str, url: Optional[str], cover_key: Optional[str]) -> list:
-    """卡片里的一个视频。url 有值：整块（封面 + 一行说明）可点击打开云空间播放，下面再放一个播放按钮；
-    url 为空（上传云空间失败）：只放说明和封面，视频另发一条消息。"""
+    """卡片里的一个视频（画廊风）。url 有值：整块可点——大封面（不裁剪、圆角）+ 通栏「▶ 播放视频」按钮，
+    点封面或按钮都打开云空间播放；url 为空（上传云空间失败）：封面 + 一行说明，视频另发一条消息。"""
     name = short(Path(video).name, 60)
+    cover = ({"tag": "img", "img_key": cover_key, "scale_type": "fit_horizontal", "corner_radius": "8px",
+              "alt": {"tag": "plain_text", "content": name + " 封面"}} if cover_key else None)
     if not url:
-        els = [note("🎬 %s（视频在下一条消息，点开播放）" % name)]
-        if cover_key:
-            els.append({"tag": "img", "img_key": cover_key, "alt": {"tag": "plain_text", "content": name + " 封面"}})
-        return els
-    inner = []
-    if cover_key:
-        inner.append({"tag": "img", "img_key": cover_key, "preview": False,
-                      "alt": {"tag": "plain_text", "content": name + " 封面"}})
-    inner.append(text("▶ 点击播放：%s" % name))
+        els = [cover] if cover else []
+        return els + [note("🎬 %s · 视频在下一条消息，点开播放" % name)]
     open_url = [{"type": "open_url", "default_url": url}]
-    return [
-        {"tag": "interactive_container", "width": "fill", "has_border": True, "border_color": "grey",
-         "corner_radius": "8px", "padding": "4px 4px 4px 4px", "behaviors": open_url, "elements": inner},
-        {"tag": "button", "text": {"tag": "plain_text", "content": "▶ 播放视频"}, "type": "primary",
-         "size": "small", "behaviors": open_url},
-    ]
+    inner = [dict(cover, preview=False)] if cover else []
+    inner.append({"tag": "button", "text": {"tag": "plain_text", "content": "▶ 播放视频"}, "type": "primary_filled",
+                  "size": "medium", "width": "fill", "behaviors": open_url})
+    return [{"tag": "interactive_container", "width": "fill", "padding": "0px", "vertical_spacing": "8px",
+             "behaviors": open_url, "elements": inner}]
 
 
 def video_fallback(ticket_id: str, video: str, workdir: Optional[str] = None) -> str:

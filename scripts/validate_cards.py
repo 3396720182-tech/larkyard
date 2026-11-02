@@ -4,7 +4,7 @@
 不发任何消息（只创建一个不挂在任何会话上的卡片实体）。改了 templates.py / card.py 的卡片结构后跑一次：
     /usr/bin/python3 scripts/validate_cards.py            # 校验
     /usr/bin/python3 scripts/validate_cards.py --dump     # 只打印 JSON，不调接口
-    /usr/bin/python3 scripts/validate_cards.py --with-images   # 另传一张 1x1 小图，连含 img 的卡（结果图、视频封面）一起校验
+    /usr/bin/python3 scripts/validate_cards.py --with-images   # 另传两张小图（1x1、9x16），连含图片的画廊卡一起校验
 需要 lark-cli 和 bot 身份（与 ticketd 相同的环境变量）。
 """
 from __future__ import annotations
@@ -44,18 +44,9 @@ def samples():
                           ("failed", None, []), ("waiting", None, []), ("dropped", "不属于本单", [])):
         out.append(("结果卡 " + st, templates.result_card(tid, t()["title"], wd, st, "一句话结果\n第二行", arts, ask,
                                                      ["读代码", "写代码"], 600)))
-    # 视频块（T0010）：发件箱换好链接后的样子。img_key 要真实存在，--with-images 时先传一张小图拿 key
-    url = "https://example.feishu.cn/file/boxcnExample"
-    key = _sample_img_key() if "--with-images" in sys.argv else None
-    for label, els in (("视频 链接", templates.video_elements(wd + "/生成/v/视频-720p.mp4", url, key)),
-                       ("视频 兜底", templates.video_elements(wd + "/生成/v/视频-720p.mp4", None, key))):
-        c = templates.result_card(tid, t()["title"], wd, "blocked", "720p 预览好了", [], "要出 1080p 吗？", ["出视频"], 600)
-        c["body"]["elements"][1:1] = els
-        out.append(("结果卡 " + label, c))
-    if key:
-        c = templates.result_card(tid, t()["title"], wd, "ready", "图好了", [], None, [], 60)
-        c["body"]["elements"][1:1] = [{"tag": "img", "img_key": key, "alt": {"tag": "plain_text", "content": "预览-1.png"}}]
-        out.append(("结果卡 图片", c))
+    # 画廊卡（T0010）：都走 result_card + 发件箱真实的视频/图片替换流程，上传器用桩（不传云空间）。
+    # 含 img 的卡要真实存在的 img_key：--with-images 时先传两张小图（1x1、9x16）拿 key。
+    out += _gallery_samples(tid, t()["title"], wd, "--with-images" in sys.argv)
     core.add_report(con, tid, "ready", "做好了", [wd + "/结果.md"])
     con.execute("UPDATE outbox SET status='sent'")
     out.append(("结果卡 带稿子按钮", templates.with_doc_links(
@@ -67,10 +58,81 @@ def samples():
     return out
 
 
-def _sample_img_key() -> str:
-    """传一张 1x1 的 PNG 拿 image_key（只上传图片，不发消息），供含 img 的卡片校验。"""
-    import base64
-    png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+def _png(w: int, h: int) -> bytes:
+    """生成 w×h 的纯色 PNG（不依赖第三方库）。"""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+    raw = b"".join(b"\x00" + b"\xe8\x8a\x3c" * w for _ in range(h))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+_PNG = _png(1, 1)
+_MP4 = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 64
+
+
+def _gallery_samples(tid, title, wd, with_images):
+    from ticketd import outbox, templates
+    url = "https://example.feishu.cn/file/boxcnExample"
+    os.makedirs(wd + "/生成", exist_ok=True)
+
+    def put(name, data):
+        with open(wd + "/生成/" + name, "wb") as f:
+            f.write(data)
+        return wd + "/生成/" + name
+
+    put("v.mp4", _MP4)
+    put("无封面.mp4", _MP4)
+    out = []
+
+    def resolve(card, up, drive=lambda v, w, t: (True, url)):
+        card, _ = outbox.resolve_card_videos(card, wd, tid, drive_uploader=drive, uploader=up)
+        return outbox.resolve_card_images(card, wd, uploader=up)
+
+    no_img = lambda path: (False, "不该上传图片", True)  # noqa: E731
+    c = templates.result_card(tid, title, wd, "blocked", "720p 预览好了。细节", [wd + "/生成/无封面.mp4"],
+                              "满意就回复「出 1080p」", ["出视频"], 300)
+    out.append(("画廊 视频无封面", resolve(c, no_img)))
+    if not with_images:
+        return out
+    key = _sample_img_key(_PNG)
+    key916 = _sample_img_key(_png(9, 16))
+    tall_png = _png(9, 16)
+
+    def up(path):  # 上传器拿到的是私有临时副本（文件名不保留），按内容区分竖图
+        with open(path, "rb") as f:
+            return True, key916 if f.read() == tall_png else key, False
+    pngs = [put("预览-%d.png" % n, _PNG) for n in range(1, 5)]
+    put("v.png", _PNG)
+    tall = put("竖版-9x16.png", tall_png)
+    put("竖版视频.mp4", _MP4)
+    put("竖版视频.png", tall_png)
+    md = wd + "/结果.md"
+    for label, st, arts, ask in (
+            ("单图", "ready", pngs[:1], None),
+            ("4 图网格", "blocked", pngs, "选第几张？回复编号"),
+            ("3 图网格", "ready", pngs[:3], None),
+            ("视频+缩略图", "ready", [wd + "/生成/v.mp4", pngs[0]], None),
+            ("视频待确认", "blocked", [wd + "/生成/v.mp4"], "满意就回复「出 1080p」"),
+            ("9:16 单图", "ready", [tall], None),
+            ("9:16 视频", "ready", [wd + "/生成/竖版视频.mp4"], None)):
+        c = templates.result_card(tid, title, wd, st, "做好了。第二句细节", arts + [md], ask, ["出图"], 60)
+        out.append(("画廊 " + label, resolve(c, up)))
+    # 降级形态：网格里一张图文件不合格 → 灰字；云空间传不上 → 封面 + 「视频在下一条消息」
+    put("坏图.png", b"not an image")
+    c = templates.result_card(tid, title, wd, "blocked", "4 张好了", pngs[:2] + [wd + "/生成/坏图.png", pngs[3]],
+                              "选？", [], 60)
+    out.append(("画廊 网格有一张失败", resolve(c, up)))
+    c = templates.result_card(tid, title, wd, "ready", "视频好了", [wd + "/生成/v.mp4"], None, [], 60)
+    out.append(("画廊 视频兜底", resolve(c, up, drive=lambda v, w, t: (False, "auth"))))
+    return out
+
+
+def _sample_img_key(png: bytes) -> str:
+    """传一张小 PNG 拿 image_key（只上传图片，不发消息），供含 img 的卡片校验。"""
     d = tempfile.mkdtemp(prefix="ticketd-validate-")
     with open(os.path.join(d, "x.png"), "wb") as f:
         f.write(png)

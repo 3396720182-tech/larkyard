@@ -91,8 +91,9 @@ class CoreTest(TicketdTestCase):
         self.assertIn("👉 需要你：能授权 /x 吗？", row["text"])
         card = json.loads(row["card_json"])
         self.assertEqual(card["header"]["template"], "orange")
-        asks = [e for e in card["body"]["elements"] if "需要你" in e.get("text", {}).get("content", "")]
-        self.assertEqual(asks[0]["text"]["text_color"], "orange")
+        box = card["body"]["elements"][1]  # 结论下面就是「需要你」色块（T0010 改版）
+        self.assertEqual(box["columns"][0]["background_style"], "orange-50")
+        self.assertEqual([e["text"]["content"] for e in box["columns"][0]["elements"]], ["👉 需要你", "能授权 /x 吗？"])
 
     def test_progress_and_silent_dropped_not_sent(self):
         tid = self.new_ticket()
@@ -121,7 +122,9 @@ class CoreTest(TicketdTestCase):
         card = json.loads(self.con.execute("SELECT card_json FROM outbox").fetchone()[0])
         self.assertIn("用时 10 分钟", card["header"]["subtitle"]["content"])
         flat = json.dumps(card, ensure_ascii=False)
-        self.assertIn("📎 结果.md", flat)
+        panel = [e for e in card["body"]["elements"] if e["tag"] == "collapsible_panel"][0]  # 本机路径收进折叠面板
+        self.assertEqual(panel["header"]["title"]["content"], "📎 本机文件（1）")
+        self.assertEqual(panel["elements"][0]["text"]["content"], "📎 本机文件\n结果.md")
         self.assertNotIn(wd, flat)
         self.assertIn("过程：读代码 → 写代码", flat)
         btn = [e for e in card["body"]["elements"] if e["tag"] == "button"][0]

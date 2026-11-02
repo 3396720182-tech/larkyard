@@ -10,6 +10,20 @@ JPG = b"\xff\xd8\xff\xe0" + b"0" * 64
 MP4 = b"\x00\x00\x00\x18ftypisom" + b"0" * 64
 
 
+def find_all(obj, tag):
+    """卡片里（任意嵌套层）所有某种 tag 的元素，按出现顺序。"""
+    out = []
+    if isinstance(obj, dict):
+        if obj.get("tag") == tag:
+            out.append(obj)
+        for v in obj.values():
+            out += find_all(v, tag)
+    elif isinstance(obj, list):
+        for v in obj:
+            out += find_all(v, tag)
+    return out
+
+
 class CardVideosTest(TicketdTestCase):
     def setUp(self):
         super().setUp()
@@ -68,24 +82,31 @@ class CardVideosTest(TicketdTestCase):
         els = self.templates.result_elements("blocked", "预览好了", arts, "要 1080p 吗？", "/w", images=True)
         vids = [e for e in els if self.templates.VIDEO_KEY in e]
         self.assertEqual([v[self.templates.VIDEO_KEY] for v in vids], ["生成/v/视频-720p.mp4"])
-        uploads = [e[self.templates.UPLOAD_KEY] for e in els if self.templates.UPLOAD_KEY in e]
+        uploads = [e[self.templates.UPLOAD_KEY] for e in find_all(els, "img")]
         self.assertEqual(uploads, ["生成/k/预览-1.jpeg"])  # 同名封面图不再作为普通图片重复显示
+        self.assertEqual(els[-1]["header"]["title"]["content"], "📎 本机文件（4）")
+        # 画廊：视频（主角）在最上面，其余图作三列小缩略图跟在后面，然后才是一行结论
+        self.assertEqual([e["tag"] for e in els[:3]], ["div", "column_set", "div"])
+        self.assertIn(self.templates.VIDEO_KEY, els[0])
+        self.assertEqual(len(els[1]["columns"]), 3)
+        self.assertEqual(els[2]["text"]["content"], "预览好了")
         plain = self.templates.result_elements("blocked", "x", arts, None, "/w")  # 状态卡不带任何占位
         self.assertFalse(any(self.templates.VIDEO_KEY in e or self.templates.UPLOAD_KEY in e for e in plain))
         self.assertEqual(self.templates.cover_candidates("a/b.mp4")[:2], ["a/b.jpg", "a/b.jpeg"])
 
     def test_video_elements_shapes(self):
         els = self.templates.video_elements("生成/v/视频-720p.mp4", "https://x.feishu.cn/file/b", "img_1")
-        box, btn = els
+        (box,) = els
         self.assertEqual(box["tag"], "interactive_container")
         self.assertEqual(box["behaviors"], [{"type": "open_url", "default_url": "https://x.feishu.cn/file/b"}])
-        self.assertEqual(box["elements"][0], {"tag": "img", "img_key": "img_1", "preview": False,
-                                              "alt": {"tag": "plain_text", "content": "视频-720p.mp4 封面"}})
-        self.assertIn("▶ 点击播放：视频-720p.mp4", json.dumps(box, ensure_ascii=False))
-        self.assertEqual((btn["tag"], btn["text"]["content"], btn["behaviors"]), ("button", "▶ 播放视频", box["behaviors"]))
-        fb = self.templates.video_elements("v.mp4", None, "img_1")  # 没链接：说明 + 普通封面，视频另发
-        self.assertIn("视频在下一条消息", fb[0]["text"]["content"])
-        self.assertEqual(fb[1]["img_key"], "img_1")
+        cover, btn = box["elements"]
+        self.assertEqual(cover, {"tag": "img", "img_key": "img_1", "scale_type": "fit_horizontal", "corner_radius": "8px",
+                                 "preview": False, "alt": {"tag": "plain_text", "content": "视频-720p.mp4 封面"}})
+        self.assertEqual((btn["text"]["content"], btn["width"], btn["type"], btn["behaviors"]),
+                         ("▶ 播放视频", "fill", "primary_filled", box["behaviors"]))  # 点封面、点按钮都能播
+        fb = self.templates.video_elements("v.mp4", None, "img_1")  # 没链接：封面 + 说明，视频另发
+        self.assertEqual(fb[0]["img_key"], "img_1")
+        self.assertIn("视频在下一条消息", fb[1]["text"]["content"])
         self.assertEqual(len(self.templates.video_elements("v.mp4", "https://x.feishu.cn/f", None)[0]["elements"]), 1)
 
     def test_reports_do_not_enqueue_separate_video_messages(self):
@@ -116,7 +137,7 @@ class CardVideosTest(TicketdTestCase):
         url = "https://example.feishu.cn/file/boxcn_fake_1"
         self.assertEqual(box["behaviors"][0]["default_url"], url)
         self.assertEqual(box["elements"][0]["img_key"], "img_v3_1")
-        btn = [e for e in card["body"]["elements"] if e.get("tag") == "button"][0]
+        btn = find_all(box, "button")[0]
         self.assertEqual(btn["behaviors"][0]["default_url"], url)
         self.assertEqual(self.uploads, [JPG])  # 封面只传一次，没被当普通图片重复显示
         self.assertNotIn(self.templates.VIDEO_KEY, json.dumps(card))
@@ -178,7 +199,7 @@ class CardVideosTest(TicketdTestCase):
         card = self.card_of(sent[0])
         self.assertFalse(any(e.get("tag") == "interactive_container" for e in card["body"]["elements"]))
         self.assertIn("视频在下一条消息", json.dumps(card, ensure_ascii=False))
-        self.assertEqual([i["img_key"] for i in card["body"]["elements"] if i.get("tag") == "img"], ["img_v3_1"])
+        self.assertEqual([i["img_key"] for i in find_all(card, "img")], ["img_v3_1"])
         video = sent[1]
         self.assertEqual(video[video.index("--video") + 1], "./video.mp4")
         self.assertEqual(video[video.index("--video-cover") + 1], "./cover.jpg")

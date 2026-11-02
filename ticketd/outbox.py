@@ -151,7 +151,7 @@ def _upload_workdir_image(path: str, workdir: Optional[str], uploader) -> Tuple[
             ok, info, _ = uploader(tmp)
         return (info, "") if ok and info else ("", info or "未返回 image_key")
     except OSError as e:
-        return "", str(e)
+        return "", "文件不能上传：%s" % e
 
 
 def resolve_card_videos(card: dict, workdir: Optional[str], ticket_id: str, drive_uploader=None,
@@ -184,34 +184,50 @@ def resolve_card_videos(card: dict, workdir: Optional[str], ticket_id: str, driv
 
 
 def resolve_card_images(card: dict, workdir: Optional[str], uploader=None) -> dict:
-    """把卡片里待上传的图片占位换成 img_key。上传不成的整张图（连同上方的文件名）删掉，结果不能因图片卡住。
-    上传的是读进来的字节的私有副本，不把 worker 可控的路径交给 lark-cli。"""
+    """把卡片里（含 column_set / 容器里嵌套的）待上传图片占位换成 img_key；上传不成的图换成一行灰字
+    「（xx 未能显示）」，结果不能因图片卡住。上传的是读进来的字节的私有副本，不把 worker 可控的路径交给 lark-cli。"""
     uploader = uploader or upload_image
-    els = card.get("body", {}).get("elements", [])
-    out = []
-    for el in els:
-        if not (isinstance(el, dict) and templates.UPLOAD_KEY in el):
+
+    def walk(els):
+        out = []
+        for el in els:
+            if not isinstance(el, dict):
+                out.append(el)
+                continue
+            if templates.UPLOAD_KEY in el:
+                path = el[templates.UPLOAD_KEY]
+                key, why = _upload_workdir_image(path, workdir, uploader)
+                if key:
+                    el = {k: v for k, v in el.items() if k != templates.UPLOAD_KEY}
+                    el["img_key"] = key
+                else:
+                    alert("结果卡图片未显示（%s）：%s" % (path, why))
+                    el = templates.note("（%s 未能显示）" % ((el.get("alt") or {}).get("content") or "图片"))
+                out.append(el)
+                continue
+            el = dict(el)
+            if isinstance(el.get("elements"), list):
+                el["elements"] = walk(el["elements"])
+            if isinstance(el.get("columns"), list):
+                el["columns"] = [dict(c, elements=walk(c.get("elements") or [])) if isinstance(c, dict) else c
+                                 for c in el["columns"]]
             out.append(el)
-            continue
-        path = el[templates.UPLOAD_KEY]
-        key, why = _upload_workdir_image(path, workdir, uploader)
-        if key:
-            el = {k: v for k, v in el.items() if k != templates.UPLOAD_KEY}
-            el["img_key"] = key
-            out.append(el)
-        else:
-            alert("结果卡图片未显示（%s）：%s" % (path, why))
-            name = (el.get("alt") or {}).get("content")
-            if out and isinstance(out[-1], dict) and (out[-1].get("text") or {}).get("content") == name:
-                out.pop()  # 去掉这张图上方的文件名
+        return out
+
     card = dict(card)
-    card["body"] = dict(card.get("body", {}), elements=out)
+    card["body"] = dict(card.get("body", {}), elements=walk(card.get("body", {}).get("elements", [])))
     return card
 
 
-def _has_uploads(card: dict) -> bool:
-    return any(isinstance(el, dict) and (templates.UPLOAD_KEY in el or templates.VIDEO_KEY in el)
-               for el in card.get("body", {}).get("elements", []))
+def _has_uploads(obj) -> bool:
+    """卡片里（任意嵌套层）还有没有待上传的占位。"""
+    if isinstance(obj, dict):
+        if templates.UPLOAD_KEY in obj or templates.VIDEO_KEY in obj:
+            return True
+        return any(_has_uploads(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_has_uploads(v) for v in obj)
+    return False
 
 
 MAX_DRIVE_VIDEO_BYTES = 20 * 1024 * 1024  # 云空间一次性上传（upload_all）的上限

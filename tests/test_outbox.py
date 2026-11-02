@@ -201,6 +201,18 @@ class OutboxTest(TicketdTestCase):
         btns = self._buttons(calls[-1])
         self.assertEqual([b["text"]["content"] for b in btns], ["📄 打开 稿子.md", "📄 打开 表.xlsx"])
         self.assertTrue(btns[0]["behaviors"][0]["default_url"].startswith("https://example.feishu.cn/docx/"))
+        # 按钮跟在正文后面，在收起的「本机文件」面板和页脚之前
+        tags = [e["tag"] for e in json.loads(calls[-1][calls[-1].index("--content") + 1])["body"]["elements"]]
+        self.assertEqual(tags, ["div", "button", "button", "collapsible_panel", "div"])
+
+    def test_doc_buttons_go_before_footer_without_panel(self):
+        from ticketd import templates
+        card = templates.result_card("T1", "t", "/w", "ready", "好了", ["https://x.feishu.cn/docx/1"], None, [], 1)
+        templates.with_doc_links(card, [("稿子.md", "https://example.feishu.cn/docx/a")])
+        els = card["body"]["elements"]
+        self.assertEqual([e["tag"] for e in els], ["div", "button", "button", "div"])
+        self.assertEqual(els[2]["text"]["content"], "📄 打开 稿子.md")
+        self.assertIn("引用此卡可追问", els[-1]["text"]["content"])
 
     def test_doc_import_cached_for_unchanged_file(self):
         tid = self.new_ticket()
