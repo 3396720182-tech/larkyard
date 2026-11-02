@@ -7,6 +7,7 @@
 - Linux 上 worker 沙箱的可写目录换成 lark-cli 在 Linux 的数据目录（`~/.local/share/lark-cli`）和 `/tmp`，不存在的附带路径不写（bubblewrap 绑不上不存在的路径），不写 macOS 才有的 `allowMachLookup`。macOS 上生成的设置不变。
 - 新环境变量 `TICKETD_PYTHON`：指定 Python 解释器（默认 `/usr/bin/python3`，不存在时退回 PATH 上的 `python3`），`bin/ticket`、`bin/ticketd`、`install.sh` 都认；Linux 上写进服务环境，macOS 上显式指定时写进 plist。安装时检查 Python ≥ 3.9。
 - README（中英）新增「Linux / WSL2」安装说明和已知限制。
+- 新增 GitHub Actions 工作流：在 ubuntu-latest 和 macos-latest 上跑全部单测，并在 Ubuntu 上真装、重装、卸载一次 systemd 用户服务。
 - 结果卡里直接看图：图片产物（png/jpg/jpeg/webp/gif，最多 6 张）由发件箱上传成 `img_key` 后显示在卡里，结果覆盖状态卡和另发新消息两条路都生效。只上传工单目录里的普通文件（不跟符号链接、不认硬链接、≤10MB、核对文件头），交给 lark-cli 的是私有副本。
 - 结果卡里看视频：`.mp4` 产物以用户身份传到用户自己的云空间（`lark-cli drive +upload --as user`），卡里放可点击的封面和「▶ 播放视频」按钮；封面用同目录同名的图片。云空间上传失败时改为卡片后另发一条视频消息（`outbox` 新增 `media_json` 列，老库自动迁移）。
 - 新配置项：`TICKETD_VIDEO_FOLDER`（视频上传到的云空间文件夹，空为根目录）。

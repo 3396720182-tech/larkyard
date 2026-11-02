@@ -1,0 +1,82 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # 用系统自带的解释器，和 bin/ticket、bin/ticketd 默认用的一致：ubuntu-latest 上是较新的 3.x，macOS 上是 3.9
+      - name: Python
+        run: /usr/bin/python3 --version
+      - name: Unit tests
+        run: /usr/bin/python3 -m unittest discover -s tests -v
+      - name: Card variants render
+        run: /usr/bin/python3 scripts/validate_cards.py --dump > /dev/null
+
+  systemd-user-service:
+    name: systemd user service (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start a systemd user instance
+        run: |
+          sudo loginctl enable-linger "$USER"
+          rt="/run/user/$(id -u)"
+          echo "XDG_RUNTIME_DIR=$rt" >> "$GITHUB_ENV"
+          for i in $(seq 30); do
+            if [ -S "$rt/systemd/private" ] || [ -S "$rt/bus" ]; then break; fi
+            sleep 1
+          done
+          XDG_RUNTIME_DIR="$rt" systemctl --user show-environment > /dev/null
+      - name: Stand-ins for claude and lark-cli
+        # 只验证服务能装、能起、能停；这一步不跑 worker，也不发消息
+        run: |
+          mkdir -p "$RUNNER_TEMP/fakebin"
+          for t in claude lark-cli; do
+            printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/fakebin/$t"
+            chmod +x "$RUNNER_TEMP/fakebin/$t"
+          done
+          echo "$RUNNER_TEMP/fakebin" >> "$GITHUB_PATH"
+      - name: Install
+        run: |
+          mkdir -p ~/.ticketd
+          echo "TICKETD_OWNER=ou_owner" > ~/.ticketd/config.env
+          scripts/install.sh
+      - name: Service is running
+        run: |
+          systemctl --user is-active dev.larkyard.ticketd
+          for i in $(seq 30); do [ -f ~/.ticketd/heartbeat ] && break; sleep 1; done
+          test -f ~/.ticketd/heartbeat
+          grep -q "ticketd started" ~/.ticketd/logs/daemon.out.log
+          bin/ticket ls
+      - name: Reinstall restarts the service
+        run: |
+          scripts/install.sh
+          systemctl --user is-active dev.larkyard.ticketd
+          test "$(grep -c 'ticketd stopped' ~/.ticketd/logs/daemon.out.log)" = 1
+      - name: Uninstall
+        run: |
+          scripts/uninstall.sh
+          if systemctl --user is-active --quiet dev.larkyard.ticketd; then exit 1; fi
+          test ! -e ~/.config/systemd/user/dev.larkyard.ticketd.service
+          test -f ~/.ticketd/config.env
+      - name: Logs
+        if: failure()
+        run: |
+          systemctl --user status dev.larkyard.ticketd --no-pager || true
+          journalctl --user -u dev.larkyard.ticketd --no-pager || true
+          tail -n 50 ~/.ticketd/logs/* || true

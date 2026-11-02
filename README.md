@@ -198,14 +198,14 @@ sudo loginctl enable-linger "$USER"
 
 - 有 6 个孤儿进程清理的用例要查看真实进程（macOS 用 `ps`，Linux 读 `/proc`），在禁止这样做的沙箱里（比如由 Larkyard worker 来跑）会失败，属环境限制。
 - 孤儿进程清理有一个残余风险（macOS 上一直如此，Linux 上一样）：你自己在工单目录里启动、又脱离了终端的后台程序（比如在工单目录里 `code .` 起的编辑器、tmux 服务端），在这张单的 worker 结束时会被当成残留进程清掉。
-- 平台相关的代码只在 `ticketd/host.py`、`ticketd/procs.py`、`ticketd/perms.py` 和 `scripts/install.sh`；单测 mock 平台分支，所以两个平台的分支在任一系统上都能测。
+- 平台相关的代码只在 `ticketd/host.py`、`ticketd/procs.py`、`ticketd/perms.py` 和 `scripts/install.sh`；单测 mock 平台分支，所以两个平台的分支在任一系统上都能测。GitHub Actions（`.github/workflows/tests.yml`）在 ubuntu-latest 和 macos-latest 上跑全部单测，并在 Ubuntu 上真装、重装、卸载一次 systemd 用户服务。
 - 改行为前先读 `docs/spec.md` 对应章节，改完把「调整」写回 spec；改卡片结构后跑 `validate_cards.py`（加 `--with-images` 会先传两张小图，把含图片的卡也一起校验）。
 - 仓库里不放任何个人信息：open_id、chat_id、message_id、本机路径、密钥、工单历史和数据库。个人的东西放 `config.env` 和 `CLAUDE.local.md`。
 
 ## 已知限制
 
 - 支持 macOS 和 Linux（含 WSL2），不支持原生 Windows；只服务一个主用户。
-- Linux / WSL2 上的验证目前只有单测（mock 平台分支），还没有像 macOS 那样端到端实测过（`docs/spec.md` §6 的沙箱结论来自 macOS）。尤其没实测：Claude Code / Codex 的 bubblewrap 沙箱下 worker 的读写边界、Codex 授权仓库里 `.git` 是否只读（`TICKETD_CODEX_GIT_WRITABLE` 在 Linux 上的效果）、worker 沙箱里 lark-cli 的只读操作。
+- Linux / WSL2 上的验证目前只有单测（mock 平台分支）和 CI（ubuntu-latest 上跑全部单测、真装一次 systemd 用户服务），还没有像 macOS 那样端到端实测过（`docs/spec.md` §6 的沙箱结论来自 macOS）。尤其没实测：Claude Code / Codex 的 bubblewrap 沙箱下 worker 的读写边界、Codex 授权仓库里 `.git` 是否只读（`TICKETD_CODEX_GIT_WRITABLE` 在 Linux 上的效果）、worker 沙箱里 lark-cli 的只读操作。
 - Linux 上 Claude Code 沙箱里的命令在独立的网络命名空间里，连不到宿主机 `localhost` 上的服务；WSL2 里 worker 默认也调不了 Windows 程序（`cmd.exe`、`/mnt/c/...` 下的 exe）。
 - WSL2 可能在所有 WSL 终端都关掉一段时间后停掉整个发行版，ticketd 和 bridge 也随之停止；要常驻就保持一个 WSL 终端开着，或用 Windows 任务计划在登录时启动一个常驻的 `wsl.exe` 进程。这一条随 WSL 版本变化，本仓库没有验证。
 - 依赖 lark-channel-bridge 注入的 `<bridge_context>` 字段（`chatId`、`messageIds`、`senderId`）；bridge 改了格式时，工作区约定里的派单命令需要跟着改。
