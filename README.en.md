@@ -54,11 +54,11 @@ The two workers side by side:
 |---|---|---|
 | How it runs | `claude -p --session-id/--resume …` (stream-json) | `codex exec --json …` / `codex exec resume <thread_id> …` |
 | System prompt | `prompts/worker.md` via `--append-system-prompt` | `worker.md` + `worker.codex.md` via `developer_instructions` |
-| Sandbox | Claude Code's Seatbelt sandbox + permission rules (`dontAsk`) | Codex's own Seatbelt sandbox (`workspace-write`, `approval_policy=never`) |
+| Sandbox | Claude Code's sandbox (macOS: Seatbelt; Linux / WSL2: bubblewrap) + permission rules (`dontAsk`) | Codex's own sandbox (macOS: Seatbelt; Linux / WSL2: bubblewrap) (`workspace-write`, `approval_policy=never`) |
 | Writable | Ticket dir, granted dirs, temp dirs, lark-cli config dirs | Same; `.git` in granted repos is writable by default (`TICKETD_CODEX_GIT_WRITABLE=1`), so workers can `git commit` |
 | No messaging you directly | Permission deny rules block `lark-cli im +messages-send` and similar | execpolicy rules in a dedicated `CODEX_HOME` block the same commands plus all `lark-cli api` writes (rules match whole words only, so they are stricter) |
 | "Latest step" on the card | The description of each command (e.g. "run all unit tests") | Program name only (e.g. "运行 pytest"), so the worker reports stages more often |
-| Verified on | Claude Code 2.1.300 | codex-cli 0.134.0 |
+| Verified on (macOS) | Claude Code 2.1.300 | codex-cli 0.134.0 |
 
 A few details about Codex workers:
 - **Give ticketd its own `CODEX_HOME`**: set `TICKETD_CODEX_HOME` to a directory containing a working `config.toml`. Each time ticketd starts a Codex worker it writes the anti-messaging rules there. Without it everything still runs, just without that guardrail.
@@ -69,7 +69,7 @@ A few details about Codex workers:
 
 | Part | Where | What it does |
 |---|---|---|
-| `ticketd` daemon | `ticketd/`, `bin/ticketd`, `launchd/` | launchd-managed: queueing, concurrency limit, one worker per ticket (`claude -p` by default, `codex exec` per ticket), timeouts, crash recovery, an idempotent outbox with retries, status cards |
+| `ticketd` daemon | `ticketd/`, `bin/ticketd`, `launchd/`, `systemd/` | Managed by launchd (macOS) or a systemd user service (Linux): queueing, concurrency limit, one worker per ticket (`claude -p` by default, `codex exec` per ticket), timeouts, crash recovery, an idempotent outbox with retries, status cards |
 | `ticket` CLI | `bin/ticket` | The only entry point for the bridge session and workers: `new / send / lookup / stop / hold / release / grant / show / ls / report` |
 | Worker contract | `prompts/worker.md`, `prompts/worker.codex.md` | System prompt for workers: the user's own words are the spec, write only to granted dirs, report stages, close with one of 5 states; Codex workers also get `worker.codex.md` |
 | Executors | `ticketd/executors.py` | Separates "which agent CLI runs a turn" from the scheduler: one implementation for Claude Code and one for Codex; Codex events are translated into the same shape, so status cards, stall detection and retries are shared |
@@ -81,7 +81,7 @@ A few details about Codex workers:
 you ──Feishu──▶ lark-channel-bridge ──▶ bridge session (Claude Code, reads workspace CLAUDE.md)
                                            │ ticket new / send / stop / hold / release / grant
                                            ▼
-                                SQLite (~/.ticketd/db) ◀──poll── ticketd (launchd)
+                                SQLite (~/.ticketd/db) ◀──poll── ticketd (launchd / systemd)
                                                                  ├─ worker: Claude Code (claude -p) or Codex (codex exec),
                                                                  │         routed per ticket, one session + dir + sandbox each
                                                                  ├─ status card: edited in place, result overwrites it
@@ -99,8 +99,8 @@ you ──Feishu──▶ lark-channel-bridge ──▶ bridge session (Claude C
 
 ## Requirements
 
-- macOS (launchd for the daemon; Claude Code's or Codex's own Seatbelt sandbox for workers)
-- `/usr/bin/python3` 3.9+ (standard library only)
+- macOS, or Linux (including WSL2 on Windows). On macOS the daemon runs under launchd and workers in the Seatbelt sandbox; on Linux it runs as a systemd user service and workers in the bubblewrap sandbox, with the extra requirements under "Linux / WSL2" below. Native Windows is not supported; use WSL2
+- Python 3.9+ (standard library only): `/usr/bin/python3` by default, or any interpreter set in `TICKETD_PYTHON`
 - Node.js ≥ 20.12 and a working [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge) (tested with 0.7.0)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart), logged in (tested with 2.1.300). Required: the bridge session and the default worker use it
 - lark-cli (`npm i -g @larksuite/cli`) on PATH; importing documents into Feishu Docs and uploading videos to Drive need it logged in as a user (optional; without it a video is sent as a separate video message after the card)
@@ -121,13 +121,46 @@ scripts/setup-workspace.sh <bridge workspace>    # add --force if a CLAUDE.md al
 ```
 
 - Bridge profile other than `claude`: set `LARK_CHANNEL_PROFILE` (and `LARK_CHANNEL_HOME` if changed) before installing.
-- Different launchd label or data dir: `TICKETD_LABEL=... TICKETD_HOME=... scripts/install.sh` (use the same variables to uninstall).
-- Preview the generated plist without installing: `scripts/install.sh --print`.
+- Different service name (launchd label / systemd unit name) or data dir: `TICKETD_LABEL=... TICKETD_HOME=... scripts/install.sh` (use the same variables to uninstall).
+- Preview the generated plist (a systemd unit on Linux) without installing: `scripts/install.sh --print`.
+- `/usr/bin/python3` older than 3.9 or missing: `TICKETD_PYTHON=/path/to/python3 scripts/install.sh`.
 - Config changes are picked up without a restart.
+
+### Linux / WSL2
+
+On Linux `scripts/install.sh` installs a systemd user service (`~/.config/systemd/user/dev.larkyard.ticketd.service`); the other steps are the same as above. Prepare the host first:
+
+```bash
+# Worker sandbox: Claude Code needs bubblewrap and socat; Codex also prefers the system bubblewrap
+sudo apt-get install bubblewrap socat        # Fedora: sudo dnf install bubblewrap socat
+
+# From Ubuntu 24.04 AppArmor stops bwrap from creating user namespaces; if this prints 1, add an AppArmor profile for bwrap
+sysctl kernel.apparmor_restrict_unprivileged_userns
+sudo tee /etc/apparmor.d/bwrap > /dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+EOF
+sudo systemctl reload apparmor
+
+# Keep the user service running after you log out, and start it at boot
+sudo loginctl enable-linger "$USER"
+```
+
+- **Turn on systemd in WSL2 first**: put the two lines `[boot]` and `systemd=true` in `/etc/wsl.conf`, run `wsl --shutdown` in PowerShell and reopen the distribution. It works once `systemctl --user status` prints normally. WSL1 won't do (Claude Code's sandbox requires WSL2): check with `wsl -l -v`, upgrade with `wsl --set-version <distro> 2`.
+- **In WSL2 keep everything on the Linux file system**: the bridge, this repo, `~/.ticketd` and the ticket directories all under `~`, not under `/mnt/c/...` (symlinks, permissions and file locks behave differently on Windows drives, and it's slow). Install the bridge in the same WSL distribution.
+- The install script checks the host: it stops on WSL1, when node / lark-cli / claude resolve to Windows builds on a Windows drive (`/mnt/c/...`) in WSL2, and when there is no systemd user instance; it warns about missing bwrap / socat, AppArmor restricting user namespaces, and lingering being off. systemd must be ≥ 240 (Ubuntu 20.04, Debian 11 and later are fine).
+- Manage the service with `systemctl --user status|restart|stop dev.larkyard.ticketd`; logs are in `~/.ticketd/logs/` as on macOS.
+- On Linux lark-cli uses no OS keychain: its credentials and master key are files in `~/.local/share/lark-cli`. ticketd adds that directory to the worker sandbox's writable paths (token refreshes write there).
+- On Linux the repo, home and `TICKETD_HOME` paths must not contain whitespace or `%` `$` `"` `\` (systemd units treat them specially); the install script refuses them.
 
 **Check**: send the bot something that takes a few minutes. You should get the receipt, then a status card; `bin/ticket ls` lists the ticket. Daemon logs are in `~/.ticketd/logs/`.
 
-**Uninstall**: `scripts/uninstall.sh` (data and ticket directories are kept); restore the workspace `CLAUDE.md` from the backup made by `setup-workspace.sh`.
+**Uninstall**: `scripts/uninstall.sh` (removes the launchd agent on macOS, stops and removes the systemd user service on Linux; data and ticket directories are kept); restore the workspace `CLAUDE.md` from the backup made by `setup-workspace.sh`.
 
 ## Configuration
 
@@ -141,13 +174,13 @@ Everything lives in `~/.ticketd/config.env` (environment variables of the same n
 | `TICKETD_TURN_TIMEOUT` | `7200` | Per-turn timeout (seconds) |
 | `TICKETD_MODEL` | empty | Model for Claude Code workers; empty means Claude Code's default |
 | `TICKETD_EXECUTOR` | `claude` | Default executor for new tickets: `claude` or `codex` (override per ticket with `ticket new --executor`) |
-| `TICKETD_CODEX` | `codex` | Codex CLI path. launchd's PATH is generated by `install.sh` and only contains the directories of node, lark-cli, claude (and codex, if found at install time); use an absolute path otherwise |
+| `TICKETD_CODEX` | `codex` | Codex CLI path. The service's PATH (launchd / systemd) is generated by `install.sh` and only contains the directories of node, lark-cli, claude (and codex, if found at install time); use an absolute path otherwise |
 | `TICKETD_CODEX_MODEL` | empty | Codex worker model; empty means the default in `config.toml` |
 | `TICKETD_CODEX_HOME` | empty | Dedicated `CODEX_HOME` for ticketd (holds the anti-messaging execpolicy rules); empty means `~/.codex` and no rules are written |
 | `TICKETD_CODEX_GIT_WRITABLE` | `1` | Whether Codex workers may `git commit` in granted repos; `0` keeps Codex's built-in read-only `.git` protection |
 | `TICKETD_VIDEO_FOLDER` | empty | Drive folder token that result videos are uploaded to; empty means the root of your Drive |
 
-Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (default `dev.larkyard.ticketd`), `LARK_CHANNEL_HOME`, `LARK_CHANNEL_PROFILE`.
+Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (default `dev.larkyard.ticketd`; the systemd unit name on Linux), `LARK_CHANNEL_HOME`, `LARK_CHANNEL_PROFILE`, `TICKETD_PYTHON` (Python interpreter, default `/usr/bin/python3`; `bin/ticket` and `bin/ticketd` honour it too; on Linux it is always written into the service environment, on macOS into the plist when set explicitly).
 
 ## Development
 
@@ -156,13 +189,18 @@ Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (
 /usr/bin/python3 scripts/validate_cards.py --dump    # print every card variant; without --dump it validates them via Feishu cardkit (sends nothing)
 ```
 
-- Six orphan-sweep tests need `ps`; they fail inside sandboxes that forbid it (e.g. when run by a Larkyard worker).
+- Six orphan-sweep tests inspect real processes (`ps` on macOS, `/proc` on Linux); they fail inside sandboxes that forbid it (e.g. when run by a Larkyard worker).
+- The orphan sweep has one residual risk (always the case on macOS, the same on Linux): a background program you start yourself inside a ticket directory and detach from the terminal (an editor launched with `code .` there, a tmux server) is cleaned up as a leftover when that ticket's worker finishes.
+- Platform-specific code lives only in `ticketd/host.py`, `ticketd/procs.py`, `ticketd/perms.py` and `scripts/install.sh`; the unit tests mock the platform, so both branches are tested on either OS.
 - Read the matching section of `docs/spec.md` before changing behavior, and record the change there. Run `validate_cards.py` after touching card layouts (`--with-images` uploads two tiny images first so cards with images are validated too).
 - Keep personal data out of the repo: open_ids, chat_ids, message_ids, local paths, secrets, ticket history, databases. Personal things go in `config.env` and `CLAUDE.local.md`.
 
 ## Known limitations
 
-- macOS only; a single owner.
+- macOS and Linux (including WSL2); native Windows is not supported. A single owner.
+- On Linux / WSL2 the only verification so far is the unit tests (mocking the platform); there has been no end-to-end run like on macOS (the sandbox findings in `docs/spec.md` §6 come from macOS). Not yet measured in particular: the read/write boundary of workers under Claude Code's and Codex's bubblewrap sandboxes, whether `.git` in granted repos is read-only under Codex (what `TICKETD_CODEX_GIT_WRITABLE` does on Linux), and read-only lark-cli calls inside the worker sandbox.
+- On Linux, commands in Claude Code's sandbox run in their own network namespace and can't reach services on the host's `localhost`; in WSL2 workers can't launch Windows programs (`cmd.exe`, exes under `/mnt/c/...`) by default either.
+- WSL2 may shut the whole distribution down some time after the last WSL terminal closes, taking ticketd and the bridge with it. To keep them running, keep a WSL terminal open or have Windows Task Scheduler start a long-running `wsl.exe` process at logon. This depends on the WSL version and has not been verified here.
 - Relies on the `<bridge_context>` fields injected by lark-channel-bridge (`chatId`, `messageIds`, `senderId`); if the bridge changes them, the dispatch command in the workspace conventions must follow.
 - The bridge session (the one that triages and dispatches) has only been written for and tested on Claude Code: the workspace conventions are a `CLAUDE.md`. A Codex bridge session (profile `agentKind: "codex"`) is untested; what can be routed to Codex is the worker.
 - Worker sandboxing relies on Claude Code's `--permission-mode dontAsk` and sandbox settings; re-check the findings in `docs/spec.md` §6 after upgrading Claude Code.

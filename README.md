@@ -54,11 +54,11 @@ Larkyard 的做法：**bridge 里的会话只做判断和派单**，长任务交
 |---|---|---|
 | 怎么跑 | `claude -p --session-id/--resume …`（stream-json） | `codex exec --json …` / `codex exec resume <thread_id> …` |
 | 系统提示 | `prompts/worker.md`，用 `--append-system-prompt` 注入 | `worker.md` + `worker.codex.md`，用 `developer_instructions` 注入 |
-| 沙箱 | Claude Code 的 Seatbelt 沙箱 + 权限规则（`dontAsk`） | Codex 自带的 Seatbelt 沙箱（`workspace-write`，`approval_policy=never`） |
+| 沙箱 | Claude Code 的沙箱（macOS：Seatbelt；Linux / WSL2：bubblewrap）+ 权限规则（`dontAsk`） | Codex 自带的沙箱（macOS：Seatbelt；Linux / WSL2：bubblewrap）（`workspace-write`，`approval_policy=never`） |
 | 能写哪里 | 工单目录、你授权的目录、临时目录、lark-cli 配置目录 | 同左；授权仓库里的 `.git` 默认也能写（`TICKETD_CODEX_GIT_WRITABLE=1`），所以能 `git commit` |
 | 防误发飞书消息 | 权限 deny 规则拦 `lark-cli im +messages-send` 等 | 专用 `CODEX_HOME` 里的 execpolicy 规则拦同一批命令，外加所有 `lark-cli api` 写操作（规则只能按词精确匹配，所以更严） |
 | 状态卡「最近一步」 | 显示每条命令的中文说明（如「跑全部单测」） | 只能显示程序名（如「运行 pytest」），所以 worker 会更勤地报阶段 |
-| 验证过的版本 | Claude Code 2.1.300 | codex-cli 0.134.0 |
+| 验证过的版本（macOS） | Claude Code 2.1.300 | codex-cli 0.134.0 |
 
 Codex worker 的几点细节：
 - **建议配一个专用的 `CODEX_HOME`**：设 `TICKETD_CODEX_HOME`，目录里放一份能用的 `config.toml`。ticketd 每次启动 Codex worker 时会往里写防误发规则。不配也能跑，但没有这道护栏。
@@ -69,7 +69,7 @@ Codex worker 的几点细节：
 
 | 部分 | 位置 | 作用 |
 |---|---|---|
-| `ticketd` 派单服务 | `ticketd/`、`bin/ticketd`、`launchd/` | launchd 托管的守护进程：排队、并发上限、为每张单起一个 worker（默认 `claude -p`，可按单换成 `codex exec`）、超时、崩溃恢复、发件箱（失败重试、幂等）、状态卡 |
+| `ticketd` 派单服务 | `ticketd/`、`bin/ticketd`、`launchd/`、`systemd/` | launchd（macOS）或 systemd 用户服务（Linux）托管的守护进程：排队、并发上限、为每张单起一个 worker（默认 `claude -p`，可按单换成 `codex exec`）、超时、崩溃恢复、发件箱（失败重试、幂等）、状态卡 |
 | `ticket` 命令 | `bin/ticket` | 主会话和 worker 操作工单的唯一入口：`new / send / lookup / stop / hold / release / grant / show / ls / report` |
 | worker 约定 | `prompts/worker.md`、`prompts/worker.codex.md` | worker 的系统提示：只认用户原话、只写授权目录、按阶段自报进度、用 5 种状态之一收尾；Codex worker 额外追加 `worker.codex.md` |
 | 执行器 | `ticketd/executors.py` | 把「用哪个 agent CLI 跑一轮」从调度器里拆出来：Claude Code 和 Codex 各一个实现，Codex 的事件翻译成同一种格式，状态卡、卡死检测、重试两边共用 |
@@ -81,7 +81,7 @@ Codex worker 的几点细节：
 你 ──飞书──▶ lark-channel-bridge ──▶ 主会话（Claude Code，读工作区 CLAUDE.md）
                                         │ ticket new / send / stop / hold / release / grant
                                         ▼
-                             SQLite（~/.ticketd/db） ◀──轮询── ticketd（launchd）
+                             SQLite（~/.ticketd/db） ◀──轮询── ticketd（launchd / systemd）
                                                                ├─ worker：Claude Code（claude -p）或 Codex（codex exec），
                                                                │          按单路由，每单一个会话 + 目录 + 沙箱
                                                                ├─ 状态卡：原地刷新，结果覆盖
@@ -99,8 +99,8 @@ Codex worker 的几点细节：
 
 ## 环境要求
 
-- macOS（用 launchd 托管服务，用 Claude Code / Codex 各自的 Seatbelt 沙箱限制 worker）
-- `/usr/bin/python3`（3.9+，只用标准库）
+- macOS，或 Linux（含 Windows 上的 WSL2）。macOS 用 launchd 托管服务、用 Seatbelt 沙箱限制 worker；Linux 用 systemd 用户服务托管、用 bubblewrap 沙箱限制 worker，额外要求见下面的「Linux / WSL2」。原生 Windows 不支持，请用 WSL2
+- Python 3.9+（只用标准库）：默认用 `/usr/bin/python3`，别的解释器用 `TICKETD_PYTHON` 指定
 - Node.js ≥ 20.12，已装好并能正常对话的 [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge)（在 0.7.0 上验证）
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart)（`claude` 已登录；在 2.1.300 上验证）：必需，主会话和默认 worker 都用它
 - lark-cli（`npm i -g @larksuite/cli`），在 PATH 上；稿子导入云文档、视频传云空间需要它以 user 身份登录过（可选，没登录时视频改为卡片后另发一条视频消息）
@@ -128,13 +128,46 @@ scripts/setup-workspace.sh <bridge 工作目录>
 ```
 
 - bridge 用的不是默认 profile `claude` 时，安装前设置 `LARK_CHANNEL_PROFILE=<名字>`（和 `LARK_CHANNEL_HOME`，如果你改过）。
-- 想换 launchd 标签或数据目录：`TICKETD_LABEL=... TICKETD_HOME=... scripts/install.sh`（卸载时用同样的变量）。
-- 只想看生成的 plist、不安装：`scripts/install.sh --print`。
+- 想换服务名（launchd 标签 / systemd 服务名）或数据目录：`TICKETD_LABEL=... TICKETD_HOME=... scripts/install.sh`（卸载时用同样的变量）。
+- 只想看生成的 plist（Linux 上是 systemd unit）、不安装：`scripts/install.sh --print`。
+- `/usr/bin/python3` 低于 3.9 或不存在：`TICKETD_PYTHON=/path/to/python3 scripts/install.sh`。
 - 配置文件改了不用重启：服务和 `ticket` 命令读取时会发现文件变化。
+
+### Linux / WSL2
+
+`scripts/install.sh` 在 Linux 上装成 systemd 用户服务（`~/.config/systemd/user/dev.larkyard.ticketd.service`），其余步骤和上面一样。先准备好：
+
+```bash
+# worker 沙箱：Claude Code 要 bubblewrap 和 socat；Codex 也优先用系统装的 bubblewrap
+sudo apt-get install bubblewrap socat        # Fedora：sudo dnf install bubblewrap socat
+
+# Ubuntu 24.04 起 AppArmor 默认不让 bwrap 建用户命名空间；下面这条输出 1 时，给 bwrap 加一份 AppArmor 配置
+sysctl kernel.apparmor_restrict_unprivileged_userns
+sudo tee /etc/apparmor.d/bwrap > /dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+EOF
+sudo systemctl reload apparmor
+
+# 让用户服务在退出登录后继续跑、开机自己起来
+sudo loginctl enable-linger "$USER"
+```
+
+- **WSL2 要先打开 systemd**：在 `/etc/wsl.conf` 里写两行 `[boot]` 和 `systemd=true`，在 PowerShell 里 `wsl --shutdown` 后重新打开发行版。`systemctl --user status` 能正常输出就说明好了。WSL1 不行（Claude Code 的沙箱只支持 WSL2）：`wsl -l -v` 查版本，`wsl --set-version <发行版> 2` 升级。
+- **WSL2 里所有东西都放在 Linux 文件系统里**：bridge、本仓库、`~/.ticketd`、工单目录都在 `~` 下，不要放 `/mnt/c/...`（Windows 盘上符号链接、权限和文件锁的行为不一样，也慢）。bridge 也要装在同一个 WSL 发行版里。
+- 安装脚本会检查并提示：是 WSL1、WSL2 里 node / lark-cli / claude 用的是 Windows 盘（`/mnt/c/...`）上的版本、没有 systemd 用户实例时直接退出；缺 bwrap / socat、AppArmor 限制了用户命名空间、没开 linger 时给出警告。systemd 要 ≥ 240（Ubuntu 20.04、Debian 11 及更新的都满足）。
+- 管理服务：`systemctl --user status|restart|stop dev.larkyard.ticketd`；日志和 macOS 一样在 `~/.ticketd/logs/`。
+- Linux 上 lark-cli 不用系统钥匙串，凭据和主密钥是 `~/.local/share/lark-cli` 里的文件；ticketd 已把这个目录放进 worker 沙箱的可写范围（令牌刷新要写）。
+- Linux 上本仓库、家目录、`TICKETD_HOME` 等路径里不能有空白和 `%` `$` `"` `\`（systemd unit 会把它们当成特殊字符），安装脚本遇到会拒绝。
 
 **验证**：在飞书里给 bot 发一件要做几分钟的事。应该先收到开单回执，接着出现状态卡；在终端里 `bin/ticket ls` 能看到这张单。服务日志在 `~/.ticketd/logs/`。
 
-**卸载**：`scripts/uninstall.sh`（数据目录和工单目录保留）；工作区的 `CLAUDE.md` 用 `setup-workspace.sh` 留下的备份还原。
+**卸载**：`scripts/uninstall.sh`（macOS 卸 launchd 服务，Linux 停掉并删除 systemd 用户服务；数据目录和工单目录保留）；工作区的 `CLAUDE.md` 用 `setup-workspace.sh` 留下的备份还原。
 
 ## 配置
 
@@ -148,13 +181,13 @@ scripts/setup-workspace.sh <bridge 工作目录>
 | `TICKETD_TURN_TIMEOUT` | `7200` | 单轮超时（秒） |
 | `TICKETD_MODEL` | 空 | Claude Code worker 用的模型，空为 claude 默认 |
 | `TICKETD_EXECUTOR` | `claude` | 新单默认的执行器：`claude` 或 `codex`（`ticket new --executor` 可逐单指定） |
-| `TICKETD_CODEX` | `codex` | Codex CLI 路径。launchd 的 PATH 由 `install.sh` 生成，只含 node、lark-cli、claude（以及安装时找得到的 codex）所在目录；找不到时写绝对路径 |
+| `TICKETD_CODEX` | `codex` | Codex CLI 路径。服务（launchd / systemd）的 PATH 由 `install.sh` 生成，只含 node、lark-cli、claude（以及安装时找得到的 codex）所在目录；找不到时写绝对路径 |
 | `TICKETD_CODEX_MODEL` | 空 | Codex worker 的模型，空为 `config.toml` 里的默认 |
 | `TICKETD_CODEX_HOME` | 空 | ticketd 专用的 `CODEX_HOME`（放防误发的 execpolicy 规则）；空则沿用 `~/.codex` 且不写规则 |
 | `TICKETD_CODEX_GIT_WRITABLE` | `1` | Codex worker 能否在授权仓库里 `git commit`；`0` = 保留 Codex 自带的 `.git` 只读保护 |
 | `TICKETD_VIDEO_FOLDER` | 空 | 结果里的视频传到你云空间的哪个文件夹（文件夹 token）；空为云空间根目录 |
 
-安装时的变量：`TICKETD_HOME`（默认 `~/.ticketd`）、`TICKETD_LABEL`（默认 `dev.larkyard.ticketd`）、`LARK_CHANNEL_HOME`、`LARK_CHANNEL_PROFILE`。
+安装时的变量：`TICKETD_HOME`（默认 `~/.ticketd`）、`TICKETD_LABEL`（默认 `dev.larkyard.ticketd`，Linux 上是 systemd 服务名）、`LARK_CHANNEL_HOME`、`LARK_CHANNEL_PROFILE`、`TICKETD_PYTHON`（Python 解释器，默认 `/usr/bin/python3`；`bin/ticket`、`bin/ticketd` 也认它；Linux 上总是写进服务环境，macOS 上显式指定时写进 plist）。
 
 ## 开发
 
@@ -163,13 +196,18 @@ scripts/setup-workspace.sh <bridge 工作目录>
 /usr/bin/python3 scripts/validate_cards.py --dump    # 打印所有卡片变体；不带 --dump 会调飞书 cardkit 校验（不发消息）
 ```
 
-- 有 6 个孤儿进程清理的用例依赖 `ps`，在禁止执行 `ps` 的沙箱里（比如由 Larkyard worker 来跑）会失败，属环境限制。
+- 有 6 个孤儿进程清理的用例要查看真实进程（macOS 用 `ps`，Linux 读 `/proc`），在禁止这样做的沙箱里（比如由 Larkyard worker 来跑）会失败，属环境限制。
+- 孤儿进程清理有一个残余风险（macOS 上一直如此，Linux 上一样）：你自己在工单目录里启动、又脱离了终端的后台程序（比如在工单目录里 `code .` 起的编辑器、tmux 服务端），在这张单的 worker 结束时会被当成残留进程清掉。
+- 平台相关的代码只在 `ticketd/host.py`、`ticketd/procs.py`、`ticketd/perms.py` 和 `scripts/install.sh`；单测 mock 平台分支，所以两个平台的分支在任一系统上都能测。
 - 改行为前先读 `docs/spec.md` 对应章节，改完把「调整」写回 spec；改卡片结构后跑 `validate_cards.py`（加 `--with-images` 会先传两张小图，把含图片的卡也一起校验）。
 - 仓库里不放任何个人信息：open_id、chat_id、message_id、本机路径、密钥、工单历史和数据库。个人的东西放 `config.env` 和 `CLAUDE.local.md`。
 
 ## 已知限制
 
-- 只支持 macOS；只服务一个主用户。
+- 支持 macOS 和 Linux（含 WSL2），不支持原生 Windows；只服务一个主用户。
+- Linux / WSL2 上的验证目前只有单测（mock 平台分支），还没有像 macOS 那样端到端实测过（`docs/spec.md` §6 的沙箱结论来自 macOS）。尤其没实测：Claude Code / Codex 的 bubblewrap 沙箱下 worker 的读写边界、Codex 授权仓库里 `.git` 是否只读（`TICKETD_CODEX_GIT_WRITABLE` 在 Linux 上的效果）、worker 沙箱里 lark-cli 的只读操作。
+- Linux 上 Claude Code 沙箱里的命令在独立的网络命名空间里，连不到宿主机 `localhost` 上的服务；WSL2 里 worker 默认也调不了 Windows 程序（`cmd.exe`、`/mnt/c/...` 下的 exe）。
+- WSL2 可能在所有 WSL 终端都关掉一段时间后停掉整个发行版，ticketd 和 bridge 也随之停止；要常驻就保持一个 WSL 终端开着，或用 Windows 任务计划在登录时启动一个常驻的 `wsl.exe` 进程。这一条随 WSL 版本变化，本仓库没有验证。
 - 依赖 lark-channel-bridge 注入的 `<bridge_context>` 字段（`chatId`、`messageIds`、`senderId`）；bridge 改了格式时，工作区约定里的派单命令需要跟着改。
 - 主会话（bridge 里做判断和派单的那个会话）目前只在 Claude Code 上写过、验证过：工作区约定是 `CLAUDE.md`。bridge 的 Codex 主会话（profile `agentKind: "codex"`）还没验证；能路由给 Codex 的是 worker。
 - worker 的沙箱和权限依赖 Claude Code 的 `--permission-mode dontAsk` 与 sandbox 设置，Claude Code 升级后建议按 `docs/spec.md` §6 的实测结论复核一遍。
