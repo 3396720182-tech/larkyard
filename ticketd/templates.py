@@ -2,6 +2,7 @@
 
 - worker 可控的文字（摘要、阶段、问题、产物）一律放 plain_text，不经 Markdown 解析。
 - 只用实测过的卡片能力（div / hr / button、header 的 title / subtitle / template）。
+  例外：结果卡的 img（T0005）尚未经 validate_cards.py 校验；飞书若拒收，发件箱会改发文字兜底。
   改卡片结构后跑 `scripts/validate_cards.py`，用飞书 cardkit 接口校验（不发消息）。
 """
 from __future__ import annotations
@@ -23,6 +24,12 @@ LABELS = {k: "%s %s" % (e, w) for k, (e, w, _) in FINAL.items()}
 LABELS["progress"] = "❓ 有问题问你"
 
 _URL = re.compile(r"^https?://[^\s<>\"]+$")
+
+# 结果卡里直接显示的图片产物。占位元素带 UPLOAD_KEY，由发件箱在发送前上传换成 img_key；
+# 换不成的占位会被整个删掉（产物路径仍在 📎 列表里），所以占位字段永远不会原样发给飞书。
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+MAX_CARD_IMAGES = 6
+UPLOAD_KEY = "ticketd_upload"
 
 
 def short(s, n: int = 160) -> str:
@@ -118,9 +125,14 @@ def title_of(ticket_id: str, title: str) -> str:
     return "%s · %s" % (ticket_id, title)
 
 
+def image_artifacts(artifacts: List[str]) -> List[str]:
+    return [a for a in artifacts if not _URL.match(a) and a.lower().endswith(IMAGE_EXTS)][:MAX_CARD_IMAGES]
+
+
 def result_elements(status: str, summary: str, artifacts: List[str], ask: Optional[str],
-                    workdir: Optional[str]) -> list:
-    """结果正文：一句话结果、需要你做的事、产物。"""
+                    workdir: Optional[str], images: bool = False) -> list:
+    """结果正文：一句话结果、需要你做的事、产物。images=True 时图片产物直接显示（只用于推送的结果卡，
+    状态卡原地 PATCH 不经发件箱，不能带待上传的占位）。"""
     els = [text(clip(summary, 1200))]
     if ask:
         if status == "dropped":
@@ -129,6 +141,12 @@ def result_elements(status: str, summary: str, artifacts: List[str], ask: Option
             els.append(text("👉 需要你：" + clip(ask, 600), color="orange" if status == "blocked" else None))
     files = [a for a in artifacts if not _URL.match(a)]
     links = [a for a in artifacts if _URL.match(a)]
+    if images:
+        for a in image_artifacts(artifacts):
+            name = short(Path(a).name, 60)
+            els.append(note(name))
+            els.append({"tag": "img", "img_key": "", UPLOAD_KEY: a,
+                        "alt": {"tag": "plain_text", "content": name}})
     if files:
         els.append(note("\n".join("📎 " + short(nice_path(a, workdir), 120) for a in files[:8])))
     for u in links[:3]:
@@ -163,7 +181,7 @@ def result_card(ticket_id: str, title: str, workdir: Optional[str], status: str,
     sub = "%s %s" % (emoji, word)
     if elapsed is not None:
         sub += " · 用时 %s" % dur(elapsed)
-    els = result_elements(status, summary, artifacts, ask, workdir)
+    els = result_elements(status, summary, artifacts, ask, workdir, images=True)
     els.append(hr())
     els.append(note(("过程：%s · " % trail(phases, done=True, limit=6) if phases else "") + "引用此卡可追问"))
     return card("%s %s %s：%s" % (emoji, ticket_id, word, short(summary, 40)),

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
 import time
 from typing import Optional, Tuple
 
-from . import config, core, db, templates
+from . import config, core, db, safefs, templates
 
 PERMANENT_CODES = {230001, 230002, 230011, 230025}
 
@@ -63,15 +65,107 @@ def patch_card(message_id: str, card: dict) -> Tuple[bool, str, bool]:
                       "--data", json.dumps(body, ensure_ascii=False)])
 
 
-def _run_lark(cmd) -> Tuple[bool, str, bool]:
+# ---------- 结果卡里的图片 ----------
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 飞书 im/v1/images 上限 10MB
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
+
+
+def upload_image(path: str) -> Tuple[bool, str, bool]:
+    """上传图片拿 image_key（im/v1/images，image_type=message）。返回值同 send_reply，info 为 image_key。
+    lark-cli 的 --file 只接受当前目录下的相对路径（绝对路径报 cannot open file），所以切到图片所在目录再传文件名。"""
+    return _run_lark([config.lark_bin(), "im", "images", "create", "--as", "bot",
+                      "--data", json.dumps({"image_type": "message"}), "--file", "image=" + os.path.basename(path)],
+                     field="image_key", cwd=os.path.dirname(os.path.abspath(path)))
+
+
+def _read_workdir_image(path: str, workdir: Optional[str]) -> bytes:
+    """读工单目录里的一张图。守护进程不在沙箱里，路径由 worker 控制：只认工单目录内、非符号链接、
+    非硬链接的普通文件，按文件头确认是图片，避免借上传把沙箱外的文件发出去。"""
+    if not workdir:
+        raise OSError("工单没有工作目录")
+    if not os.path.isabs(path):  # worker 常报相对工单目录的路径；守护进程的 cwd 不是工单目录
+        path = os.path.join(workdir, path)
+    root = os.path.realpath(workdir)
+    real = os.path.realpath(path)
+    if not real.startswith(root + os.sep):
+        raise OSError("不在工单目录内")
+    fd = safefs.open_read(path)
+    if fd is None:
+        raise OSError("文件不存在")
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        st = os.fstat(fd)
+        rst = os.stat(real)
+        if (st.st_dev, st.st_ino) != (rst.st_dev, rst.st_ino):
+            raise OSError("路径在读取过程中被替换")
+        if st.st_size > MAX_IMAGE_BYTES:
+            raise OSError("超过 10MB")
+        chunks, left = [], MAX_IMAGE_BYTES + 1
+        while left > 0:
+            b = os.read(fd, min(left, 1 << 20))
+            if not b:
+                break
+            chunks.append(b)
+            left -= len(b)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > MAX_IMAGE_BYTES:
+        raise OSError("超过 10MB")
+    if not (data.startswith(_IMAGE_MAGIC) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")):
+        raise OSError("文件头不是图片")
+    return data
+
+
+def resolve_card_images(card: dict, workdir: Optional[str], uploader=None) -> dict:
+    """把卡片里待上传的图片占位换成 img_key。上传不成的整张图（连同上方的文件名）删掉，结果不能因图片卡住。
+    上传的是读进来的字节的私有副本，不把 worker 可控的路径交给 lark-cli。"""
+    uploader = uploader or upload_image
+    els = card.get("body", {}).get("elements", [])
+    out = []
+    for el in els:
+        if not (isinstance(el, dict) and templates.UPLOAD_KEY in el):
+            out.append(el)
+            continue
+        path = el[templates.UPLOAD_KEY]
+        key, why = "", ""
+        try:
+            data = _read_workdir_image(path, workdir)
+            with tempfile.TemporaryDirectory(prefix="ticketd-img-") as d:
+                tmp = os.path.join(d, "image" + os.path.splitext(path)[1].lower())
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                ok, info, _ = uploader(tmp)
+            key, why = (info, "") if ok and info else ("", info or "未返回 image_key")
+        except OSError as e:
+            why = str(e)
+        if key:
+            el = {k: v for k, v in el.items() if k != templates.UPLOAD_KEY}
+            el["img_key"] = key
+            out.append(el)
+        else:
+            alert("结果卡图片未显示（%s）：%s" % (path, why))
+            name = (el.get("alt") or {}).get("content")
+            if out and isinstance(out[-1], dict) and (out[-1].get("text") or {}).get("content") == name:
+                out.pop()  # 去掉这张图上方的文件名
+    card = dict(card)
+    card["body"] = dict(card.get("body", {}), elements=out)
+    return card
+
+
+def _has_uploads(card: dict) -> bool:
+    return any(isinstance(el, dict) and templates.UPLOAD_KEY in el
+               for el in card.get("body", {}).get("elements", []))
+
+
+def _run_lark(cmd, field: str = "message_id", cwd: Optional[str] = None) -> Tuple[bool, str, bool]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, "调用 lark-cli 失败：%s" % e, False
     data = _parse_json(p.stdout) or _parse_json(p.stderr)
     if data and data.get("ok"):
         body = data.get("data")
-        return True, (body.get("message_id") or "") if isinstance(body, dict) else "", False
+        return True, (body.get(field) or "") if isinstance(body, dict) else "", False
     if p.returncode == 0 and not (data and data.get("ok") is False):
         if data is None:
             alert("lark-cli 返回 0 但输出无法解析，按已发送处理：%s" % (p.stdout or p.stderr)[:200])
@@ -97,6 +191,11 @@ def _send_row(r, sender, card_sender, con, card_patcher=None) -> Tuple[bool, str
     if r["card_json"] == "":  # 卡片已被拒：兜底文字的每次重试都用同一个幂等键
         return sender(r["reply_to"], r["text"], idem + "-t")
     card, text = json.loads(r["card_json"]), r["text"]
+    if _has_uploads(card):
+        # 先上传图片，把换好 img_key 的卡片写回发件箱：重试时不重复上传（稿子按钮不写回，每次按缓存现加）
+        t = con.execute("SELECT workdir FROM tickets WHERE id=?", (r["ticket_id"],)).fetchone()
+        card = resolve_card_images(card, t["workdir"] if t else None)
+        con.execute("UPDATE outbox SET card_json=? WHERE id=?", (json.dumps(card, ensure_ascii=False), r["id"]))
     links = _doc_links(con, r)
     if links:
         card = templates.with_doc_links(card, links)
