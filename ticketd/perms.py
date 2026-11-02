@@ -5,9 +5,9 @@ import os
 from pathlib import Path
 from typing import List
 
-from . import config
+from . import config, host
 
-# V1 实测（spec §6）：lark-cli 在沙箱里做 TLS 校验需要这些 mach 服务
+# V1 实测（spec §6）：lark-cli 在沙箱里做 TLS 校验需要这些 mach 服务（只有 macOS 有，Linux 上不写这一项）
 MACH_LOOKUP = ["com.apple.trustd.agent", "com.apple.trustd", "com.apple.SecurityServer", "com.apple.securityd"]
 # 这份 deny 列表只是防误发的护栏，不是安全边界
 DENY = [
@@ -26,45 +26,57 @@ def writable_paths(workdir: str, grant_paths: List[str]) -> List[str]:
     return [str(Path(workdir).resolve())] + [str(Path(g).resolve()) for g in grant_paths]
 
 
+def _existing_on_linux(paths: List[str], keep: int) -> List[str]:
+    """Linux 上沙箱是 bubblewrap，给它一个不存在的绑定路径会整条命令起不来；前 keep 个（工单目录和授权目录）
+    原样保留，其余的（lark-cli、临时目录这类附带路径）不存在就不写。macOS 不过滤，生成的设置保持不变。"""
+    if not host.is_linux():
+        return paths
+    return paths[:keep] + [p for p in paths[keep:] if os.path.isdir(p)]
+
+
 def build_settings(workdir: str, grant_paths: List[str]) -> dict:
     paths = writable_paths(workdir, grant_paths)
     allow = list(BASE_ALLOW)
     for p in paths:
         # 规则格式是 Tool(//绝对路径/**)：p 自带开头的 "/"
         allow += ["Edit(/%s/**)" % p, "Write(/%s/**)" % p, "NotebookEdit(/%s/**)" % p]
-    sandbox_write = paths + [
-        str(Path.home() / "Library" / "Application Support" / "lark-cli"),
-        "/private/tmp",
-    ]
+    sandbox_write = paths + [host.lark_cli_data_dir(), host.shared_tmp()]
     tmpdir = os.environ.get("TMPDIR")
     if tmpdir:
         sandbox_write.append(str(Path(tmpdir).resolve()))
     lark_cfg = os.environ.get("LARKSUITE_CLI_CONFIG_DIR")
     if lark_cfg:
         sandbox_write.append(str(Path(lark_cfg).resolve()))
+    sandbox_write = _existing_on_linux(sandbox_write, len(paths))
+    network = {"allowedDomains": ["*"]}
+    if not host.is_linux():
+        network["allowMachLookup"] = list(MACH_LOOKUP)
     return {
         "permissions": {"allow": allow, "deny": list(DENY)},
         "sandbox": {
             "enabled": True,
             "autoAllowBashIfSandboxed": True,
             "allowUnsandboxedCommands": False,
+            # Linux / WSL2 上沙箱靠 bubblewrap + socat：没装时宁可让 worker 起不来，也不裸跑
             "failIfUnavailable": True,
             "filesystem": {"allowWrite": sandbox_write},
-            "network": {"allowedDomains": ["*"], "allowMachLookup": list(MACH_LOOKUP)},
+            "network": network,
         },
     }
 
 
 def codex_writable_roots(workdir: str, grant_paths: List[str]) -> List[str]:
     """Codex workspace-write 的可写根：和 Claude 沙箱的 allowWrite 对齐（/tmp、$TMPDIR 是 Codex 默认可写的）。"""
-    roots = writable_paths(workdir, grant_paths) + [
-        str(Path.home() / "Library" / "Application Support" / "lark-cli")]
+    paths = writable_paths(workdir, grant_paths)
+    roots = paths + [host.lark_cli_data_dir()]
     lark_cfg = os.environ.get("LARKSUITE_CLI_CONFIG_DIR")
     if lark_cfg:
         roots.append(str(Path(lark_cfg).resolve()))
+    roots = _existing_on_linux(roots, len(paths))
     if config.codex_git_writable():
         # Codex 把每个可写根下的 .git 设为只读（V1 实测：授权仓库里 git commit 失败）。
         # 把 .git 本身也列为可写根即可放开，和 Claude worker 能在授权仓库里提交保持一致。
+        # （macOS 实测；Linux 上 Codex 用 bubblewrap，这一条未实测，多列一个可写根不会放宽到 .git 以外。）
         roots += [str(Path(g).resolve() / ".git") for g in grant_paths if (Path(g) / ".git").is_dir()]
     return roots
 
