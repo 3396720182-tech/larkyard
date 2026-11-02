@@ -2,6 +2,13 @@
 
 ## 0.2.0 — 未发布
 
+- 结果卡里直接看图：图片产物（png/jpg/jpeg/webp/gif，最多 6 张）由发件箱上传成 `img_key` 后显示在卡里，结果覆盖状态卡和另发新消息两条路都生效。只上传工单目录里的普通文件（不跟符号链接、不认硬链接、≤10MB、核对文件头），交给 lark-cli 的是私有副本。
+- 结果卡里看视频：`.mp4` 产物以用户身份传到用户自己的云空间（`lark-cli drive +upload --as user`），卡里放可点击的封面和「▶ 播放视频」按钮；封面用同目录同名的图片。云空间上传失败时改为卡片后另发一条视频消息（`outbox` 新增 `media_json` 列，老库自动迁移）。
+- 新配置项：`TICKETD_VIDEO_FOLDER`（视频上传到的云空间文件夹，空为根目录）。
+- 结果卡改版（画廊风）：有媒体时媒体在最上面，单图大图、多图两列网格带编号；下面一行结论、「👉 需要你」色块、链接和稿子按钮，其余细节和本机路径收进默认折叠的「详情」。没有媒体的卡按文档排版。worker 提示词要求摘要第一句写结论。
+- 发送链路加固：结果卡遇到任何飞书业务错误都马上改发文字兜底；结果覆盖状态卡被拒时改发新卡；卡片/视频重试满 24 小时前先试一次文字兜底；上传媒体遇到网络/超时先退避重试 3 次，不立刻降级。
+- 修复：macOS 15 上 `ps -E` 看不到系统程序（sh、sleep…）的环境变量，worker 留下的后台进程逃过了清理。现在另按目录补一道：已被 launchd 收养、没有控制终端、当前目录在工单目录内的进程也会被清理。
+- `scripts/validate_cards.py` 新增画廊卡样例，`--with-images` 会先传两张小图，把含图片的卡也送去校验。
 - 新增执行器：工单可以交给 Codex CLI 跑（`ticket new --executor codex`，或设 `TICKETD_EXECUTOR=codex`），默认仍是 Claude Code。新文件是 `ticketd/executors.py` 和 `prompts/worker.codex.md`；`tickets` 表新增 `executor` 列，老库会自动迁移，老单按 claude 处理。
 - Codex worker 跑在 Codex 自带的 Seatbelt 沙箱里，可写范围和 Claude worker 一致；授权仓库的 `.git` 默认放开（`TICKETD_CODEX_GIT_WRITABLE`）。在专用 `CODEX_HOME`（`TICKETD_CODEX_HOME`）里写 execpolicy 规则，禁止发飞书消息。
 - 新配置项：`TICKETD_EXECUTOR`、`TICKETD_CODEX`、`TICKETD_CODEX_MODEL`、`TICKETD_CODEX_HOME`、`TICKETD_CODEX_GIT_WRITABLE`。

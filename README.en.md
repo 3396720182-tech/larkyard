@@ -28,7 +28,11 @@ Larkyard's answer: **the bridge session only triages and dispatches.** Long task
 A ticket takes up two things in the chat:
 
 1. A one-line receipt from the bridge session: `🎫 已开单 T0001「…」，进度看下方状态卡` ("ticket T0001 opened, progress on the card below").
-2. One status card, edited in place while the work runs (stage trail, latest step, elapsed time; edits don't notify). When the ticket finishes, the result overwrites the same card. Document artifacts (.md / .docx / .xlsx …) are imported as Feishu docs with an "open" button.
+2. One status card, edited in place while the work runs (stage trail, latest step, elapsed time; edits don't notify). When the ticket finishes, the result overwrites the same card:
+   - Image artifacts (png / jpg / webp / gif, up to 6) are shown in the card: one large image, or a two-column grid with a number under each so you can reply "2" to pick one.
+   - `.mp4` videos are uploaded to your own Feishu Drive as you; the card shows a clickable cover and a "▶ 播放视频" (play) button that opens Drive's player. The cover is the image next to the video with the same name (`final.mp4` → `final.jpg`).
+   - Document artifacts (.md / .docx / .xlsx …) are imported as Feishu docs with an "open" button.
+   - The card keeps one line of conclusion and the "👉 需要你" (needs you) block; the rest of the summary and local paths sit in a collapsed details panel.
 
 A separate short ping is sent only when you need to answer something. Reply to any message of the ticket to follow up; say "stop", "hold", "go on" or "grant <dir>" to control it.
 
@@ -99,7 +103,7 @@ you ──Feishu──▶ lark-channel-bridge ──▶ bridge session (Claude C
 - `/usr/bin/python3` 3.9+ (standard library only)
 - Node.js ≥ 20.12 and a working [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge) (tested with 0.7.0)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart), logged in (tested with 2.1.300). Required: the bridge session and the default worker use it
-- lark-cli (`npm i -g @larksuite/cli`) on PATH; importing documents into Feishu Docs needs it logged in as a user (optional)
+- lark-cli (`npm i -g @larksuite/cli`) on PATH; importing documents into Feishu Docs and uploading videos to Drive need it logged in as a user (optional; without it a video is sent as a separate video message after the card)
 - [Codex CLI](https://github.com/openai/codex) (`codex` logged in or with a provider configured; verified on codex-cli 0.134.0). Optional: only needed to route tickets to Codex. Install it before running `scripts/install.sh`, which adds it to the daemon's PATH
 
 UI strings (receipts, cards, prompts) are currently in Chinese.
@@ -141,6 +145,7 @@ Everything lives in `~/.ticketd/config.env` (environment variables of the same n
 | `TICKETD_CODEX_MODEL` | empty | Codex worker model; empty means the default in `config.toml` |
 | `TICKETD_CODEX_HOME` | empty | Dedicated `CODEX_HOME` for ticketd (holds the anti-messaging execpolicy rules); empty means `~/.codex` and no rules are written |
 | `TICKETD_CODEX_GIT_WRITABLE` | `1` | Whether Codex workers may `git commit` in granted repos; `0` keeps Codex's built-in read-only `.git` protection |
+| `TICKETD_VIDEO_FOLDER` | empty | Drive folder token that result videos are uploaded to; empty means the root of your Drive |
 
 Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (default `dev.larkyard.ticketd`), `LARK_CHANNEL_HOME`, `LARK_CHANNEL_PROFILE`.
 
@@ -151,8 +156,8 @@ Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (
 /usr/bin/python3 scripts/validate_cards.py --dump    # print every card variant; without --dump it validates them via Feishu cardkit (sends nothing)
 ```
 
-- Five orphan-sweep tests need `ps`; they fail inside sandboxes that forbid it (e.g. when run by a Larkyard worker).
-- Read the matching section of `docs/spec.md` before changing behavior, and record the change there. Run `validate_cards.py` after touching card layouts.
+- Six orphan-sweep tests need `ps`; they fail inside sandboxes that forbid it (e.g. when run by a Larkyard worker).
+- Read the matching section of `docs/spec.md` before changing behavior, and record the change there. Run `validate_cards.py` after touching card layouts (`--with-images` uploads two tiny images first so cards with images are validated too).
 - Keep personal data out of the repo: open_ids, chat_ids, message_ids, local paths, secrets, ticket history, databases. Personal things go in `config.env` and `CLAUDE.local.md`.
 
 ## Known limitations
@@ -161,6 +166,7 @@ Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (
 - Relies on the `<bridge_context>` fields injected by lark-channel-bridge (`chatId`, `messageIds`, `senderId`); if the bridge changes them, the dispatch command in the workspace conventions must follow.
 - The bridge session (the one that triages and dispatches) has only been written for and tested on Claude Code: the workspace conventions are a `CLAUDE.md`. A Codex bridge session (profile `agentKind: "codex"`) is untested; what can be routed to Codex is the worker.
 - Worker sandboxing relies on Claude Code's `--permission-mode dontAsk` and sandbox settings; re-check the findings in `docs/spec.md` §6 after upgrading Claude Code.
+- Feishu cards have no video component, so videos don't play inline: the card has a cover and a button that opens Drive's player. Drive's one-shot upload caps at 20MB; larger videos (up to 30MB) go out as a separate video message after the card, and beyond that only the local path is given.
 - The Codex executor relies on the `codex exec --json` event format and config keys (measured on 0.134.0; real output is kept in `tests/fixtures/`). After upgrading Codex, run `tests/test_codex.py` first and re-check the sandbox per spec §6.
 
 ## License

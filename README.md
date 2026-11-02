@@ -28,7 +28,11 @@ Larkyard 的做法：**bridge 里的会话只做判断和派单**，长任务交
 一张工单在聊天里只占两样东西：
 
 1. bridge 回的一行开单回执：`🎫 已开单 T0001「整理X」，进度看下方状态卡`
-2. 一张状态卡：运行中原地刷新（阶段轨迹、最近一步、用时，编辑不产生推送提醒）；结束时结果直接覆盖到这张卡上，稿子类产物（.md / .docx / .xlsx …）会导入成飞书云文档，卡上有「打开」按钮。
+2. 一张状态卡：运行中原地刷新（阶段轨迹、最近一步、用时，编辑不产生推送提醒）；结束时结果直接覆盖到这张卡上：
+   - 图片产物（png / jpg / webp / gif，最多 6 张）直接显示在卡里：单张大图，多张两列网格、每张带编号，回复「2」就能选；
+   - `.mp4` 视频以你的身份传到你的飞书云空间，卡里是可点击的封面和「▶ 播放视频」按钮，点开用云空间播放器看（封面用同目录同名的图片，如 `成片.mp4` 配 `成片.jpg`）；
+   - 稿子类产物（.md / .docx / .xlsx …）会导入成飞书云文档，卡上有「打开」按钮；
+   - 卡上只放一行结论和「👉 需要你」，其余细节和本机文件路径收在默认折叠的「详情」里。
 
 只有需要你回答时（受阻、带问题）才会另推一条短提醒。引用工单里的任意一条消息回复，就是对这张单的追问；说「停」「先别动」「继续」「授权某目录」，就是控制这张单。
 
@@ -99,7 +103,7 @@ Codex worker 的几点细节：
 - `/usr/bin/python3`（3.9+，只用标准库）
 - Node.js ≥ 20.12，已装好并能正常对话的 [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge)（在 0.7.0 上验证）
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart)（`claude` 已登录；在 2.1.300 上验证）：必需，主会话和默认 worker 都用它
-- lark-cli（`npm i -g @larksuite/cli`），在 PATH 上；稿子导入云文档需要它以 user 身份登录过（可选）
+- lark-cli（`npm i -g @larksuite/cli`），在 PATH 上；稿子导入云文档、视频传云空间需要它以 user 身份登录过（可选，没登录时视频改为卡片后另发一条视频消息）
 - [Codex CLI](https://github.com/openai/codex)（`codex` 已登录或已配置 provider；在 codex-cli 0.134.0 上验证）：可选，要把工单路由给 Codex 时才需要。先装好再跑 `scripts/install.sh`，安装脚本会把它加进服务的 PATH
 
 界面文案（回执、状态卡、提示）目前是中文。
@@ -148,6 +152,7 @@ scripts/setup-workspace.sh <bridge 工作目录>
 | `TICKETD_CODEX_MODEL` | 空 | Codex worker 的模型，空为 `config.toml` 里的默认 |
 | `TICKETD_CODEX_HOME` | 空 | ticketd 专用的 `CODEX_HOME`（放防误发的 execpolicy 规则）；空则沿用 `~/.codex` 且不写规则 |
 | `TICKETD_CODEX_GIT_WRITABLE` | `1` | Codex worker 能否在授权仓库里 `git commit`；`0` = 保留 Codex 自带的 `.git` 只读保护 |
+| `TICKETD_VIDEO_FOLDER` | 空 | 结果里的视频传到你云空间的哪个文件夹（文件夹 token）；空为云空间根目录 |
 
 安装时的变量：`TICKETD_HOME`（默认 `~/.ticketd`）、`TICKETD_LABEL`（默认 `dev.larkyard.ticketd`）、`LARK_CHANNEL_HOME`、`LARK_CHANNEL_PROFILE`。
 
@@ -158,8 +163,8 @@ scripts/setup-workspace.sh <bridge 工作目录>
 /usr/bin/python3 scripts/validate_cards.py --dump    # 打印所有卡片变体；不带 --dump 会调飞书 cardkit 校验（不发消息）
 ```
 
-- 有 5 个孤儿进程清理的用例依赖 `ps`，在禁止执行 `ps` 的沙箱里（比如由 Larkyard worker 来跑）会失败，属环境限制。
-- 改行为前先读 `docs/spec.md` 对应章节，改完把「调整」写回 spec；改卡片结构后跑 `validate_cards.py`。
+- 有 6 个孤儿进程清理的用例依赖 `ps`，在禁止执行 `ps` 的沙箱里（比如由 Larkyard worker 来跑）会失败，属环境限制。
+- 改行为前先读 `docs/spec.md` 对应章节，改完把「调整」写回 spec；改卡片结构后跑 `validate_cards.py`（加 `--with-images` 会先传两张小图，把含图片的卡也一起校验）。
 - 仓库里不放任何个人信息：open_id、chat_id、message_id、本机路径、密钥、工单历史和数据库。个人的东西放 `config.env` 和 `CLAUDE.local.md`。
 
 ## 已知限制
@@ -168,6 +173,7 @@ scripts/setup-workspace.sh <bridge 工作目录>
 - 依赖 lark-channel-bridge 注入的 `<bridge_context>` 字段（`chatId`、`messageIds`、`senderId`）；bridge 改了格式时，工作区约定里的派单命令需要跟着改。
 - 主会话（bridge 里做判断和派单的那个会话）目前只在 Claude Code 上写过、验证过：工作区约定是 `CLAUDE.md`。bridge 的 Codex 主会话（profile `agentKind: "codex"`）还没验证；能路由给 Codex 的是 worker。
 - worker 的沙箱和权限依赖 Claude Code 的 `--permission-mode dontAsk` 与 sandbox 设置，Claude Code 升级后建议按 `docs/spec.md` §6 的实测结论复核一遍。
+- 飞书卡片没有视频组件，视频不能在卡片里直接播放：卡里放封面和按钮，点开走云空间播放器。云空间一次性上传最大 20MB，更大的视频（≤30MB）改为卡片后另发一条视频消息，再大就只给本机路径。
 - Codex 执行器依赖 `codex exec --json` 的事件格式和配置键（在 0.134.0 上实测，真实输出存在 `tests/fixtures/`）；Codex 升级后先跑 `tests/test_codex.py`，并按 spec §6 复核沙箱。
 
 ## 许可
