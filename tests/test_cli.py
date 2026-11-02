@@ -176,3 +176,15 @@ class CliSpoolTest(TicketdTestCase):
         p = self.run_cli("report", "--status", "ready", "--summary", "  ", env=env)
         self.assertEqual(p.returncode, 2)
         self.assertIn("错误", p.stderr)
+
+    def test_bin_honors_ticketd_python(self):
+        import sys
+        marker = self.tmp / "py-used"
+        wrapper = self.tmp / "py"
+        wrapper.write_text('#!/bin/sh\necho used > "%s"\nexec "%s" "$@"\n' % (marker, sys.executable), encoding="utf-8")
+        wrapper.chmod(0o755)
+        p = self.run_cli("ls", env={"TICKETD_PYTHON": str(wrapper)})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(marker.exists())
+        p = self.run_cli("ls", env={"TICKETD_PYTHON": str(self.tmp / "missing-python")})
+        self.assertNotEqual(p.returncode, 0)  # 显式指定的解释器不存在时不悄悄换成别的

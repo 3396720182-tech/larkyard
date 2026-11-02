@@ -1,3 +1,7 @@
 #!/bin/sh
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec /usr/bin/python3 -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from ticketd.cli import main; sys.exit(main())' "$DIR" "$@"
+# 默认用系统自带的 /usr/bin/python3（macOS 和常见 Linux 发行版都有）；TICKETD_PYTHON 可指定别的解释器（3.9+），
+# 没指定且 /usr/bin/python3 不存在时退回 PATH 上的 python3
+PY="${TICKETD_PYTHON:-/usr/bin/python3}"
+if [ -z "${TICKETD_PYTHON:-}" ] && [ ! -x "$PY" ]; then PY=python3; fi
+exec "$PY" -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from ticketd.cli import main; sys.exit(main())' "$DIR" "$@"
