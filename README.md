@@ -34,6 +34,8 @@ Larkyard 的做法：**bridge 里的会话只做判断和派单**，长任务交
    - 稿子类产物（.md / .docx / .xlsx …）会导入成飞书云文档，卡上有「打开」按钮；
    - 卡上只放一行结论和「👉 需要你」，其余细节和本机文件路径收在默认折叠的「详情」里。
 
+结果不会因为发送出问题而悄悄丢掉：你撤回了派单那条消息，结果就直接发到会话里；网络断一阵，图片和视频会等网络恢复后照常放进卡里，要连续失败 10 分钟以上才会降级成灰字或另发视频；同一个视频再次汇报不会重复上传。
+
 只有需要你回答时（受阻、带问题）才会另推一条短提醒。引用工单里的任意一条消息回复，就是对这张单的追问；说「停」「先别动」「继续」「授权某目录」，就是控制这张单。
 
 ## 路由：Claude Code 还是 Codex
@@ -69,7 +71,7 @@ Codex worker 的几点细节：
 
 | 部分 | 位置 | 作用 |
 |---|---|---|
-| `ticketd` 派单服务 | `ticketd/`、`bin/ticketd`、`launchd/`、`systemd/` | launchd（macOS）或 systemd 用户服务（Linux）托管的守护进程：排队、并发上限、为每张单起一个 worker（默认 `claude -p`，可按单换成 `codex exec`）、超时、崩溃恢复、发件箱（失败重试、幂等）、状态卡 |
+| `ticketd` 派单服务 | `ticketd/`、`bin/ticketd`、`launchd/`、`systemd/` | launchd（macOS）或 systemd 用户服务（Linux）托管的守护进程：排队、并发上限、为每张单起一个 worker（默认 `claude -p`，可按单换成 `codex exec`）、超时、崩溃恢复、发件箱（失败重试、幂等，原消息撤回时改发到会话）、状态卡 |
 | `ticket` 命令 | `bin/ticket` | 主会话和 worker 操作工单的唯一入口：`new / send / lookup / stop / hold / release / grant / show / ls / report` |
 | worker 约定 | `prompts/worker.md`、`prompts/worker.codex.md` | worker 的系统提示：只认用户原话、只写授权目录、按阶段自报进度、用 5 种状态之一收尾；Codex worker 额外追加 `worker.codex.md` |
 | 执行器 | `ticketd/executors.py` | 把「用哪个 agent CLI 跑一轮」从调度器里拆出来：Claude Code 和 Codex 各一个实现，Codex 的事件翻译成同一种格式，状态卡、卡死检测、重试两边共用 |
@@ -85,7 +87,7 @@ Codex worker 的几点细节：
                                                                ├─ worker：Claude Code（claude -p）或 Codex（codex exec），
                                                                │          按单路由，每单一个会话 + 目录 + 沙箱
                                                                ├─ 状态卡：原地刷新，结果覆盖
-                                                               └─ 发件箱：lark-cli 回复原消息，失败重试
+                                                               └─ 发件箱：lark-cli 回复原消息（已撤回则发到会话），失败退避重试
 ```
 
 ## 工作区约定的核心
@@ -212,6 +214,7 @@ sudo loginctl enable-linger "$USER"
 - 主会话（bridge 里做判断和派单的那个会话）目前只在 Claude Code 上写过、验证过：工作区约定是 `CLAUDE.md`。bridge 的 Codex 主会话（profile `agentKind: "codex"`）还没验证；能路由给 Codex 的是 worker。
 - worker 的沙箱和权限依赖 Claude Code 的 `--permission-mode dontAsk` 与 sandbox 设置，Claude Code 升级后建议按 `docs/spec.md` §6 的实测结论复核一遍。
 - 飞书卡片没有视频组件，视频不能在卡片里直接播放：卡里放封面和按钮，点开走云空间播放器。100MB 以内的视频传云空间（超过 20MB 时 lark-cli 自动分片上传）；传不上去时，≤30MB 的改为卡片后另发一条视频消息，再大就只给本机路径。
+- 媒体上传还在守护进程主循环里做：每行结果卡每个 tick 新开上传最多 60 秒，超了下个 tick 接着传。最坏情况下，其他工单的消息会被延后约 60 秒再加一次上传超时。守护进程在上传视频途中被强杀，重启后会再传一次，云空间里会多一份同名视频。
 - Codex 执行器依赖 `codex exec --json` 的事件格式和配置键（在 0.134.0 上实测，真实输出存在 `tests/fixtures/`）；Codex 升级后先跑 `tests/test_codex.py`，并按 spec §6 复核沙箱。
 
 ## 许可

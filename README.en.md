@@ -34,6 +34,8 @@ A ticket takes up two things in the chat:
    - Document artifacts (.md / .docx / .xlsx …) are imported as Feishu docs with an "open" button.
    - The card keeps one line of conclusion and the "👉 需要你" (needs you) block; the rest of the summary and local paths sit in a collapsed details panel.
 
+Results aren't silently lost when sending goes wrong: if you withdraw the message that opened the ticket, the result goes to the chat instead; during a network outage images and videos wait and still land in the card once the network is back, and only degrade (grey placeholder text, or a separate video message) after failing for more than 10 minutes; re-reporting the same video doesn't upload it again.
+
 A separate short ping is sent only when you need to answer something. Reply to any message of the ticket to follow up; say "stop", "hold", "go on" or "grant <dir>" to control it.
 
 ## Routing: Claude Code or Codex
@@ -69,7 +71,7 @@ A few details about Codex workers:
 
 | Part | Where | What it does |
 |---|---|---|
-| `ticketd` daemon | `ticketd/`, `bin/ticketd`, `launchd/`, `systemd/` | Managed by launchd (macOS) or a systemd user service (Linux): queueing, concurrency limit, one worker per ticket (`claude -p` by default, `codex exec` per ticket), timeouts, crash recovery, an idempotent outbox with retries, status cards |
+| `ticketd` daemon | `ticketd/`, `bin/ticketd`, `launchd/`, `systemd/` | Managed by launchd (macOS) or a systemd user service (Linux): queueing, concurrency limit, one worker per ticket (`claude -p` by default, `codex exec` per ticket), timeouts, crash recovery, an idempotent outbox with retries that falls back to the chat when the origin message was withdrawn, status cards |
 | `ticket` CLI | `bin/ticket` | The only entry point for the bridge session and workers: `new / send / lookup / stop / hold / release / grant / show / ls / report` |
 | Worker contract | `prompts/worker.md`, `prompts/worker.codex.md` | System prompt for workers: the user's own words are the spec, write only to granted dirs, report stages, close with one of 5 states; Codex workers also get `worker.codex.md` |
 | Executors | `ticketd/executors.py` | Separates "which agent CLI runs a turn" from the scheduler: one implementation for Claude Code and one for Codex; Codex events are translated into the same shape, so status cards, stall detection and retries are shared |
@@ -85,7 +87,7 @@ you ──Feishu──▶ lark-channel-bridge ──▶ bridge session (Claude C
                                                                  ├─ worker: Claude Code (claude -p) or Codex (codex exec),
                                                                  │         routed per ticket, one session + dir + sandbox each
                                                                  ├─ status card: edited in place, result overwrites it
-                                                                 └─ outbox: lark-cli replies to the origin message, with retries
+                                                                 └─ outbox: lark-cli replies to the origin message (or the chat if it was withdrawn), with backoff
 ```
 
 ## The conventions in short
@@ -205,6 +207,7 @@ Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (
 - The bridge session (the one that triages and dispatches) has only been written for and tested on Claude Code: the workspace conventions are a `CLAUDE.md`. A Codex bridge session (profile `agentKind: "codex"`) is untested; what can be routed to Codex is the worker.
 - Worker sandboxing relies on Claude Code's `--permission-mode dontAsk` and sandbox settings; re-check the findings in `docs/spec.md` §6 after upgrading Claude Code.
 - Feishu cards have no video component, so videos don't play inline: the card has a cover and a button that opens Drive's player. Videos up to 100MB go to Drive (lark-cli switches to multipart upload above 20MB); if the Drive upload fails, videos up to 30MB go out as a separate video message after the card, and beyond that only the local path is given.
+- Media uploads still run in the daemon's main loop: each result row may start uploads for up to 60 s per tick and continues on the next tick when over budget. In the worst case, other tickets' messages are delayed by about 60 s plus one upload timeout. If the daemon is killed mid-way through a video upload, it uploads again after restart and Drive ends up with a duplicate copy.
 - The Codex executor relies on the `codex exec --json` event format and config keys (measured on 0.134.0; real output is kept in `tests/fixtures/`). After upgrading Codex, run `tests/test_codex.py` first and re-check the sandbox per spec §6.
 
 ## License
