@@ -110,6 +110,11 @@ def lark_bin() -> str:
     return _env("TICKETD_LARK", "lark-cli")
 
 
+def video_folder() -> str:
+    """视频产物上传到的云空间文件夹 token（用户身份）；空 = 用户云空间根目录。"""
+    return _env("TICKETD_VIDEO_FOLDER", "")
+
+
 def model() -> str:
     return _env("TICKETD_MODEL", "")
 

@@ -79,8 +79,30 @@ def upload_image(path: str) -> Tuple[bool, str, bool]:
 
 
 def _read_workdir_image(path: str, workdir: Optional[str]) -> bytes:
-    """读工单目录里的一张图。守护进程不在沙箱里，路径由 worker 控制：只认工单目录内、非符号链接、
-    非硬链接的普通文件，按文件头确认是图片，避免借上传把沙箱外的文件发出去。"""
+    """读工单目录里的一张图，按文件头确认是图片。"""
+    data = _read_workdir_file(path, workdir, MAX_IMAGE_BYTES)
+    if not (data.startswith(_IMAGE_MAGIC) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")):
+        raise OSError("文件头不是图片")
+    return data
+
+
+def _fd_path(fd: int) -> Optional[str]:
+    """已打开文件的真实路径（macOS F_GETPATH / Linux /proc）；拿不到返回 None。"""
+    try:
+        import fcntl
+        if hasattr(fcntl, "F_GETPATH"):
+            return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+    except OSError:
+        return None
+    try:
+        return os.readlink("/proc/self/fd/%d" % fd)
+    except OSError:
+        return None
+
+
+def _read_workdir_file(path: str, workdir: Optional[str], limit: int) -> bytes:
+    """读工单目录里的一个文件。守护进程不在沙箱里，路径由 worker 控制：只认工单目录内、非符号链接、
+    非硬链接的普通文件，避免借上传把沙箱外的文件发出去。"""
     if not workdir:
         raise OSError("工单没有工作目录")
     if not os.path.isabs(path):  # worker 常报相对工单目录的路径；守护进程的 cwd 不是工单目录
@@ -97,9 +119,13 @@ def _read_workdir_image(path: str, workdir: Optional[str]) -> bytes:
         rst = os.stat(real)
         if (st.st_dev, st.st_ino) != (rst.st_dev, rst.st_ino):
             raise OSError("路径在读取过程中被替换")
-        if st.st_size > MAX_IMAGE_BYTES:
-            raise OSError("超过 10MB")
-        chunks, left = [], MAX_IMAGE_BYTES + 1
+        opened = _fd_path(fd)
+        # O_NOFOLLOW 只管最后一级：中间某级目录在检查和打开之间被换成符号链接时，按实际打开的文件再核一次
+        if opened is not None and not os.path.realpath(opened).startswith(root + os.sep):
+            raise OSError("打开的文件不在工单目录内")
+        if st.st_size > limit:
+            raise OSError("超过 %dMB" % (limit // (1024 * 1024)))
+        chunks, left = [], limit + 1
         while left > 0:
             b = os.read(fd, min(left, 1 << 20))
             if not b:
@@ -109,11 +135,52 @@ def _read_workdir_image(path: str, workdir: Optional[str]) -> bytes:
     finally:
         os.close(fd)
     data = b"".join(chunks)
-    if len(data) > MAX_IMAGE_BYTES:
-        raise OSError("超过 10MB")
-    if not (data.startswith(_IMAGE_MAGIC) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")):
-        raise OSError("文件头不是图片")
+    if len(data) > limit:
+        raise OSError("超过 %dMB" % (limit // (1024 * 1024)))
     return data
+
+
+def _upload_workdir_image(path: str, workdir: Optional[str], uploader) -> Tuple[str, str]:
+    """上传工单目录里的一张图（私有副本），返回 (image_key, 失败原因)。"""
+    try:
+        data = _read_workdir_image(path, workdir)
+        with tempfile.TemporaryDirectory(prefix="ticketd-img-") as d:
+            tmp = os.path.join(d, "image" + os.path.splitext(path)[1].lower())
+            with open(tmp, "wb") as f:
+                f.write(data)
+            ok, info, _ = uploader(tmp)
+        return (info, "") if ok and info else ("", info or "未返回 image_key")
+    except OSError as e:
+        return "", str(e)
+
+
+def resolve_card_videos(card: dict, workdir: Optional[str], ticket_id: str, drive_uploader=None,
+                        uploader=None) -> Tuple[dict, list]:
+    """把卡片里的视频占位换成「可点击封面 + 播放按钮」（视频先以用户身份传到云空间拿链接）。
+    返回 (新卡片, 没能放进卡片的视频列表)——后者由调用方另排视频消息。"""
+    drive_uploader = drive_uploader or upload_video_drive
+    uploader = uploader or upload_image
+    out, leftover = [], []
+    for el in card.get("body", {}).get("elements", []):
+        if not (isinstance(el, dict) and templates.VIDEO_KEY in el):
+            out.append(el)
+            continue
+        video = el[templates.VIDEO_KEY]
+        ok, url = drive_uploader(video, workdir, ticket_id)
+        if not ok:
+            alert("视频没能传到云空间，改为卡片后另发视频消息（%s）：%s" % (video, url))
+            url = None
+            leftover.append(video)
+        cover = find_cover(video, workdir)
+        key = ""
+        if cover:
+            key, why = _upload_workdir_image(cover, workdir, uploader)
+            if not key:
+                alert("视频封面未显示（%s）：%s" % (cover, why))
+        out.extend(templates.video_elements(video, url, key or None))
+    card = dict(card)
+    card["body"] = dict(card.get("body", {}), elements=out)
+    return card, leftover
 
 
 def resolve_card_images(card: dict, workdir: Optional[str], uploader=None) -> dict:
@@ -127,17 +194,7 @@ def resolve_card_images(card: dict, workdir: Optional[str], uploader=None) -> di
             out.append(el)
             continue
         path = el[templates.UPLOAD_KEY]
-        key, why = "", ""
-        try:
-            data = _read_workdir_image(path, workdir)
-            with tempfile.TemporaryDirectory(prefix="ticketd-img-") as d:
-                tmp = os.path.join(d, "image" + os.path.splitext(path)[1].lower())
-                with open(tmp, "wb") as f:
-                    f.write(data)
-                ok, info, _ = uploader(tmp)
-            key, why = (info, "") if ok and info else ("", info or "未返回 image_key")
-        except OSError as e:
-            why = str(e)
+        key, why = _upload_workdir_image(path, workdir, uploader)
         if key:
             el = {k: v for k, v in el.items() if k != templates.UPLOAD_KEY}
             el["img_key"] = key
@@ -153,13 +210,143 @@ def resolve_card_images(card: dict, workdir: Optional[str], uploader=None) -> di
 
 
 def _has_uploads(card: dict) -> bool:
-    return any(isinstance(el, dict) and templates.UPLOAD_KEY in el
+    return any(isinstance(el, dict) and (templates.UPLOAD_KEY in el or templates.VIDEO_KEY in el)
                for el in card.get("body", {}).get("elements", []))
 
 
-def _run_lark(cmd, field: str = "message_id", cwd: Optional[str] = None) -> Tuple[bool, str, bool]:
+MAX_DRIVE_VIDEO_BYTES = 20 * 1024 * 1024  # 云空间一次性上传（upload_all）的上限
+_DRIVE_URL = re.compile(r"^https://[A-Za-z0-9.-]+\.(feishu\.cn|larksuite\.com|feishu-pre\.net)/\S+$")
+
+
+def _safe_drive_name(ticket_id: str, video: str) -> str:
+    """云空间里的文件名：工单号-原文件名（只留字母数字汉字和 ._-，不以 - 开头，限长）。"""
+    base = re.sub(r"[^\w.\-]", "_", os.path.basename(video))[-80:] or "video.mp4"
+    if not base.lower().endswith(".mp4"):
+        base += ".mp4"
+    return "%s-%s" % (re.sub(r"[^\w]", "", ticket_id) or "ticket", base)
+
+
+def upload_video_drive(video: str, workdir: Optional[str], ticket_id: str) -> Tuple[bool, str]:
+    """以用户身份把视频传到用户自己的云空间（文件归用户所有，用户本人能打开），返回 (成功, 链接或失败原因)。
+    文件规则同图片/视频消息：只认工单目录里的普通 mp4，交给 lark-cli 的是私有临时副本。"""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
+        data = _read_workdir_file(video, workdir, MAX_DRIVE_VIDEO_BYTES)
+        if not _is_mp4(data):
+            raise OSError("文件头不是 mp4")
+    except OSError as e:
+        return False, "视频不能上传（%s）：%s" % (video, e)
+    with tempfile.TemporaryDirectory(prefix="ticketd-drive-") as d:
+        with open(os.path.join(d, "video.mp4"), "wb") as f:
+            f.write(data)
+        cmd = [config.lark_bin(), "drive", "+upload", "--as", "user", "--file", "./video.mp4",
+               "--name", _safe_drive_name(ticket_id, video)]
+        if config.video_folder():
+            cmd += ["--folder-token", config.video_folder()]
+        ok, body, err = _lark_json(cmd, cwd=d, timeout=VIDEO_TIMEOUT)
+    if not ok:
+        return False, "上传云空间失败：%s" % err
+    url = _find_url(body)
+    token = _find_key(body, "file_token")
+    if not url and token:
+        ok, meta, err = _lark_json([config.lark_bin(), "drive", "metas", "batch_query", "--as", "user", "--data",
+                                    json.dumps({"request_docs": [{"doc_token": token, "doc_type": "file"}],
+                                                "with_url": True})])
+        url = _find_url(meta) if ok else None
+        if not url:
+            return False, "已上传（file_token=%s）但拿不到链接：%s" % (token, err or "返回里没有 url")
+    if not url:
+        return False, "上传云空间后没有返回 file_token 或链接"
+    return True, url
+
+
+def _find_key(obj, key: str):
+    """在 lark-cli 返回的 data 里深度找第一个 key 字段（各命令包装层不一样）。"""
+    if isinstance(obj, dict):
+        if isinstance(obj.get(key), str) and obj[key]:
+            return obj[key]
+        for v in obj.values():
+            r = _find_key(v, key)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, key)
+            if r:
+                return r
+    return None
+
+
+def _find_url(obj) -> Optional[str]:
+    url = _find_key(obj, "url")
+    return url if url and _DRIVE_URL.match(url) else None
+
+
+def _lark_json(cmd, cwd: Optional[str] = None, timeout: float = 30) -> Tuple[bool, Optional[dict], str]:
+    """跑 lark-cli，返回 (成功, data 字段, 失败信息)。"""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, None, "调用 lark-cli 失败：%s" % e
+    data = _parse_json(p.stdout) or _parse_json(p.stderr)
+    if data and data.get("ok"):
+        return True, data.get("data") if isinstance(data.get("data"), (dict, list)) else {}, ""
+    err = (data or {}).get("error")
+    return False, None, "rc=%s %s" % (p.returncode, json.dumps(err, ensure_ascii=False) if err else (p.stderr or p.stdout)[-300:])
+
+
+# ---------- 视频消息（T0010） ----------
+MAX_VIDEO_BYTES = 30 * 1024 * 1024  # 飞书 im/v1/files 上限 30MB
+VIDEO_TIMEOUT = 180
+VIDEO_MAX_ATTEMPTS = 3  # 失败这么多次后改发兜底文字
+
+
+def find_cover(video: str, workdir: Optional[str]) -> Optional[str]:
+    """视频的封面：同目录同名的第一张能通过图片检查的图。返回原样（相对/绝对）路径，没有返回 None。"""
+    for c in templates.cover_candidates(video):
+        try:
+            _read_workdir_image(c, workdir)
+            return c
+        except OSError:
+            continue
+    return None
+
+
+def _is_mp4(data: bytes) -> bool:
+    return len(data) >= 12 and data[4:8] == b"ftyp"
+
+
+def send_video(reply_to: str, video: str, workdir: Optional[str], idem: str) -> Tuple[bool, str, bool]:
+    """回复一条视频消息（lark-cli 的 --video 会先上传成 file_key，封面 --video-cover 必填）。
+    和图片一样：只认工单目录里的普通文件，复制成私有临时文件再交给 lark-cli（它只接受 cwd 下的相对路径）。
+    没有封面时退成文件消息（--file），飞书里同样能点开预览。本地检查不过算永久失败（重试也不会好）。"""
+    try:
+        data = _read_workdir_file(video, workdir, MAX_VIDEO_BYTES)
+        if not _is_mp4(data):
+            raise OSError("文件头不是 mp4")
+        cover = find_cover(video, workdir)
+        cover_data = _read_workdir_image(cover, workdir) if cover else None
+    except OSError as e:
+        return False, "视频不能发送（%s）：%s" % (video, e), True
+    with tempfile.TemporaryDirectory(prefix="ticketd-video-") as d:
+        name = "video.mp4"  # 固定 ASCII 名：不把 worker 起的文件名交给 lark-cli
+        with open(os.path.join(d, name), "wb") as f:
+            f.write(data)
+        cmd = [config.lark_bin(), "im", "+messages-reply", "--as", "bot", "--message-id", reply_to,
+               "--idempotency-key", idem]
+        if cover_data is not None:
+            cname = "cover" + os.path.splitext(cover)[1].lower()
+            with open(os.path.join(d, cname), "wb") as f:
+                f.write(cover_data)
+            cmd += ["--video", "./" + name, "--video-cover", "./" + cname]
+        else:
+            alert("视频 %s 没有同名封面图，改发文件消息" % video)
+            cmd += ["--file", "./" + name]
+        return _run_lark(cmd, cwd=d, timeout=VIDEO_TIMEOUT)
+
+
+def _run_lark(cmd, field: str = "message_id", cwd: Optional[str] = None, timeout: float = 30) -> Tuple[bool, str, bool]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, "调用 lark-cli 失败：%s" % e, False
     data = _parse_json(p.stdout) or _parse_json(p.stderr)
@@ -184,20 +371,45 @@ def _run_lark(cmd, field: str = "message_id", cwd: Optional[str] = None) -> Tupl
 CARD_HOLD = 120.0  # 新单的状态卡还没发出时，同单的消息先等它（保证卡片排在结果前面），最多等这么久
 
 
-def _send_row(r, sender, card_sender, con, card_patcher=None) -> Tuple[bool, str, bool]:
+def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None) -> Tuple[bool, str, bool]:
+    video_sender = video_sender or send_video
     idem = "ticketd-%s-%d-%d" % (r["ticket_id"], r["id"], int(r["created_at"] * 1000) % 10 ** 10)
+    media = r["media_json"] if "media_json" in r.keys() else None
+    if media and r["attempts"] >= VIDEO_MAX_ATTEMPTS:
+        # 网络/超时反复失败：每次都要阻塞守护进程最多 180 秒、还挡住同单后面的消息，不再硬发，改发文字
+        alert("outbox %d（%s）视频连续 %d 次没发出，改发文字：%s" % (r["id"], r["ticket_id"], r["attempts"], r["last_error"]))
+        con.execute("UPDATE outbox SET media_json='' WHERE id=?", (r["id"],))
+        media = ""
+    if media:
+        t = con.execute("SELECT workdir FROM tickets WHERE id=?", (r["ticket_id"],)).fetchone()
+        ok, info, permanent = video_sender(r["reply_to"], json.loads(media)["video"], t["workdir"] if t else None, idem)
+        if ok or not permanent:
+            return ok, info, permanent
+        # 视频发不出去（文件不合格或飞书永久拒收）：改发文字告诉用户文件在哪
+        alert("outbox %d（%s）视频消息发送失败，改发文字：%s" % (r["id"], r["ticket_id"], info))
+        con.execute("UPDATE outbox SET media_json='' WHERE id=?", (r["id"],))
+        return sender(r["reply_to"], r["text"], idem + "-t")
+    if media == "":  # 视频已放弃：兜底文字的每次重试都用同一个幂等键
+        return sender(r["reply_to"], r["text"], idem + "-t")
     if r["card_json"] is None:
         return sender(r["reply_to"], r["text"], idem)
     if r["card_json"] == "":  # 卡片已被拒：兜底文字的每次重试都用同一个幂等键
         return sender(r["reply_to"], r["text"], idem + "-t")
     card, text = json.loads(r["card_json"]), r["text"]
     if _has_uploads(card):
-        # 先上传图片，把换好 img_key 的卡片写回发件箱：重试时不重复上传（稿子按钮不写回，每次按缓存现加）
+        # 先传视频（云空间）和图片，把换好链接/img_key 的卡片写回发件箱：重试时不重复上传
         t = con.execute("SELECT workdir FROM tickets WHERE id=?", (r["ticket_id"],)).fetchone()
-        card = resolve_card_images(card, t["workdir"] if t else None)
-        con.execute("UPDATE outbox SET card_json=? WHERE id=?", (json.dumps(card, ensure_ascii=False), r["id"]))
+        wd = t["workdir"] if t else None
+        card, leftover = resolve_card_videos(card, wd, r["ticket_id"])
+        card = resolve_card_images(card, wd)
+        with db.tx(con):
+            con.execute("UPDATE outbox SET card_json=? WHERE id=?", (json.dumps(card, ensure_ascii=False), r["id"]))
+            for v in leftover:  # 没进卡片的视频：卡片之后另发视频消息（id 更大，排在卡片后面）
+                con.execute("INSERT INTO outbox(ticket_id, reply_to, text, media_json, created_at) VALUES(?,?,?,?,?)",
+                            (r["ticket_id"], r["reply_to"], templates.video_fallback(r["ticket_id"], v, wd),
+                             json.dumps({"video": v}, ensure_ascii=False), db.now()))
     links = _doc_links(con, r)
-    if links:
+    if links:  # 稿子按钮每次按缓存现加，不写回发件箱
         card = templates.with_doc_links(card, links)
         text += "".join("\n📄 %s：%s" % (name, url) for name, url in links)
     if r["report_id"] is not None:
@@ -256,7 +468,7 @@ def flush(con, sender=None, limit: int = 5, card_sender=None, card_patcher=None)
         (now, now - CARD_HOLD, limit)).fetchall()
     for r in rows:
         try:
-            ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher)
+            ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher=card_patcher)
         except Exception as e:  # 毒丸行：发送器本身抛异常，标记 dead 后继续处理其余行
             con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
                         (r["attempts"] + 1, repr(e), r["id"]))

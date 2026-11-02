@@ -25,5 +25,11 @@ count = len(log.read_text(encoding="utf-8").splitlines())
 if args[:2] == ["drive", "+import"]:
     print(json.dumps({"ok": True, "identity": "user",
                       "data": {"type": "docx", "url": "https://example.feishu.cn/docx/fake%d" % count}}, indent=2))
+elif args[:2] == ["drive", "+upload"]:  # 云空间上传：只回 file_token（链接要再查 metas）
+    print(json.dumps({"ok": True, "identity": "user", "data": {"file_token": "boxcn_fake_%d" % count}}, indent=2))
+elif args[:3] == ["drive", "metas", "batch_query"]:
+    tok = json.loads(args[args.index("--data") + 1])["request_docs"][0]["doc_token"]
+    print(json.dumps({"ok": True, "identity": "user", "data": {"metas": [
+        {"doc_token": tok, "url": "https://example.feishu.cn/file/" + tok}]}}, indent=2))
 else:
     print(json.dumps({"ok": True, "identity": "bot", "data": {"message_id": "om_fake_%d" % count}}, indent=2))

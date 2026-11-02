@@ -4,6 +4,7 @@
 不发任何消息（只创建一个不挂在任何会话上的卡片实体）。改了 templates.py / card.py 的卡片结构后跑一次：
     /usr/bin/python3 scripts/validate_cards.py            # 校验
     /usr/bin/python3 scripts/validate_cards.py --dump     # 只打印 JSON，不调接口
+    /usr/bin/python3 scripts/validate_cards.py --with-images   # 另传一张 1x1 小图，连含 img 的卡（结果图、视频封面）一起校验
 需要 lark-cli 和 bot 身份（与 ticketd 相同的环境变量）。
 """
 from __future__ import annotations
@@ -43,6 +44,18 @@ def samples():
                           ("failed", None, []), ("waiting", None, []), ("dropped", "不属于本单", [])):
         out.append(("结果卡 " + st, templates.result_card(tid, t()["title"], wd, st, "一句话结果\n第二行", arts, ask,
                                                      ["读代码", "写代码"], 600)))
+    # 视频块（T0010）：发件箱换好链接后的样子。img_key 要真实存在，--with-images 时先传一张小图拿 key
+    url = "https://example.feishu.cn/file/boxcnExample"
+    key = _sample_img_key() if "--with-images" in sys.argv else None
+    for label, els in (("视频 链接", templates.video_elements(wd + "/生成/v/视频-720p.mp4", url, key)),
+                       ("视频 兜底", templates.video_elements(wd + "/生成/v/视频-720p.mp4", None, key))):
+        c = templates.result_card(tid, t()["title"], wd, "blocked", "720p 预览好了", [], "要出 1080p 吗？", ["出视频"], 600)
+        c["body"]["elements"][1:1] = els
+        out.append(("结果卡 " + label, c))
+    if key:
+        c = templates.result_card(tid, t()["title"], wd, "ready", "图好了", [], None, [], 60)
+        c["body"]["elements"][1:1] = [{"tag": "img", "img_key": key, "alt": {"tag": "plain_text", "content": "预览-1.png"}}]
+        out.append(("结果卡 图片", c))
     core.add_report(con, tid, "ready", "做好了", [wd + "/结果.md"])
     con.execute("UPDATE outbox SET status='sent'")
     out.append(("结果卡 带稿子按钮", templates.with_doc_links(
@@ -52,6 +65,22 @@ def samples():
     con.execute("UPDATE outbox SET status='dead'")
     out.append(("终态直写", card.render(t(), card.view(con, t(), now), [], now)))
     return out
+
+
+def _sample_img_key() -> str:
+    """传一张 1x1 的 PNG 拿 image_key（只上传图片，不发消息），供含 img 的卡片校验。"""
+    import base64
+    png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+    d = tempfile.mkdtemp(prefix="ticketd-validate-")
+    with open(os.path.join(d, "x.png"), "wb") as f:
+        f.write(png)
+    from ticketd import outbox
+    ok, key, _ = outbox._run_lark([os.environ.get("TICKETD_LARK", "lark-cli"), "im", "images", "create", "--as", "bot",
+                                   "--data", json.dumps({"image_type": "message"}), "--file", "image=x.png"],
+                                  field="image_key", cwd=d)
+    if not (ok and key):
+        sys.exit("上传示例图片失败：%s" % key)
+    return key
 
 
 def check(card: dict) -> str:

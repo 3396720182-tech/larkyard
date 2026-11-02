@@ -70,6 +70,7 @@ MIGRATIONS = [
     ("tickets", "executor", "TEXT NOT NULL DEFAULT 'claude'"),   # 建单时定下，之后不变（会话不能跨执行器迁移）
     ("outbox", "card_json", "TEXT"),                             # 非空 = 发卡片（text 是卡片发不出去时的兜底）
     ("outbox", "report_id", "INTEGER"),                           # 这条消息对应的汇报
+    ("outbox", "media_json", "TEXT"),                             # 非空 = 发视频消息（结果卡里放不进的视频；text 是发不出去时的兜底）
 ]
 
 

@@ -2,7 +2,7 @@
 
 - worker 可控的文字（摘要、阶段、问题、产物）一律放 plain_text，不经 Markdown 解析。
 - 只用实测过的卡片能力（div / hr / button、header 的 title / subtitle / template）。
-  例外：结果卡的 img（T0005）尚未经 validate_cards.py 校验；飞书若拒收，发件箱会改发文字兜底。
+  例外：结果卡的 img（T0005）、视频块的 interactive_container（T0010）；改了要跑 validate_cards.py。飞书若拒收，发件箱会改发文字兜底。
   改卡片结构后跑 `scripts/validate_cards.py`，用飞书 cardkit 接口校验（不发消息）。
 """
 from __future__ import annotations
@@ -30,6 +30,14 @@ _URL = re.compile(r"^https?://[^\s<>\"]+$")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 MAX_CARD_IMAGES = 6
 UPLOAD_KEY = "ticketd_upload"
+
+# 视频产物（T0010）：飞书卡片没有视频组件，不能内嵌播放。结果卡里放 VIDEO_KEY 占位，发件箱发卡前把视频
+# 以用户身份传到云空间拿链接，换成「可点击的封面 + ▶ 播放视频按钮」（点开走飞书云空间的播放器）；
+# 上传不成才退回：封面照常显示，视频在卡片之后另发一条视频消息。封面约定：与视频同目录同名的图片。
+VIDEO_EXTS = (".mp4",)
+COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+MAX_VIDEOS = 2
+VIDEO_KEY = "ticketd_video"
 
 
 def short(s, n: int = 160) -> str:
@@ -125,8 +133,22 @@ def title_of(ticket_id: str, title: str) -> str:
     return "%s · %s" % (ticket_id, title)
 
 
+def video_artifacts(artifacts: List[str]) -> List[str]:
+    """产物里的视频。和视频同名的图片都算封面候选：卡片只显示实际用上的那张，其余同名图不单独显示。"""
+    return [a for a in artifacts if not _URL.match(a) and a.lower().endswith(VIDEO_EXTS)][:MAX_VIDEOS]
+
+
+def cover_candidates(video: str) -> List[str]:
+    """视频的封面候选：同目录同名、扩展名换成图片（视频-720p.mp4 → 视频-720p.jpg …）。"""
+    stem = video[: -len(Path(video).suffix)] if Path(video).suffix else video
+    return [stem + e for e in COVER_EXTS]
+
+
 def image_artifacts(artifacts: List[str]) -> List[str]:
-    return [a for a in artifacts if not _URL.match(a) and a.lower().endswith(IMAGE_EXTS)][:MAX_CARD_IMAGES]
+    """卡片里直接显示的图片；已作为视频封面显示的同名图不再重复。"""
+    covers = {c.lower() for v in video_artifacts(artifacts) for c in cover_candidates(v)}  # macOS 文件名不分大小写
+    return [a for a in artifacts if not _URL.match(a) and a.lower().endswith(IMAGE_EXTS)
+            and a.lower() not in covers][:MAX_CARD_IMAGES]
 
 
 def result_elements(status: str, summary: str, artifacts: List[str], ask: Optional[str],
@@ -142,6 +164,8 @@ def result_elements(status: str, summary: str, artifacts: List[str], ask: Option
     files = [a for a in artifacts if not _URL.match(a)]
     links = [a for a in artifacts if _URL.match(a)]
     if images:
+        for v in video_artifacts(artifacts):
+            els.append(dict(note("🎬 " + short(Path(v).name, 60)), **{VIDEO_KEY: v}))
         for a in image_artifacts(artifacts):
             name = short(Path(a).name, 60)
             els.append(note(name))
@@ -192,6 +216,34 @@ def result_card(ticket_id: str, title: str, workdir: Optional[str], status: str,
 def ack_message(ticket_id: str, title: str) -> str:
     """`ticket new` 的输出，由 bridge 原样回复。目标、可写目录都在状态卡上，这里不重复。"""
     return "🎫 已开单 %s「%s」，进度看下方状态卡" % (ticket_id, title)
+
+
+def video_elements(video: str, url: Optional[str], cover_key: Optional[str]) -> list:
+    """卡片里的一个视频。url 有值：整块（封面 + 一行说明）可点击打开云空间播放，下面再放一个播放按钮；
+    url 为空（上传云空间失败）：只放说明和封面，视频另发一条消息。"""
+    name = short(Path(video).name, 60)
+    if not url:
+        els = [note("🎬 %s（视频在下一条消息，点开播放）" % name)]
+        if cover_key:
+            els.append({"tag": "img", "img_key": cover_key, "alt": {"tag": "plain_text", "content": name + " 封面"}})
+        return els
+    inner = []
+    if cover_key:
+        inner.append({"tag": "img", "img_key": cover_key, "preview": False,
+                      "alt": {"tag": "plain_text", "content": name + " 封面"}})
+    inner.append(text("▶ 点击播放：%s" % name))
+    open_url = [{"type": "open_url", "default_url": url}]
+    return [
+        {"tag": "interactive_container", "width": "fill", "has_border": True, "border_color": "grey",
+         "corner_radius": "8px", "padding": "4px 4px 4px 4px", "behaviors": open_url, "elements": inner},
+        {"tag": "button", "text": {"tag": "plain_text", "content": "▶ 播放视频"}, "type": "primary",
+         "size": "small", "behaviors": open_url},
+    ]
+
+
+def video_fallback(ticket_id: str, video: str, workdir: Optional[str] = None) -> str:
+    """视频消息发不出去时的兜底文字。"""
+    return "🎬 %s 的视频没能直接发出，文件在：%s" % (ticket_id, nice_path(video, workdir))
 
 
 def report_message(ticket_id: str, status: str, summary: str,
