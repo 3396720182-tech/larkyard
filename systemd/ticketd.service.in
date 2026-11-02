@@ -1,0 +1,29 @@
+# 由 scripts/install.sh 生成，重新安装会覆盖；要改就改仓库里的 systemd/ticketd.service.in 再装一次。
+[Unit]
+Description=Larkyard ticketd (@LABEL@)
+
+[Service]
+Type=simple
+ExecStart="@REPO@/bin/ticketd"
+WorkingDirectory=@TICKETD_HOME@
+Restart=always
+RestartSec=10
+# 停服务时先只给 ticketd 发 SIGTERM，让它自己按顺序停掉 worker；ticketd 退出后（或 45 秒还没退出），
+# cgroup 里剩下的进程（含 worker 留下的后台进程）统一 SIGKILL
+KillMode=mixed
+TimeoutStopSec=45
+Environment="HOME=@HOME@"
+Environment="PATH=@PATH@"
+Environment="LANG=C.UTF-8"
+Environment="TICKETD_HOME=@TICKETD_HOME@"
+Environment="TICKETD_PYTHON=@PYTHON@"
+Environment="LARK_CHANNEL=1"
+Environment="LARK_CHANNEL_HOME=@LC_HOME@"
+Environment="LARK_CHANNEL_PROFILE=@LC_PROFILE@"
+Environment="LARK_CHANNEL_CONFIG=@LC_HOME@/profiles/@LC_PROFILE@/lark-cli-source/config.json"
+Environment="LARKSUITE_CLI_CONFIG_DIR=@LC_HOME@/profiles/@LC_PROFILE@/lark-cli"
+StandardOutput=append:@TICKETD_HOME@/logs/daemon.out.log
+StandardError=append:@TICKETD_HOME@/logs/daemon.err.log
+
+[Install]
+WantedBy=default.target
