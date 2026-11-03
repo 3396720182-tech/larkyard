@@ -207,6 +207,7 @@ sudo loginctl enable-linger "$USER"
 - 平台相关的代码只在 `ticketd/host.py`、`ticketd/procs.py`、`ticketd/perms.py` 和 `scripts/install.sh`；单测 mock 平台分支，所以两个平台的分支在任一系统上都能测。GitHub Actions（`.github/workflows/tests.yml`）在 ubuntu-latest 和 macos-latest 上跑全部单测，并在 Ubuntu 上真装、重装、卸载一次 systemd 用户服务。
 - 改行为前先读 `docs/spec.md` 对应章节，改完把「调整」写回 spec；改卡片结构后跑 `validate_cards.py`（加 `--with-images` 会先传两张小图，把含图片的卡也一起校验）。
 - 仓库里不放任何个人信息：open_id、chat_id、message_id、本机路径、密钥、工单历史和数据库。个人的东西放 `config.env` 和 `CLAUDE.local.md`。
+- 去敏检查：`/usr/bin/python3 scripts/check_private.py --install-hooks` 给本克隆装上 pre-commit / pre-push 钩子，提交和推送前自动拦住密钥、真实飞书 id、本机用户目录和非 noreply 邮箱（只打印位置，不回显内容）。只有你知道的串（用户名、公司名）写进 `~/.ticketd/private-patterns`，一行一个正则。
 
 ## 已知限制
 

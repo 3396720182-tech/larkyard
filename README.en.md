@@ -200,6 +200,7 @@ Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (
 - Platform-specific code lives only in `ticketd/host.py`, `ticketd/procs.py`, `ticketd/perms.py` and `scripts/install.sh`; the unit tests mock the platform, so both branches are tested on either OS. GitHub Actions (`.github/workflows/tests.yml`) runs all unit tests on ubuntu-latest and macos-latest, and installs, reinstalls and uninstalls the systemd user service for real on Ubuntu.
 - Read the matching section of `docs/spec.md` before changing behavior, and record the change there. Run `validate_cards.py` after touching card layouts (`--with-images` uploads two tiny images first so cards with images are validated too).
 - Keep personal data out of the repo: open_ids, chat_ids, message_ids, local paths, secrets, ticket history, databases. Personal things go in `config.env` and `CLAUDE.local.md`.
+- Leak check: `/usr/bin/python3 scripts/check_private.py --install-hooks` installs pre-commit / pre-push hooks in your clone that stop secrets, real Feishu ids, home-directory paths and non-noreply emails before they are committed or pushed (it prints locations only, never the matched text). Strings only you know (user name, company) go in `~/.ticketd/private-patterns`, one regex per line.
 
 ## Known limitations
 

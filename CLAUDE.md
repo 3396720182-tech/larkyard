@@ -29,6 +29,10 @@ Larkyard 基于 lark-channel-bridge 开发，但不 fork、不修改它。需要
 ## 去敏（每次提交前检查）
 
 仓库公开，不得出现：密钥、令牌、真实的 open_id / chat_id / message_id、本机用户名路径、公司或客户项目信息、工单历史、数据库和日志。
-测试和示例用 `ou_owner`、`oc_1`、`om_1` 这类假值。提交前可以跑：
+测试和示例用 `ou_owner`、`oc_1`、`om_1` 这类假值。提交和推送前由钩子自动检查（每个克隆装一次）：
 
-    git grep -n -E "ou_[0-9a-f]{20,}|oc_[0-9a-f]{20,}|om_x1|/Users/[a-z]{2,}" -- . ':!CLAUDE.md'
+    /usr/bin/python3 scripts/check_private.py --install-hooks   # pre-commit 查暂存的新增行和提交身份，pre-push 查要推的每个提交
+    /usr/bin/python3 scripts/check_private.py                   # 手动查整个工作树
+
+只有你自己知道的串（用户名、公司名、真实 open_id）写进 `~/.ticketd/private-patterns`（一行一个正则，不进仓库）。
+检查只打印位置不回显内容；确属误报的行写上 `check-private: ignore`。`tests/test_check_private.py` 会在 CI 里查整个仓库。
