@@ -7,6 +7,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Optional, Tuple
 
@@ -84,7 +85,10 @@ def _target_args(to: str) -> list:
 
 MEDIA_MAX_ATTEMPTS = 3  # 媒体上传瞬时失败时至少退避重试这么多次……
 MEDIA_DEGRADE_AFTER = 600.0  # ……并且这一行已经等了这么久，才降级（图换灰字、视频另发）：断网半分钟不该永久丢图
-MEDIA_BUDGET = 60.0  # 一行结果卡在一个 tick 里开始新上传的时间上限（秒）；超了把进度写回、下个 tick 接着传
+# 一行结果卡在一轮里开始新上传的时间上限（秒）；超了把进度写回、下一轮接着传。它不是单次上传的超时（那是
+# _drive_timeout，100MB 约 420 秒），所以守护进程里上传不在主循环做，而在媒体通道线程里做（daemon.MediaLane）；
+# 这个预算只管媒体通道里各行轮流，别让一张多视频的卡一直占着通道。
+MEDIA_BUDGET = 60.0
 _clock = time.monotonic  # 测试可替换
 
 
@@ -274,8 +278,9 @@ def _resolve_videos(card, workdir, ticket_id, drive_uploader=None, uploader=None
                     try:
                         con.execute("INSERT OR REPLACE INTO drive_links VALUES(?,?,?,?)",
                                     (ticket_id, digest, url, db.now()))
-                    except sqlite3.OperationalError as e:  # 缓存是锦上添花：库被锁住时不影响这次发送
-                        alert("云空间链接缓存写入失败（%s）：%r" % (video, e))
+                    except sqlite3.Error as e:  # 缓存是锦上添花：写不进去不影响这次发送，但要分清锁等待和故障
+                        alert("云空间链接缓存写入失败（%s，%s）：%r"
+                              % (video, "库被占用" if db.is_busy(e) else "数据库故障，需要检查", e))
             elif _is_transient(info) and not degrade:
                 err = info
                 out.append(el)
@@ -533,12 +538,12 @@ def _idem(r) -> str:
     return "ticketd-%s-%d-%d" % (r["ticket_id"], r["id"], int(r["created_at"] * 1000) % 10 ** 10)
 
 
-def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None) -> Tuple[bool, str, bool]:
+def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None, lane: str = "all") -> Tuple[bool, str, bool]:
     video_sender = video_sender or send_video
     idem = _idem(r)
     media = r["media_json"] if "media_json" in r.keys() else None
     if media and r["attempts"] >= VIDEO_MAX_ATTEMPTS and db.now() - r["created_at"] >= MEDIA_DEGRADE_AFTER:
-        # 网络/超时反复失败且已等了 10 分钟：每次都要阻塞守护进程最多 180 秒、还挡住同单后面的消息，不再硬发，改发文字
+        # 网络/超时反复失败且已等了 10 分钟：每次都要占住媒体通道最多 180 秒、还挡住同单后面的消息，不再硬发，改发文字
         alert("outbox %d（%s）视频连续 %d 次没发出，改发文字：%s" % (r["id"], r["ticket_id"], r["attempts"], r["last_error"]))
         con.execute("UPDATE outbox SET media_json='' WHERE id=?", (r["id"],))
         media = ""
@@ -567,7 +572,7 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None)
         # 网络/超时：只写回已经成功的部分，整行按 attempts 退避重试；失败满 MEDIA_MAX_ATTEMPTS 次、
         # 且这一行已经等了 MEDIA_DEGRADE_AFTER 秒后才降级（短暂断网不该让图片永久变灰字）
         degrade = r["attempts"] >= MEDIA_MAX_ATTEMPTS and db.now() - r["created_at"] >= MEDIA_DEGRADE_AFTER
-        deadline = _clock() + MEDIA_BUDGET  # 一个 tick 里不在一行上耗太久（主循环还要调度、刷新状态卡）
+        deadline = _clock() + MEDIA_BUDGET  # 一轮里不在一行上耗太久（媒体通道里还有别的行在等）
         card, leftover, err = _resolve_videos(card, wd, r["ticket_id"], degrade=degrade, con=con, deadline=deadline)
         if not err:
             card, err = _resolve_images(card, wd, degrade=degrade, deadline=deadline)
@@ -582,7 +587,13 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None)
         if err:
             # 以「调用 lark-cli 失败」开头：flush 按网络失败处理（退避、本 tick 不再试其余行）
             return False, "调用 lark-cli 失败：上传卡片媒体暂时失败，稍后重试（%s）" % err[:300], False
-    links = _doc_links(con, r)
+    if lane == LANE_MEDIA:
+        # 媒体通道只做慢的准备：上传（上面已写回）和稿子导入（结果进 published 缓存）。发送留给主循环：
+        # 结果要覆盖到状态卡上，必须和 card.refresh 在同一个线程里，否则两边的 PATCH 会互相覆盖
+        _doc_links(con, r)
+        _docs_tried.add(r["id"])
+        return False, PREPARED, False
+    links = _doc_links(con, r, allow_import=lane != LANE_FAST)  # 主循环只用缓存里的链接，不在这里导入
     if links:  # 稿子按钮每次按缓存现加，不写回发件箱
         card = templates.with_doc_links(card, links)
         text += "".join("\n📄 %s：%s" % (name, url) for name, url in links)
@@ -605,21 +616,32 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None)
     return sender(r["reply_to"], text, idem + "-t")
 
 
-def _doc_links(con, r) -> list:
-    """结果卡片上的稿子：把本地文档产物导入成云文档，拿到链接（有缓存，重试不重复导入）。"""
+def _doc_sources(con, r):
+    """这一行结果的 (工作目录, 产物列表)；不是结果行或查不到时返回 None。"""
     if r["report_id"] is None:
-        return []
+        return None
     rep = con.execute("SELECT artifacts_json FROM reports WHERE id=?", (r["report_id"],)).fetchone()
     t = con.execute("SELECT workdir FROM tickets WHERE id=?", (r["ticket_id"],)).fetchone()
     if not rep or not t:
-        return []
+        return None
     try:
         arts = json.loads(rep["artifacts_json"] or "[]")
     except ValueError:
+        return None
+    return t["workdir"], arts if isinstance(arts, list) else []
+
+
+def _doc_links(con, r, allow_import: bool = True) -> list:
+    """结果卡片上的稿子：把本地文档产物导入成云文档，拿到链接（有缓存，重试不重复导入）。
+    allow_import=False 时只用缓存里已有的链接（主循环里不做最长 90 秒一个的导入）。"""
+    src = _doc_sources(con, r)
+    if src is None:
         return []
     from . import publish  # publish 依赖本模块的 alert / _parse_json
     try:
-        return publish.doc_links(con, r["ticket_id"], t["workdir"], arts if isinstance(arts, list) else [])
+        return publish.doc_links(con, r["ticket_id"], src[0], src[1], allow_import=allow_import)
+    except sqlite3.OperationalError:
+        raise  # 库的问题交给 flush 分类（锁等待退避 / 故障告警），不当成导入失败吞掉
     except Exception as e:  # 导入是锦上添花：任何意外都不能挡住结果送达
         alert("%s 稿子链接生成异常：%r" % (r["ticket_id"], e))
         return []
@@ -647,94 +669,233 @@ def _redirect_to_chat(con, r, info: str):
     return con.execute("SELECT * FROM outbox WHERE id=?", (r["id"],)).fetchone()
 
 
-def _poison(con, r, sender, e: Exception) -> None:
-    """发送这一行时抛了异常：先试一次文字兜底（送到了算 sent，并绑定消息以便追问），不行再标 dead。"""
+def _card_dirty(con, ticket_id: str) -> None:
+    """让状态卡下一轮重新刷新。card_at 归零之外还推后 updated_at：媒体通道在另一个线程里写这一笔时，主循环的
+    card.refresh 可能正在 PATCH，它写回的 card_at（本轮开始的时间）会盖掉 0，updated_at 更晚，下一轮仍会被选中。"""
+    con.execute("UPDATE tickets SET card_at=0, updated_at=? WHERE id=?", (db.now(), ticket_id))
+
+
+def _poison(con, r, sender, e: Exception) -> bool:
+    """发送这一行时抛了异常：先试一次文字兜底（送到了算 sent，并绑定消息以便追问），不行再标 dead。
+    返回 True = 结果写不进库（本轮这条通道停下，内存里退避，免得每轮重发一遍文字）。"""
     tok, tinfo = False, None
     try:
         tok, tinfo, _ = sender(r["reply_to"], r["text"], _idem(r) + "-t")
     except Exception:
         pass
-    with db.tx(con):
-        con.execute("UPDATE outbox SET status=?, attempts=?, last_error=?, sent_message_id=? WHERE id=?",
-                    ("sent" if tok else "dead", r["attempts"] + 1, repr(e), tinfo if tok else None, r["id"]))
-        if tok and tinfo:
-            con.execute("INSERT OR IGNORE INTO bindings VALUES(?,?)", (tinfo, r["ticket_id"]))
-        con.execute("UPDATE tickets SET card_at=0 WHERE id=?", (r["ticket_id"],))
+    try:
+        with db.tx(con):
+            con.execute("UPDATE outbox SET status=?, attempts=?, last_error=?, sent_message_id=? WHERE id=?",
+                        ("sent" if tok else "dead", r["attempts"] + 1, repr(e), tinfo if tok else None, r["id"]))
+            if tok and tinfo:
+                con.execute("INSERT OR IGNORE INTO bindings VALUES(?,?)", (tinfo, r["ticket_id"]))
+            _card_dirty(con, r["ticket_id"])
+    except sqlite3.Error as e2:
+        delay = _mem_backoff(r["id"])
+        alert("outbox %d（%s）发送异常 %r，%s，但结果写不进库（%r），%d 秒内不重试"
+              % (r["id"], r["ticket_id"], e, "已改发文字" if tok else "文字兜底也没发出", e2, delay))
+        return True
+    _db_faults.pop(r["id"], None)
     alert("outbox %d %s（%s）：发送异常 %r" % (r["id"], "已改发文字" if tok else "dead", r["ticket_id"], e))
+    return False
 
 
-def flush(con, sender=None, limit: int = 5, card_sender=None, card_patcher=None) -> None:
+# ---------- 投递通道 ----------
+# 守护进程里发件箱分两条通道。主循环的「快通道」负责所有发送（文字、卡片、结果覆盖状态卡，每次最多 30 秒）；
+# 慢的准备工作交给独立线程的「媒体通道」（daemon.MediaLane）：结果卡里图片/视频的上传、稿子导入云文档，
+# 以及视频消息（lark-cli 上传和发送是同一条命令）。一个 100MB 视频传 7 分钟时，派单、状态卡、心跳和其他工单的
+# 投递都照常走。同一工单仍严格按 id 顺序：每单只取最早一条待发消息，它没准备好，同单后面的消息就等着。
+LANE_ALL, LANE_FAST, LANE_MEDIA = "all", "fast", "media"
+PREPARED = "媒体已准备好："  # 媒体通道做完了慢的部分：不算失败、不退避，交给快通道发送
+_claimed = set()  # 正在被某条通道处理的行（同一进程里两个线程之间互斥；只有守护进程投递，不需要跨进程）
+_claimed_lock = threading.Lock()
+_docs_tried = set()  # 媒体通道已经替它导入过稿子的行：导入失败的稿子不再让这一行留在媒体通道（重启后再试一次）
+
+
+def _claim(row_id: int) -> bool:
+    with _claimed_lock:
+        if row_id in _claimed:
+            return False
+        _claimed.add(row_id)
+        return True
+
+
+def _release(row_id: int) -> None:
+    with _claimed_lock:
+        _claimed.discard(row_id)
+
+
+def needs_media(r, con=None) -> bool:
+    """这一行发出去之前要不要先做慢的准备：视频消息、卡片里还有待上传的占位、或结果里有还没导入的稿子。"""
+    if "media_json" in r.keys() and r["media_json"]:
+        return True
+    if not r["card_json"]:
+        return False
+    try:
+        if _has_uploads(json.loads(r["card_json"])):
+            return True
+    except ValueError:
+        return False  # 坏卡片交给快通道按毒丸处理（文字兜底）
+    if con is None or r["id"] in _docs_tried:
+        return False
+    src = _doc_sources(con, r)
+    if src is None:
+        return False
+    from . import publish
+    return publish.has_pending(con, r["ticket_id"], src[0], src[1])
+
+
+def _in_lane(r, lane: str, con) -> bool:
+    return lane == LANE_ALL or (lane == LANE_MEDIA) == needs_media(r, con)
+
+
+DB_FAULT_POISON_AFTER = 3  # 数据库故障（不是锁等待）在同一行上出现这么多次、且这一行已等了 MEDIA_DEGRADE_AFTER，才改发文字
+_db_faults = {}  # 行 id -> (连续故障次数, 内存里的退避截止 _clock 时间)。库写不进去时退避也记不进库，只能记在内存
+
+
+def _mem_backoff(row_id: int) -> float:
+    """在内存里给这一行记一次故障并退避（30 秒起翻倍，最多 10 分钟），返回退避秒数。"""
+    n = _db_faults.get(row_id, (0, 0.0))[0] + 1
+    delay = min(30.0 * 2 ** (n - 1), 600.0)
+    _db_faults[row_id] = (n, _clock() + delay)
+    return delay
+
+
+def _backing_off(row_id: int) -> bool:
+    f = _db_faults.get(row_id)
+    return f is not None and _clock() < f[1]
+
+
+def _db_fault(con, r, sender, e: Exception) -> bool:
+    """磁盘 I/O、只读、库满、缺表缺列等真正的数据库故障：明确告警，不当锁等待挂 24 小时。
+    这一行单独退避（不挡其他工单）；同一行反复出错且已等够 10 分钟、库还能写，才按毒丸改发文字。
+    库连退避都写不进去时返回 True：本轮这条通道停下——发了也记不下来，只会每轮重复发。"""
+    delay = _mem_backoff(r["id"])
+    n = _db_faults[r["id"]][0]
+    try:
+        con.execute("UPDATE outbox SET next_at=?, last_error=? WHERE id=?", (db.now() + delay, repr(e), r["id"]))
+        writable = True
+    except sqlite3.Error:
+        writable = False
+    alert("outbox %d（%s）数据库故障（不是锁等待，需要人工检查；第 %d 次，%d 秒后重试%s）：%r"
+          % (r["id"], r["ticket_id"], n, delay, "" if writable else "，库写不进去，本轮暂停这条通道", e))
+    if writable and n >= DB_FAULT_POISON_AFTER and db.now() - r["created_at"] >= MEDIA_DEGRADE_AFTER:
+        return _poison(con, r, sender, e)
+    return not writable
+
+
+def flush(con, sender=None, limit: int = 5, card_sender=None, card_patcher=None, lane: str = LANE_ALL) -> None:
+    """发一轮。lane：all（一个线程里全做，CLI/测试用）、fast（守护进程主循环）、media（媒体通道线程）。"""
+    if lane not in (LANE_ALL, LANE_FAST, LANE_MEDIA):
+        raise ValueError("未知的投递通道：%r" % lane)
     sender = sender or send_reply
     card_sender = card_sender or send_card
     now = db.now()
     rows = con.execute(
         "SELECT * FROM outbox WHERE id IN (SELECT MIN(id) FROM outbox WHERE status='pending' GROUP BY ticket_id)"
         " AND next_at<=? AND ticket_id NOT IN (SELECT id FROM tickets WHERE card_wanted=1"
-        " AND card_message_id IS NULL AND created_at>?) ORDER BY id LIMIT ?",
-        (now, now - CARD_HOLD, limit)).fetchall()
+        " AND card_message_id IS NULL AND created_at>?) ORDER BY id",
+        (now, now - CARD_HOLD)).fetchall()
+    done = 0
     for r in rows:
+        if done >= limit:
+            break
+        rid = r["id"]
+        if _backing_off(rid) or not _in_lane(r, lane, con) or not _claim(rid):
+            continue
         try:
-            ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher=card_patcher)
-            if not ok and _reply_gone(info) and not r["reply_to"].startswith("oc_"):
-                moved = _redirect_to_chat(con, r, info)
-                if moved is not None:
-                    r = moved
-                    ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher=card_patcher)
-        except sqlite3.OperationalError as e:
-            if db.now() - r["created_at"] <= 24 * 3600:
-                # 库被别的写者锁住等：不是这一行的问题，稍后重试（不能当毒丸改发文字，会把卡片永久换掉）
-                alert("outbox %d（%s）写库失败，稍后重试：%r" % (r["id"], r["ticket_id"], e))
-                try:
-                    con.execute("UPDATE outbox SET next_at=?, last_error=? WHERE id=?", (db.now() + 30, repr(e), r["id"]))
-                except sqlite3.Error:
-                    pass
+            # 认领之后按库里的最新状态再核一次：另一条通道可能刚把它发掉、改成退避，或已把媒体准备好
+            r = con.execute("SELECT * FROM outbox WHERE id=? AND status='pending' AND next_at<=?",
+                            (rid, db.now())).fetchone()
+            if r is None or not _in_lane(r, lane, con):
+                continue
+            done += 1
+            if _flush_row(con, r, sender, card_sender, card_patcher, lane):
                 break
-            _poison(con, r, sender, e)
-            continue
-        except Exception as e:  # 毒丸行：发送器本身抛异常。标 dead 之前先试一次文字兜底，结果不能丢
-            _poison(con, r, sender, e)
-            continue
-        if not ok and info.startswith(BUDGET_STOP):  # 上传时间用完：进度已写回，下个 tick 接着传，不算失败
-            con.execute("UPDATE outbox SET next_at=0, last_error=? WHERE id=?", (info, r["id"]))
-            continue
-        attempts = r["attempts"] + 1
-        if r["report_id"] is not None and (ok or permanent or db.now() - r["created_at"] > 24 * 3600):
-            # 结果已送达（或确定送不到）：让状态卡下一轮就收起成终态（card_at 归零即视为需要刷新）
-            con.execute("UPDATE tickets SET card_at=0 WHERE id=?", (r["ticket_id"],))
-        if ok:
-            ping = _ping(con, r, info)
-            with db.tx(con):
-                con.execute("UPDATE outbox SET status='sent', attempts=?, sent_message_id=?, last_error=NULL"
-                            " WHERE id=?", (attempts, info, r["id"]))
-                if info:
-                    con.execute("INSERT OR IGNORE INTO bindings VALUES(?,?)", (info, r["ticket_id"]))
-                if ping:
-                    core.enqueue_message(con, r["ticket_id"], ping)
-        elif permanent:
-            con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
-                        (attempts, info, r["id"]))
-            alert("outbox %d dead（%s）：%s" % (r["id"], r["ticket_id"], info))
-        elif db.now() - r["created_at"] > 24 * 3600:
-            media = r["media_json"] if "media_json" in r.keys() else None
-            if r["card_json"] or media:
-                # 卡片/视频重试了 24 小时都没发出：放弃前先试一次文字兜底，结果至少以文字送到
-                tok, tinfo, _ = sender(r["reply_to"], r["text"], _idem(r) + "-t")
-                if tok:
-                    alert("outbox %d（%s）24 小时没发出，已改发文字：%s" % (r["id"], r["ticket_id"], info))
-                    with db.tx(con):
-                        con.execute("UPDATE outbox SET status='sent', attempts=?, sent_message_id=?, last_error=?"
-                                    " WHERE id=?", (attempts, tinfo, info, r["id"]))
-                        if tinfo:
-                            con.execute("INSERT OR IGNORE INTO bindings VALUES(?,?)", (tinfo, r["ticket_id"]))
-                    continue
-            con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
-                        (attempts, info, r["id"]))
-            alert("outbox %d dead（%s）：重试 %d 次仍失败：%s" % (r["id"], r["ticket_id"], attempts, info))
-        else:
-            delay = min(5 * 2 ** (attempts - 1), 300)
-            con.execute("UPDATE outbox SET attempts=?, next_at=?, last_error=? WHERE id=?",
-                        (attempts, db.now() + delay, info, r["id"]))
-            if attempts == 3:
-                alert("outbox %d（%s）连续失败 3 次：%s" % (r["id"], r["ticket_id"], info))
-        if not ok and _is_network_failure(info):
-            break  # 网络/超时：本 tick 不再尝试其余行，避免拖住守护进程
+        finally:
+            _release(rid)
+
+
+def _flush_row(con, r, sender, card_sender, card_patcher, lane) -> bool:
+    """发一行并按结果记账。返回 True = 本轮不要再发其余行（网络/超时、库被占用或写不进去）。"""
+    try:
+        ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher=card_patcher, lane=lane)
+        if not ok and _reply_gone(info) and not r["reply_to"].startswith("oc_"):
+            moved = _redirect_to_chat(con, r, info)
+            if moved is not None:
+                r = moved
+                ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher=card_patcher, lane=lane)
+    except sqlite3.OperationalError as e:
+        if db.is_busy(e) and db.now() - r["created_at"] <= 24 * 3600:
+            # 库被别的写者占着（SQLITE_BUSY/LOCKED）：不是这一行的问题，稍后重试（不能当毒丸改发文字，会把卡片永久换掉）
+            alert("outbox %d（%s）库被占用，稍后重试：%r" % (r["id"], r["ticket_id"], e))
+            try:
+                con.execute("UPDATE outbox SET next_at=?, last_error=? WHERE id=?", (db.now() + 30, repr(e), r["id"]))
+            except sqlite3.Error:
+                pass
+            return True
+        if not db.is_busy(e):
+            return _db_fault(con, r, sender, e)
+        return _poison(con, r, sender, e)
+    except Exception as e:  # 毒丸行：发送器本身抛异常。标 dead 之前先试一次文字兜底，结果不能丢
+        return _poison(con, r, sender, e)
+    try:
+        stop = _settle(con, r, ok, info, permanent, sender)
+    except sqlite3.OperationalError as e:
+        # 已经发出去（或已试过）但结果记不进库：不能按毒丸再发文字。内存里退避，到点用同一幂等键重试（飞书 1 小时内去重）
+        delay = _mem_backoff(r["id"])
+        alert("outbox %d（%s）发送后写库失败（%s），%d 秒内不重试：%r"
+              % (r["id"], r["ticket_id"], "库被占用" if db.is_busy(e) else "数据库故障，需要人工检查", delay, e))
+        return True
+    _db_faults.pop(r["id"], None)
+    return stop
+
+
+def _settle(con, r, ok: bool, info: str, permanent: bool, sender) -> bool:
+    """按发送结果记账。返回 True = 本轮不要再发其余行。"""
+    if not ok and info.startswith((BUDGET_STOP, PREPARED)):
+        # 上传时间用完（进度已写回，下一轮接着传）或媒体已准备好（交给快通道发）：不算失败、不退避
+        con.execute("UPDATE outbox SET next_at=0, last_error=? WHERE id=?",
+                    (None if info.startswith(PREPARED) else info, r["id"]))
+        return False
+    attempts = r["attempts"] + 1
+    if r["report_id"] is not None and (ok or permanent or db.now() - r["created_at"] > 24 * 3600):
+        # 结果已送达（或确定送不到）：让状态卡下一轮就收起成终态
+        _card_dirty(con, r["ticket_id"])
+    if ok:
+        ping = _ping(con, r, info)
+        with db.tx(con):
+            con.execute("UPDATE outbox SET status='sent', attempts=?, sent_message_id=?, last_error=NULL"
+                        " WHERE id=?", (attempts, info, r["id"]))
+            if info:
+                con.execute("INSERT OR IGNORE INTO bindings VALUES(?,?)", (info, r["ticket_id"]))
+            if ping:
+                core.enqueue_message(con, r["ticket_id"], ping)
+    elif permanent:
+        con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
+                    (attempts, info, r["id"]))
+        alert("outbox %d dead（%s）：%s" % (r["id"], r["ticket_id"], info))
+    elif db.now() - r["created_at"] > 24 * 3600:
+        media = r["media_json"] if "media_json" in r.keys() else None
+        if r["card_json"] or media:
+            # 卡片/视频重试了 24 小时都没发出：放弃前先试一次文字兜底，结果至少以文字送到
+            tok, tinfo, _ = sender(r["reply_to"], r["text"], _idem(r) + "-t")
+            if tok:
+                alert("outbox %d（%s）24 小时没发出，已改发文字：%s" % (r["id"], r["ticket_id"], info))
+                with db.tx(con):
+                    con.execute("UPDATE outbox SET status='sent', attempts=?, sent_message_id=?, last_error=?"
+                                " WHERE id=?", (attempts, tinfo, info, r["id"]))
+                    if tinfo:
+                        con.execute("INSERT OR IGNORE INTO bindings VALUES(?,?)", (tinfo, r["ticket_id"]))
+                return False
+        con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
+                    (attempts, info, r["id"]))
+        alert("outbox %d dead（%s）：重试 %d 次仍失败：%s" % (r["id"], r["ticket_id"], attempts, info))
+    else:
+        delay = min(5 * 2 ** (attempts - 1), 300)
+        con.execute("UPDATE outbox SET attempts=?, next_at=?, last_error=? WHERE id=?",
+                    (attempts, db.now() + delay, info, r["id"]))
+        if attempts == 3:
+            alert("outbox %d（%s）连续失败 3 次：%s" % (r["id"], r["ticket_id"], info))
+    # 网络/超时：这条通道本轮不再尝试其余行（快、慢两条通道各自独立，互不拖住）
+    return not ok and _is_network_failure(info)

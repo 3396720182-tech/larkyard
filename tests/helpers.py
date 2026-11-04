@@ -32,7 +32,10 @@ class TicketdTestCase(unittest.TestCase):
             "TICKETD_MAX_WORKERS": "3",
             "TICKETD_TURN_TIMEOUT": "7200",
         })
-        from ticketd import db
+        from ticketd import db, outbox
+        outbox._db_faults.clear()  # 进程内状态：各用例的库里行 id 都从 1 开始，不能串到下一个用例
+        outbox._claimed.clear()
+        outbox._docs_tried.clear()
         self.con = db.connect()
 
     def tearDown(self):

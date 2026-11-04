@@ -116,3 +116,21 @@ def tx(con: sqlite3.Connection):
 
 def now() -> float:
     return time.time()
+
+
+SQLITE_BUSY, SQLITE_LOCKED = 5, 6
+# sqlite3_errmsg 对 BUSY/LOCKED 及其扩展码给出的文字（Python 3.11 之前异常上没有错误码，只能认文字）
+_BUSY_TEXT = ("database is locked", "database table is locked", "database schema is locked", "database is busy",
+              "cannot commit transaction - sql statements in progress")
+
+
+def is_busy(e: BaseException) -> bool:
+    """是不是「库被别的写者占着」这类等一等就会好的错误（SQLITE_BUSY / SQLITE_LOCKED）。
+    磁盘 I/O 错误、只读库、缺表缺列、库文件损坏等都不算：那是故障，不能当锁等待无限重试。"""
+    if not isinstance(e, sqlite3.OperationalError):
+        return False
+    code = getattr(e, "sqlite_errorcode", None)  # Python 3.11+：扩展错误码，低 8 位是主错误码
+    if isinstance(code, int):
+        return code & 0xFF in (SQLITE_BUSY, SQLITE_LOCKED)
+    msg = str(e).lower()
+    return any(t in msg for t in _BUSY_TEXT)
