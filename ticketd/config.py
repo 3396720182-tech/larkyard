@@ -123,6 +123,23 @@ def max_workers() -> int:
     return int(_env("TICKETD_MAX_WORKERS", "3"))
 
 
+def _positive_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(_env(name, str(default))))
+    except ValueError:
+        return default
+
+
+def media_workers() -> int:
+    """媒体通道里最多同时准备几行（图片/视频上传、稿子导入、视频消息）。不同工单之间并行，同一工单仍按顺序。"""
+    return _positive_int("TICKETD_MEDIA_WORKERS", 2)
+
+
+def media_video_workers() -> int:
+    """其中最多几个在上传视频（云空间上传或视频消息）：大文件占带宽、内存，也容易撞飞书限流。不超过 media_workers。"""
+    return min(_positive_int("TICKETD_MEDIA_VIDEO_WORKERS", 1), media_workers())
+
+
 def turn_timeout() -> float:
     return float(_env("TICKETD_TURN_TIMEOUT", "7200"))
 

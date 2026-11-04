@@ -702,9 +702,10 @@ def _poison(con, r, sender, e: Exception) -> bool:
 
 # ---------- 投递通道 ----------
 # 守护进程里发件箱分两条通道。主循环的「快通道」负责所有发送（文字、卡片、结果覆盖状态卡，每次最多 30 秒）；
-# 慢的准备工作交给独立线程的「媒体通道」（daemon.MediaLane）：结果卡里图片/视频的上传、稿子导入云文档，
-# 以及视频消息（lark-cli 上传和发送是同一条命令）。一个 100MB 视频传 7 分钟时，派单、状态卡、心跳和其他工单的
-# 投递都照常走。同一工单仍严格按 id 顺序：每单只取最早一条待发消息，它没准备好，同单后面的消息就等着。
+# 慢的准备工作交给「媒体通道」（daemon.MediaLane，一个有并发上限的任务池）：结果卡里图片/视频的上传、稿子导入
+# 云文档，以及视频消息（lark-cli 上传和发送是同一条命令）。一个 100MB 视频传 7 分钟时，派单、状态卡、心跳、
+# 其他工单的文字投递，以及其他工单的图片和稿子准备都照常走。同一工单仍严格按 id 顺序：每单只取最早一条
+# 待发消息，它没准备好，同单后面的消息就等着。
 LANE_ALL, LANE_FAST, LANE_MEDIA = "all", "fast", "media"
 PREPARED = "媒体已准备好："  # 媒体通道做完了慢的部分：不算失败、不退避，交给快通道发送
 _claimed = set()  # 正在被某条通道处理的行（同一进程里两个线程之间互斥；只有守护进程投递，不需要跨进程）
@@ -784,18 +785,68 @@ def _db_fault(con, r, sender, e: Exception) -> bool:
     return not writable
 
 
-def flush(con, sender=None, limit: int = 5, card_sender=None, card_patcher=None, lane: str = LANE_ALL) -> None:
-    """发一轮。lane：all（一个线程里全做，CLI/测试用）、fast（守护进程主循环）、media（媒体通道线程）。"""
-    if lane not in (LANE_ALL, LANE_FAST, LANE_MEDIA):
-        raise ValueError("未知的投递通道：%r" % lane)
-    sender = sender or send_reply
-    card_sender = card_sender or send_card
+def _heads(con) -> list:
+    """现在可以处理的行：每单只取最早一条待发消息（同一工单严格按 id 顺序），到了重试时间，状态卡不在等待中。"""
     now = db.now()
-    rows = con.execute(
+    return con.execute(
         "SELECT * FROM outbox WHERE id IN (SELECT MIN(id) FROM outbox WHERE status='pending' GROUP BY ticket_id)"
         " AND next_at<=? AND ticket_id NOT IN (SELECT id FROM tickets WHERE card_wanted=1"
         " AND card_message_id IS NULL AND created_at>?) ORDER BY id",
         (now, now - CARD_HOLD)).fetchall()
+
+
+def _claimed_now(row_id: int) -> bool:
+    with _claimed_lock:
+        return row_id in _claimed
+
+
+def is_video_job(r) -> bool:
+    """准备这一行要不要上传视频：视频消息，或卡片里还有没拿到云空间链接的视频占位（只看占位，不读文件）。
+    媒体任务池据此单独限制视频的并发（大文件占带宽和内存，也容易撞限流）。"""
+    if "media_json" in r.keys() and r["media_json"]:
+        return True
+    try:
+        card = json.loads(r["card_json"]) if r["card_json"] else None
+    except ValueError:
+        return False
+    body = card.get("body") if isinstance(card, dict) else None
+    els = body.get("elements") if isinstance(body, dict) else None
+    if not isinstance(els, list):
+        return False
+    # 只看顶层：_resolve_videos 也只处理顶层的视频占位
+    return any(isinstance(el, dict) and templates.VIDEO_KEY in el and not el.get(templates.VIDEO_URL_KEY)
+               for el in els)
+
+
+def media_jobs(con) -> list:
+    """媒体任务池的调度：现在要准备媒体、又没人在处理的行，返回 [(行, 是否要传视频)]，按 id 排序。
+    每单只会出现最早那一行：它没准备好、没发出去，同单后面的消息不会被取到。"""
+    out = []
+    for r in _heads(con):
+        if _backing_off(r["id"]) or _claimed_now(r["id"]) or not needs_media(r, con):
+            continue
+        out.append((r, is_video_job(r)))
+    return out
+
+
+def prepare(con, row_id: int, sender=None, card_sender=None) -> bool:
+    """媒体任务池里的一个任务：在调用方的线程里、用调用方自己的连接准备这一行（调用方已经认领了 row_id）。
+    返回 True = 遇到网络/超时或库被占用，调度方先停一轮再派新任务。"""
+    r = con.execute("SELECT * FROM outbox WHERE id=? AND status='pending' AND next_at<=?",
+                    (row_id, db.now())).fetchone()
+    if r is None or not needs_media(r, con):
+        return False  # 认领之前另一条通道已经发掉、改成退避或准备好了
+    return _flush_row(con, r, sender or send_reply, card_sender or send_card, None, LANE_MEDIA)
+
+
+def flush(con, sender=None, limit: int = 5, card_sender=None, card_patcher=None, lane: str = LANE_ALL) -> None:
+    """发一轮。lane：all（一个线程里全做，CLI/测试用）、fast（守护进程主循环）、media（单线程准备媒体，测试用；
+    守护进程里媒体通道是 daemon.MediaLane 的任务池，按 media_jobs / prepare 逐行派发）。"""
+    if lane not in (LANE_ALL, LANE_FAST, LANE_MEDIA):
+        raise ValueError("未知的投递通道：%r" % lane)
+    sender = sender or send_reply
+    card_sender = card_sender or send_card
+    rows = _heads(con)
     done = 0
     for r in rows:
         if done >= limit:

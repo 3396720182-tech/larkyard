@@ -192,6 +192,8 @@ sudo loginctl enable-linger "$USER"
 | `TICKETD_CODEX_HOME` | 空 | ticketd 专用的 `CODEX_HOME`（放防误发的 execpolicy 规则）；空则沿用 `~/.codex` 且不写规则 |
 | `TICKETD_CODEX_GIT_WRITABLE` | `1` | Codex worker 能否在授权仓库里 `git commit`；`0` = 保留 Codex 自带的 `.git` 只读保护 |
 | `TICKETD_VIDEO_FOLDER` | 空 | 结果里的视频传到你云空间的哪个文件夹（文件夹 token）；空为云空间根目录 |
+| `TICKETD_MEDIA_WORKERS` | `2` | 媒体通道最多同时准备几张结果卡（图片/视频上传、稿子导入、视频消息）；不同工单并行，同一工单仍按顺序 |
+| `TICKETD_MEDIA_VIDEO_WORKERS` | `1` | 其中最多几个在传视频（限制带宽、内存和飞书限流），不超过上一项 |
 
 安装时的变量：`TICKETD_HOME`（默认 `~/.ticketd`）、`TICKETD_LABEL`（默认 `dev.larkyard.ticketd`，Linux 上是 systemd 服务名）、`LARK_CHANNEL_HOME`、`LARK_CHANNEL_PROFILE`、`TICKETD_PYTHON`（Python 解释器，默认 `/usr/bin/python3`；`bin/ticket`、`bin/ticketd` 也认它；Linux 上总是写进服务环境，macOS 上显式指定时写进 plist）。
 
@@ -219,7 +221,7 @@ sudo loginctl enable-linger "$USER"
 - 主会话（bridge 里做判断和派单的那个会话）目前只在 Claude Code 上写过、验证过：工作区约定是 `CLAUDE.md`。bridge 的 Codex 主会话（profile `agentKind: "codex"`）还没验证；能路由给 Codex 的是 worker。
 - worker 的沙箱和权限依赖 Claude Code 的 `--permission-mode dontAsk` 与 sandbox 设置，Claude Code 升级后建议按 `docs/spec.md` §6 的实测结论复核一遍。
 - 飞书卡片没有视频组件，视频不能在卡片里直接播放：卡里放封面和按钮，点开走云空间播放器。100MB 以内的视频传云空间（超过 20MB 时 lark-cli 自动分片上传）；传不上去时，≤30MB 的改为卡片后另发一条视频消息，再大就只给本机路径。
-- 媒体上传和稿子导入在守护进程里的独立线程（媒体通道）中做，不再卡住派单、状态卡和其他工单的投递；同一工单里排在大视频后面的消息仍要等它传完。停止服务时不等正在进行的上传；守护进程在上传视频途中被停止或强杀，重启后会再传一次，云空间里会多一份同名视频。媒体线程卡住（而不是退出）目前检测不到，只靠每次上传自身的超时兜底。
+- 媒体上传和稿子导入在守护进程里的媒体通道中做（默认最多 2 个任务并行，其中传视频的最多 1 个），不卡住派单、状态卡，一个大视频在传时其他工单的图片和稿子也照常准备；同一工单里排在大视频后面的消息仍要等它传完（顺序约束）。同时有两个以上大视频时，后面的视频要排队（可调 `TICKETD_MEDIA_VIDEO_WORKERS`）。停止服务时最多等 5 秒，不等正在进行的上传；守护进程在上传视频途中被停止或强杀，重启后会再传一次，云空间里会多一份同名视频。媒体任务卡住超过 15 分钟会告警并让出名额，但线程杀不掉，那一单要等它结束或重启服务。
 - Codex 执行器依赖 `codex exec --json` 的事件格式和配置键（在 0.134.0 上实测，真实输出存在 `tests/fixtures/`）；Codex 升级后先跑 `tests/test_codex.py`，并按 spec §6 复核沙箱。
 
 ## 许可

@@ -32,6 +32,8 @@ elif args[:2] == ["drive", "+upload"]:  # 云空间上传：只回 file_token（
         with log.open("a", encoding="utf-8") as f:
             f.write(json.dumps(["drive-upload-finished"]) + "\n")
     print(json.dumps({"ok": True, "identity": "user", "data": {"file_token": "boxcn_fake_%d" % count}}, indent=2))
+elif args[:3] == ["im", "images", "create"]:  # 图片上传：回 image_key
+    print(json.dumps({"ok": True, "identity": "bot", "data": {"image_key": "img_fake_%d" % count}}, indent=2))
 elif args[:3] == ["drive", "metas", "batch_query"]:
     tok = json.loads(args[args.index("--data") + 1])["request_docs"][0]["doc_token"]
     print(json.dumps({"ok": True, "identity": "user", "data": {"metas": [
