@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import List, Tuple
@@ -76,16 +77,38 @@ def _import(path: Path, name: str) -> str:
     return url
 
 
-def doc_links(con, ticket_id: str, workdir: str, artifacts: List[str]) -> List[Tuple[str, str]]:
-    """返回 [(文件名, 云文档链接)]。单个文件导入失败只记告警，不影响其余文件和结果送达。"""
+def _cached(con, p: Path):
+    st = p.stat()
+    row = con.execute("SELECT url FROM published WHERE path=? AND mtime=? AND size=?",
+                      (str(p), st.st_mtime, st.st_size)).fetchone()
+    return st, (row["url"] if row else None)
+
+
+def has_pending(con, ticket_id: str, workdir: str, artifacts: List[str]) -> bool:
+    """还有没导入过的稿子吗（发件箱据此把这一行交给媒体通道，导入不在守护进程主循环里做）。"""
+    for p in candidates(con, ticket_id, workdir, artifacts):
+        try:
+            if _cached(con, p)[1] is None:
+                return True
+        except OSError:
+            continue
+        except sqlite3.OperationalError:
+            return True  # 缓存表还没建或读不了：交给媒体通道去导入，库的错误在那里按锁等待/故障分类
+    return False
+
+
+def doc_links(con, ticket_id: str, workdir: str, artifacts: List[str],
+              allow_import: bool = True) -> List[Tuple[str, str]]:
+    """返回 [(文件名, 云文档链接)]。单个文件导入失败只记告警，不影响其余文件和结果送达。
+    allow_import=False 时只返回缓存里已有的链接，不调 lark-cli。"""
     con.executescript(SCHEMA)
     links: List[Tuple[str, str]] = []
     for p in candidates(con, ticket_id, workdir, artifacts):
-        st = p.stat()
-        row = con.execute("SELECT url FROM published WHERE path=? AND mtime=? AND size=?",
-                          (str(p), st.st_mtime, st.st_size)).fetchone()
-        if row:
-            links.append((p.name, row["url"]))
+        st, url = _cached(con, p)
+        if url:
+            links.append((p.name, url))
+            continue
+        if not allow_import:
             continue
         try:
             url = _import(p, "%s %s" % (ticket_id, p.stem))

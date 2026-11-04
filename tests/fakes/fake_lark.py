@@ -26,6 +26,11 @@ if args[:2] == ["drive", "+import"]:
     print(json.dumps({"ok": True, "identity": "user",
                       "data": {"type": "docx", "url": "https://example.feishu.cn/docx/fake%d" % count}}, indent=2))
 elif args[:2] == ["drive", "+upload"]:  # 云空间上传：只回 file_token（链接要再查 metas）
+    if os.environ.get("FAKE_LARK_DRIVE_SLEEP"):  # 模拟大视频慢上传
+        import time
+        time.sleep(float(os.environ["FAKE_LARK_DRIVE_SLEEP"]))
+        with log.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(["drive-upload-finished"]) + "\n")
     print(json.dumps({"ok": True, "identity": "user", "data": {"file_token": "boxcn_fake_%d" % count}}, indent=2))
 elif args[:3] == ["drive", "metas", "batch_query"]:
     tok = json.loads(args[args.index("--data") + 1])["request_docs"][0]["doc_token"]
