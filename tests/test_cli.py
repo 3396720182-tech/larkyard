@@ -60,9 +60,16 @@ class CliTest(TicketdTestCase):
         p = self.run_cli("show", "T0001")
         self.assertIn("claude --resume", p.stdout)
         p = self.run_cli("stop", "T0001")
-        self.assertEqual(p.stdout.strip(), "⏹️ 已停止 T0001")
+        self.assertEqual(p.stdout.splitlines()[0], "⏹️ 已停止 T0001")
+        self.assertIn("恢复 T0001", p.stdout)
         p = self.run_cli("send", "T0001", "--message", "om_11", "--text", "继续")
         self.assertEqual(p.returncode, 2)
+        self.assertIn("ticket release T0001", p.stderr)
+        # issue #18：已停止的单可以恢复，之后追问照常
+        p = self.run_cli("release", "T0001")
+        self.assertEqual(p.stdout.strip(), "▶️ 已恢复 T0001，用同一个会话接着做")
+        p = self.run_cli("send", "T0001", "--message", "om_12", "--text", "继续")
+        self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_missing_request_file_exits_2(self):
         p = self.run_cli("new", "--chat", "oc_1", "--message", "om_9", "--title", "t", "--slug", "s",
@@ -215,3 +222,42 @@ class ReportMediaCheckTest(TicketdTestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         p = self.run_report(str(wd), "--status", "progress", "--summary", "出图", "--artifact", str(outside))
         self.assertEqual(p.returncode, 0, p.stderr)
+
+
+class StopSummaryTest(TicketdTestCase):
+    def test_stop_running_ticket_says_where_it_stopped(self):  # issue #17
+        from ticketd import cli, core
+        tid = self.new_ticket()
+        t0 = time.time() - 120
+        wd = core.get(self.con, tid)["workdir"]
+        os.makedirs(os.path.join(wd, "出图"), exist_ok=True)
+        old = os.path.join(wd, "旧.txt")
+        open(old, "w").close()
+        os.utime(old, (t0 - 100, t0 - 100))
+        open(os.path.join(wd, "出图", "预览-1.jpg"), "w").close()
+        open(os.path.join(wd, ".stream.jsonl"), "w").close()
+        self.con.execute("UPDATE tickets SET state='running', started_at=?, last_step='跑全部单测', last_action_at=?"
+                         " WHERE id=?", (t0, time.time() - 30, tid))
+        core.add_report(self.con, tid, "progress", "写核心代码")
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cli.main(["stop", tid]), 0)
+        text = buf.getvalue()
+        self.assertTrue(text.startswith("⏹️ 已停止 %s" % tid))
+        self.assertIn("停在：阶段「写核心代码」 · 最近：跑全部单测（刚刚）", text)
+        self.assertIn("这一轮写了：出图/预览-1.jpg", text)
+        self.assertNotIn("旧.txt", text)
+        self.assertNotIn(".stream", text)
+        self.assertIn("claude --resume", text)
+
+    def test_hold_idle_ticket_is_short(self):
+        from ticketd import cli
+        import io, contextlib
+        tid = self.new_ticket()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.main(["hold", tid])
+        lines = buf.getvalue().splitlines()
+        self.assertEqual(lines[0], "⏸️ 已暂停 %s" % tid)
+        self.assertIn("继续 %s" % tid, lines[1])

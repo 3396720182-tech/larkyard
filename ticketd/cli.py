@@ -122,18 +122,79 @@ def cmd_report(con, a) -> str:
     return "已记录 %s 的汇报：%s" % (a.ticket, a.status)
 
 
+MAX_LISTED = 6
+
+
+def _new_files(workdir: str, since: float) -> list:
+    """本轮（since 之后）工单目录里新写的文件，相对路径，按修改时间倒序。跳过隐藏文件、ticketd 内部文件，不跟随链接。"""
+    found = []
+    try:
+        for root, dirs, files in os.walk(workdir, followlinks=False):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if root.count(os.sep) - workdir.rstrip(os.sep).count(os.sep) > 3:
+                dirs[:] = []
+            for f in files:
+                if f.startswith(".") or f == "过程.log":
+                    continue
+                p = os.path.join(root, f)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if st.st_mtime >= since:
+                    found.append((st.st_mtime, os.path.relpath(p, workdir)))
+            if len(found) > 500:
+                break
+    except OSError:
+        return []
+    return [rel for _, rel in sorted(found, reverse=True)]
+
+
+def _stop_summary(con, t, verb: str) -> str:
+    """停止 / 暂停时的交代（issue #17）：停在哪一步、这一轮写了哪些文件、怎么接着做。
+    主会话把这段原样回复给用户；信息都是 ticketd 自己有的，不问 worker。"""
+    now = time.time()
+    lines = ["%s %s" % (verb, t["id"])]
+    if t["state"] == "running":
+        since = t["started_at"] or 0
+        prog = core.last_progress(con, t["id"], since)
+        where = []
+        if prog:
+            where.append("阶段「%s」" % templates.short(prog["summary"], 30))
+        if t["last_step"]:
+            ago = templates.ago(now - t["last_action_at"]) if t["last_action_at"] else ""
+            where.append("最近：%s%s" % (templates.short(t["last_step"], 40), "（%s）" % ago if ago else ""))
+        if where:
+            lines.append("停在：" + " · ".join(where))
+        files = _new_files(t["workdir"], since)
+        if files:
+            shown = "、".join(templates.short(f, 40) for f in files[:MAX_LISTED])
+            more = " 等 %d 个" % len(files) if len(files) > MAX_LISTED else ""
+            lines.append("这一轮写了：%s%s（目录 %s）" % (shown, more, templates.nice_path(t["workdir"])))
+    if verb.startswith("⏹️"):
+        lines.append("想接着做：说「恢复 %s」，会用同一个会话继续" % t["id"])
+    else:
+        lines.append("你放开前不会继续；放开时说「继续 %s」" % t["id"])
+    lines.append("终端接管：%s" % executors.get(worker.executor_of(t)).takeover_hint(t))
+    return "\n".join(lines)
+
+
 def cmd_stop(con, a) -> str:
+    t = core.get(con, a.ticket)
     core.stop(con, a.ticket)
-    return "⏹️ 已停止 %s" % a.ticket
+    return _stop_summary(con, t, "⏹️ 已停止")
 
 
 def cmd_hold(con, a) -> str:
+    t = core.get(con, a.ticket)
     core.hold(con, a.ticket)
-    return "⏸️ 已暂停 %s，你放开前不会继续" % a.ticket
+    return _stop_summary(con, t, "⏸️ 已暂停")
 
 
 def cmd_release(con, a) -> str:
-    core.release(con, a.ticket)
+    was = core.release(con, a.ticket)
+    if was == "stopped":
+        return "▶️ 已恢复 %s，用同一个会话接着做" % a.ticket
     return "▶️ 已放开 %s" % a.ticket
 
 

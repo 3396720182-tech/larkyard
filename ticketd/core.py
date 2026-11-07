@@ -118,7 +118,7 @@ def send_followup(con: sqlite3.Connection, ticket_id: str, message_id: str, text
     with db.tx(con):
         t = get(con, ticket_id)
         if t["state"] == "stopped":
-            raise TicketError("%s 已停止，需要开新单" % ticket_id)
+            raise TicketError("%s 已停止；要接着做先恢复（ticket release %s），或者开新单" % (ticket_id, ticket_id))
         bound = lookup(con, message_id)
         if bound is not None and bound != ticket_id:
             raise TicketError("消息 %s 已绑定到 %s" % (message_id, bound))
@@ -328,12 +328,19 @@ def hold(con: sqlite3.Connection, ticket_id: str) -> None:
         touch(con, ticket_id, state="held")
 
 
-def release(con: sqlite3.Connection, ticket_id: str) -> None:
+RESUME_TEXT = ("用户恢复了这张已停止的工单。上一轮是被用户停掉的，进程已经结束，后台进程也被清理了。"
+               "先检查工单目录、结果.md 和已有产物，确认停下时做到哪一步、有没有做了一半的外部动作，再接着做。")
+
+
+def release(con: sqlite3.Connection, ticket_id: str) -> str:
+    """放开暂停；已停止的单也可以用它恢复（同一个会话接着做，issue #18）。返回原来的状态。"""
     with db.tx(con):
-        if get(con, ticket_id)["state"] != "held":
-            raise TicketError("%s 不在暂停中" % ticket_id)
-        touch(con, ticket_id, state="idle")
-        add_input(con, ticket_id, "release", "用户已放开暂停，可以继续。")
+        st = get(con, ticket_id)["state"]
+        if st not in ("held", "stopped"):
+            raise TicketError("%s 不在暂停中，也没有停止" % ticket_id)
+        touch(con, ticket_id, state="idle", retries=0, retry_at=0)
+        add_input(con, ticket_id, "release", "用户已放开暂停，可以继续。" if st == "held" else RESUME_TEXT)
+    return st
 
 
 def grant(con: sqlite3.Connection, ticket_id: str, path: str) -> str:

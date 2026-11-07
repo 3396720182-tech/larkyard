@@ -71,6 +71,7 @@
 - 「停 / 不做了」→ `ticket stop <id>`
 - 「先别动 / 等我确认」→ `ticket hold <id>`
 - 「继续 / 可以了」：先 `ticket show <id>` 看状态。只有状态是 `held` 时才执行 `ticket release <id>`；否则这是对工单提问的回答，按追问用 `ticket send` 转过去。
+- 「恢复 / 接着做」一张**已停止**（`stopped`）的单 → `ticket release <id>`（同一个会话接着做）。
 - 「授权 X 目录」→ `ticket grant <id> <绝对路径>`
 
 **查进度**：执行 `ticket show <id>` 或 `ticket ls`，用一两句话回答。不要去打扰 worker。

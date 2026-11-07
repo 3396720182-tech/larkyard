@@ -154,6 +154,16 @@ class CoreTest(TicketdTestCase):
         with self.assertRaises(self.core.TicketError):
             self.core.release(self.con, tid)
 
+    def test_release_resumes_stopped_ticket(self):  # issue #18
+        tid = self.new_ticket()
+        self.core.stop(self.con, tid)
+        self.assertEqual(self.core.release(self.con, tid), "stopped")
+        t = self.core.get(self.con, tid)
+        self.assertEqual(t["state"], "idle")
+        last = self.con.execute("SELECT kind, text FROM inputs WHERE ticket_id=? ORDER BY id DESC", (tid,)).fetchone()
+        self.assertEqual(last["kind"], "release")
+        self.assertIn("恢复了这张已停止的工单", last["text"])
+
     def test_touch_if_only_updates_expected_states(self):
         tid = self.new_ticket()
         self.assertTrue(self.core.touch_if(self.con, tid, ("queued",), state="running", pid=42))
