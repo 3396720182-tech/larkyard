@@ -369,8 +369,10 @@ def ping_message(ticket_id: str, status: str, summary: str, ask: Optional[str]) 
 def api_error_message(ticket_id: str, error: str, account: Optional[str], bg: Optional[str]) -> str:
     """本轮以模型接口报错结束、但后台任务还在跑（进程要等任务结束才退出）时推的提醒。"""
     lines = ["⚠️ %s 模型接口报错%s：%s" % (ticket_id, "（%s）" % account if account else "", short(error, 200))]
-    lines.append("后台任务还在跑%s。赶在它结束前处理好，worker 被唤醒后就能接着做；"
-                 "否则这一轮会以失败结束，之后引用回复「继续」即可。" % ("（%s）" % short(bg, 60) if bg else ""))
+    later = ("来不及也没关系，这一轮结束后会定时自动重试，也可以引用回复「继续」。" if account
+             else "否则这一轮会以失败结束，之后引用回复「继续」即可。")
+    lines.append("后台任务还在跑%s。赶在它结束前处理好，worker 被唤醒后就能接着做；%s"
+                 % ("（%s）" % short(bg, 60) if bg else "", later))
     return "\n".join(lines)
 
 
