@@ -4,6 +4,8 @@
 - 只发布工单目录和授权目录里的文件；ticketd 的内部文件不发布。
 - 用用户身份导入，文档落在用户自己的云空间，打开不用再申请权限。
 - 同一文件（路径 + 修改时间 + 大小）只导入一次，重试和追问轮次复用同一个链接。
+- 同一工单同一路径的稿子改过之后：Markdown / 文本稿覆盖原来那份云文档（链接不变，旧版本在文档历史里），
+  其他格式或覆盖失败时才另导入一份，名字带上时间以便区分（issue #13：原来每轮追问都多出一份同名文档）。
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Tuple
 
@@ -19,6 +22,7 @@ from . import config, db, outbox
 DOC_TYPES = {".md": "docx", ".markdown": "docx", ".txt": "docx", ".docx": "docx",
              ".xlsx": "sheet", ".csv": "sheet", ".pptx": "slides"}
 INTERNAL = {".reports", ".stream.jsonl", "过程.log", ".stderr.log"}
+OVERWRITABLE = {".md", ".markdown", ".txt"}  # docs +update 能用 Markdown 整篇覆盖的格式
 MAX_DOCS = 3
 MAX_BYTES = 20 * 1024 * 1024
 TIMEOUT = 90
@@ -27,6 +31,11 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS published(
   path TEXT NOT NULL, mtime REAL NOT NULL, size INTEGER NOT NULL, url TEXT NOT NULL,
   created_at REAL NOT NULL, PRIMARY KEY(path, mtime, size)
+);
+-- 每张单每个稿子路径当前对应的云文档：改过的稿子覆盖它，而不是再导入一份
+CREATE TABLE IF NOT EXISTS doc_targets(
+  ticket_id TEXT NOT NULL, path TEXT NOT NULL, url TEXT NOT NULL, created_at REAL NOT NULL,
+  PRIMARY KEY(ticket_id, path)
 );
 """
 
@@ -78,6 +87,19 @@ def _import(path: Path, name: str) -> str:
     return url
 
 
+def _overwrite(path: Path, url: str) -> None:
+    """用本地稿子整篇覆盖已有的云文档（用户身份）；失败抛 RuntimeError。"""
+    cmd = [config.lark_bin(), "docs", "+update", "--as", "user", "--doc", url, "--command", "overwrite",
+           "--doc-format", "markdown", "--content", "@" + path.name]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT, cwd=str(path.parent))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError("调用 lark-cli 失败：%s" % e)
+    data = outbox._parse_json(p.stdout) or outbox._parse_json(p.stderr) or {}
+    if p.returncode != 0 or not data.get("ok"):
+        raise RuntimeError("rc=%s %s" % (p.returncode, _error_text(data, p.stderr or p.stdout)))
+
+
 def _error_text(data: dict, raw: str) -> str:
     """lark-cli 报错里真正的原因。它的 JSON 末尾常跟着一大段 _notice（升级提示），只截尾部会把原因截掉（issue #12）。
     保留 type 字段原样（"type": "network"），发件箱靠它判断是不是网络故障。"""
@@ -122,11 +144,25 @@ def doc_links(con, ticket_id: str, workdir: str, artifacts: List[str],
             continue
         if not allow_import:
             continue
-        try:
-            url = _import(p, "%s %s" % (ticket_id, p.stem))
-        except RuntimeError as e:
-            outbox.alert("%s 稿子导入云文档失败（%s）：%s" % (ticket_id, p.name, e))
-            continue
+        prev = con.execute("SELECT url FROM doc_targets WHERE ticket_id=? AND path=?",
+                           (ticket_id, str(p))).fetchone()
+        url = None
+        if prev and p.suffix.lower() in OVERWRITABLE:
+            try:
+                _overwrite(p, prev["url"])
+                url = prev["url"]
+            except RuntimeError as e:
+                outbox.alert("%s 稿子覆盖原云文档失败，改为另导入一份（%s）：%s" % (ticket_id, p.name, e))
+        if url is None:
+            name = "%s %s" % (ticket_id, p.stem)
+            if prev:
+                name += "（%s）" % time.strftime("%m-%d %H:%M")
+            try:
+                url = _import(p, name)
+            except RuntimeError as e:
+                outbox.alert("%s 稿子导入云文档失败（%s）：%s" % (ticket_id, p.name, e))
+                continue
+            con.execute("INSERT OR REPLACE INTO doc_targets VALUES(?,?,?,?)", (ticket_id, str(p), url, db.now()))
         con.execute("INSERT OR REPLACE INTO published VALUES(?,?,?,?,?)",
                     (str(p), st.st_mtime, st.st_size, url, db.now()))
         links.append((p.name, url))

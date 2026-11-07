@@ -22,7 +22,12 @@ log = Path(os.environ["FAKE_LARK_LOG"])
 with log.open("a", encoding="utf-8") as f:
     f.write(json.dumps(args, ensure_ascii=False) + "\n")
 count = len(log.read_text(encoding="utf-8").splitlines())
-if args[:2] == ["drive", "+import"]:
+if args[:2] == ["docs", "+update"]:  # 覆盖已有云文档；FAKE_LARK_UPDATE_FAIL=1 时模拟文档已被删
+    if os.environ.get("FAKE_LARK_UPDATE_FAIL") == "1":
+        sys.stderr.write(json.dumps({"ok": False, "error": {"type": "api", "code": 1770002, "message": "not found"}}))
+        sys.exit(1)
+    print(json.dumps({"ok": True, "identity": "user", "data": {}}))
+elif args[:2] == ["drive", "+import"]:
     print(json.dumps({"ok": True, "identity": "user",
                       "data": {"type": "docx", "url": "https://example.feishu.cn/docx/fake%d" % count}}, indent=2))
 elif args[:2] == ["drive", "+upload"]:  # 云空间上传：只回 file_token（链接要再查 metas）

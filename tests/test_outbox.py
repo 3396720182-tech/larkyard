@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 from helpers import TicketdTestCase
 
@@ -238,6 +239,54 @@ class OutboxTest(TicketdTestCase):
         imports = [a for a in self.sent() if a[:2] == ["drive", "+import"]]
         self.assertEqual(len(imports), 1)
         self.assertEqual(len(self._buttons(self.sent()[-1])), 1)
+
+    def _edit_and_report(self, tid, wd, name, text):
+        p = os.path.join(wd, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.utime(p, (time.time() + 5, time.time() + 5))  # 保证修改时间变了
+        self.core.add_report(self.con, tid, "ready", "改好了", [p])
+        self.outbox.flush(self.con)
+
+    def test_changed_markdown_overwrites_same_doc(self):  # issue #13
+        tid = self.new_ticket()
+        wd = self._ready_with(tid, "稿子.md")
+        self.outbox.flush(self.con)
+        self._edit_and_report(tid, wd, "稿子.md", "# 稿子\n第二版")
+        calls = self.sent()
+        imports = [a for a in calls if a[:2] == ["drive", "+import"]]
+        updates = [a for a in calls if a[:2] == ["docs", "+update"]]
+        self.assertEqual(len(imports), 1)
+        self.assertEqual(len(updates), 1)
+        url = self.con.execute("SELECT url FROM doc_targets").fetchone()["url"]
+        self.assertEqual(updates[0][updates[0].index("--doc") + 1], url)
+        self.assertEqual(updates[0][updates[0].index("--content") + 1], "@稿子.md")
+        self.assertEqual(updates[0][updates[0].index("--as") + 1], "user")
+
+    def test_overwrite_failure_falls_back_to_dated_import(self):
+        tid = self.new_ticket()
+        wd = self._ready_with(tid, "稿子.md")
+        self.outbox.flush(self.con)
+        os.environ["FAKE_LARK_UPDATE_FAIL"] = "1"  # 用户删了原文档
+        self._edit_and_report(tid, wd, "稿子.md", "# 稿子\n第二版")
+        imports = [a for a in self.sent() if a[:2] == ["drive", "+import"]]
+        self.assertEqual(len(imports), 2)
+        self.assertRegex(imports[1][imports[1].index("--name") + 1], r"^T0001 稿子（\d\d-\d\d \d\d:\d\d）$")
+        rows = self.con.execute("SELECT url FROM doc_targets").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(any("覆盖原云文档失败" in p.read_text(encoding="utf-8")
+                            for p in (self.tmp / "home").rglob("alerts.log")))
+
+    def test_changed_xlsx_imports_again_with_date(self):
+        tid = self.new_ticket()
+        wd = self._ready_with(tid, "表.xlsx")
+        self.outbox.flush(self.con)
+        self._edit_and_report(tid, wd, "表.xlsx", "a,b")
+        calls = self.sent()
+        self.assertEqual([a for a in calls if a[:2] == ["docs", "+update"]], [])
+        imports = [a for a in calls if a[:2] == ["drive", "+import"]]
+        self.assertEqual(len(imports), 2)
+        self.assertIn("（", imports[1][imports[1].index("--name") + 1])
 
     def test_doc_import_failure_still_delivers_result(self):
         tid = self.new_ticket()
