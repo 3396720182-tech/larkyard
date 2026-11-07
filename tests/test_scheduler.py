@@ -100,6 +100,27 @@ class SchedulerTest(TicketdTestCase):
         self.assertEqual(len(self.argv_log(tid)), 1)  # 账户级故障不重试
         self.assertEqual(self.core.get(self.con, tid)["retries"], 0)
 
+    def test_client_error_failure_suggests_fresh_session(self):  # issue #14
+        tid = self.new_ticket(request="[[fake:poison]]")
+        self.wait(lambda: self.state(tid) == "failed", self.sched)
+        rep = self.core.last_report(self.con, tid)
+        self.assertIn("换新会话重来 %s" % tid, rep["ask"])
+        self.assertEqual(len(self.argv_log(tid)), 1)
+
+    def test_restart_runs_new_session_with_original_request(self):  # issue #14
+        tid = self.new_ticket(request="[[fake:noreport]] 原话在这")
+        self.wait(lambda: self.state(tid) == "failed", self.sched)
+        self.core.send_followup(self.con, tid, "om_2", "追问一句 [[fake:ready]]")
+        self.wait(lambda: self.state(tid) == "idle", self.sched)
+        self.core.restart(self.con, tid)
+        self.wait(lambda: len(self.argv_log(tid)) == 3, self.sched)
+        self.wait(lambda: self.state(tid) == "idle", self.sched)
+        third = self.argv_log(tid)[2]
+        self.assertIn("--session-id", third["argv"])
+        self.assertIn("原话在这", third["card"])
+        self.assertIn("换了新会话", third["card"])
+        self.assertIn("追问一句", third["card"])
+
     def test_transient_retry_then_ready(self):
         tid = self.new_ticket(request="[[fake:transient_once]]")
         self.wait(lambda: self.state(tid) == "idle" and self.core.last_report(self.con, tid) is not None,

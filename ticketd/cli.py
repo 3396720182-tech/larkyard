@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--artifact", action="append", default=[])
     r.add_argument("--ask")
 
-    for name in ("stop", "hold", "release", "show"):
+    for name in ("stop", "hold", "release", "restart", "show"):
         x = sub.add_parser(name)
         x.add_argument("ticket")
     g = sub.add_parser("grant")
@@ -198,6 +198,11 @@ def cmd_release(con, a) -> str:
     return "▶️ 已放开 %s" % a.ticket
 
 
+def cmd_restart(con, a) -> str:
+    core.restart(con, a.ticket)
+    return "🔄 %s 换了新会话重新接着做（原话和历次追问已带上，工单目录不变）" % a.ticket
+
+
 def cmd_grant(con, a) -> str:
     p = core.grant(con, a.ticket, a.path)
     return "已授权 %s 可写：%s" % (a.ticket, p)
@@ -275,7 +280,7 @@ def cmd_show(con, a) -> str:
 
 COMMANDS = {
     "new": cmd_new, "send": cmd_send, "lookup": cmd_lookup, "report": cmd_report,
-    "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "grant": cmd_grant,
+    "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "restart": cmd_restart, "grant": cmd_grant,
     "ls": cmd_ls, "show": cmd_show,
 }
 

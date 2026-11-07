@@ -280,6 +280,14 @@ def result_error_text(result_event: Optional[dict]) -> str:
     return str(result_event.get("result") or result_event.get("subtype") or "").strip()
 
 
+CLIENT_ERROR_RE = re.compile(r"\bapi error:?\s*(?:400|404|413|422)\b")
+
+
+def is_client_error(text: str) -> bool:
+    """模型接口返回的请求错误（4xx，不含限流和账户问题）：请求本身被拒，原样重试不会好。"""
+    return bool(text) and bool(CLIENT_ERROR_RE.search(text.lower()))
+
+
 def account_error(*texts: str) -> Optional[str]:
     """报错里认出账户级故障时返回「余额不足」/「认证失败」，否则 None。余额判断在前（网关常把余额不足报成认证失败）。"""
     low = "\n".join(t for t in texts if t).lower()

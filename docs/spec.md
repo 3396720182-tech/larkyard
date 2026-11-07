@@ -189,13 +189,15 @@ ticket report --status ready|blocked|failed|dropped|waiting \
 | `ticket stop <id>` | 结束 worker 进程，状态改为 `stopped`，回复「已停止」。stopped 是终态，之后的引用追问会被拒绝，需要开新单 |
 | `ticket hold <id>` | 结束当前进程（会话保留），状态改为 `held`；新输入只排队不投递。追问和补充线索都不会解除暂停 |
 | `ticket release <id>` | 状态回到 `idle`，加一条 `release` 输入：「用户已放开暂停」，然后投递排队中的输入 |
+| `ticket restart <id>`（**2026-11-07 新增**，issue #14） | 换新会话从头续做：新的 session_id、`session_started=0`，工单号、目录、授权不变；加一条 `fresh` 输入（说明换了会话、先读 `结果.md` / `过程.log`，并附上历次追问，最多最近 10 条），首轮任务卡照常带上原话。运行中或排队中拒绝 |
 | `ticket grant <id> <dir>` | 增加可写目录，加一条 `grant` 输入，重新生成权限配置 |
 
-只有用户在对话里明确说了，主会话才执行 stop、hold、release 和 grant。
+只有用户在对话里明确说了，主会话才执行 stop、hold、release、restart 和 grant。
 
-**调整（2026-11-07，issue #17 #18）**：
+**调整（2026-11-07，issue #17 #18 #14）**：
 - 停止 / 暂停有交代：`ticket stop` / `ticket hold` 的输出（主会话原样回复给用户）多几行——停在哪个阶段、最近一步和多久前（运行中才有）、这一轮在工单目录里写了哪些文件（跳过隐藏文件和 `过程.log`，最多列 6 个）、怎么接着做、终端接管命令。信息都是 ticketd 已有的，不问 worker。原来停掉之后什么都不说，用户不知道能捡回什么。
 - stopped 不再是绝对终态：`ticket release` 也能恢复已停止的单（回到 `idle`，加一条 `release` 输入，内容提醒 worker 上一轮是被停掉的、先核对做到哪一步），沿用同一个会话。引用追问仍然会被拒绝（提示先恢复），所以「停」的语义不变，只是多了一条显式的回头路。原来卡住时用户只能用 stop 救场，同一件事被迫开两张单、丢会话。
+- worker 因不可恢复的 4xx（`API Error: 400/404/413/422`，如网关不支持 PDF 类型的 tool_result）失败时，失败卡带 `--ask` 提示可以说「换新会话重来」。
 
 ### 5.6 查询
 

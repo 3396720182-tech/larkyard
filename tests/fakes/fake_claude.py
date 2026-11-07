@@ -103,6 +103,10 @@ elif mode in ("bg_wait", "bg_api_error"):
     emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {
         "command": "genshot sheet", "description": "出联系表"}}]}})
     report("--status", "ready", "--summary", "后台任务跑完了")
+elif mode == "poison":
+    msg = "API Error: 400 tool_result content[1] is a document, which the tool-result protocol cannot represent"
+    emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 10, "result": msg})
+    sys.exit(1)
 elif mode == "balance":
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text":
           "Failed to authenticate. API Error: 403 insufficient balance"}]}})

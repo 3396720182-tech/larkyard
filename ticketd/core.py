@@ -330,6 +330,8 @@ def hold(con: sqlite3.Connection, ticket_id: str) -> None:
 
 RESUME_TEXT = ("用户恢复了这张已停止的工单。上一轮是被用户停掉的，进程已经结束，后台进程也被清理了。"
                "先检查工单目录、结果.md 和已有产物，确认停下时做到哪一步、有没有做了一半的外部动作，再接着做。")
+FRESH_TEXT = ("这一轮换了新会话：上一个会话无法继续（例如模型接口反复报同一个错误）。你看不到之前的对话，"
+              "先读工单目录里的 结果.md、过程.log 和已有产物，弄清做到哪一步，再接着做；不要重复已经完成的外部动作。")
 
 
 def release(con: sqlite3.Connection, ticket_id: str) -> str:
@@ -341,6 +343,28 @@ def release(con: sqlite3.Connection, ticket_id: str) -> str:
         touch(con, ticket_id, state="idle", retries=0, retry_at=0)
         add_input(con, ticket_id, "release", "用户已放开暂停，可以继续。" if st == "held" else RESUME_TEXT)
     return st
+
+
+def restart(con: sqlite3.Connection, ticket_id: str) -> None:
+    """换新会话从头续做（issue #14：会话被不可恢复的错误毒化后，只能另开新单、丢掉工单目录）。
+    工单号、目录、授权都不变；新会话首轮带上原话（任务卡）和历次追问。"""
+    with db.tx(con):
+        t = get(con, ticket_id)
+        if t["state"] in ("running", "queued"):
+            raise TicketError("%s 正在运行或排队，先停止或暂停再换会话" % ticket_id)
+        asks = con.execute("SELECT text FROM inputs WHERE ticket_id=? AND kind='followup' ORDER BY id",
+                           (ticket_id,)).fetchall()
+        text = FRESH_TEXT
+        if asks:
+            shown = asks[-10:]
+            text += "\n\n用户在之前会话里的追问（按时间顺序%s）：\n" % (
+                "，只列最近 10 条" if len(asks) > 10 else "")
+            text += "\n".join("%d. %s" % (i + 1, templates.short(a["text"], 500)) for i, a in enumerate(shown))
+        # 之前没投递的输入已经包含在上面的追问里，标掉，免得新会话里重复
+        con.execute("UPDATE inputs SET status='delivered' WHERE ticket_id=? AND status='pending'", (ticket_id,))
+        touch(con, ticket_id, session_id=str(uuid.uuid4()), session_started=0, state="idle",
+              retries=0, retry_at=0)
+        add_input(con, ticket_id, "fresh", text)
 
 
 def grant(con: sqlite3.Connection, ticket_id: str, path: str) -> str:

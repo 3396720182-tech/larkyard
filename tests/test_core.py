@@ -164,6 +164,27 @@ class CoreTest(TicketdTestCase):
         self.assertEqual(last["kind"], "release")
         self.assertIn("恢复了这张已停止的工单", last["text"])
 
+    def test_restart_uses_new_session_and_carries_followups(self):  # issue #14
+        tid = self.new_ticket()
+        self.con.execute("UPDATE tickets SET state='failed', session_started=1 WHERE id=?", (tid,))
+        self.con.execute("UPDATE inputs SET status='delivered' WHERE ticket_id=?", (tid,))
+        self.core.send_followup(self.con, tid, "om_2", "第一条追问")
+        old = self.core.get(self.con, tid)["session_id"]
+        self.core.restart(self.con, tid)
+        t = self.core.get(self.con, tid)
+        self.assertNotEqual(t["session_id"], old)
+        self.assertEqual((t["session_started"], t["state"]), (0, "idle"))
+        pending = self.con.execute("SELECT kind, text FROM inputs WHERE ticket_id=? AND status='pending'",
+                                   (tid,)).fetchall()
+        self.assertEqual([r["kind"] for r in pending], ["fresh"])
+        self.assertIn("1. 第一条追问", pending[0]["text"])
+
+    def test_restart_refused_while_running(self):
+        tid = self.new_ticket()
+        self.con.execute("UPDATE tickets SET state='running' WHERE id=?", (tid,))
+        with self.assertRaises(self.core.TicketError):
+            self.core.restart(self.con, tid)
+
     def test_touch_if_only_updates_expected_states(self):
         tid = self.new_ticket()
         self.assertTrue(self.core.touch_if(self.con, tid, ("queued",), state="running", pid=42))

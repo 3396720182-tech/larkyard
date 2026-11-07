@@ -480,5 +480,9 @@ class Scheduler:
         summary = "worker 未交汇报就退出（code=%s）" % code
         if r.last_text:
             summary += "：" + worker._short(r.last_text, 200)
-        core.add_report(self.con, tid, "failed", summary)
+        ask = None
+        if worker.is_client_error(err):
+            # 不可恢复的 4xx（如网关不支持 PDF 类型的 tool_result）已经写进会话历史，续做多半还是同一个错误（issue #14）
+            ask = "追问后还是同样的错误，就说「换新会话重来 %s」（工单目录和历次追问会带上）" % tid
+        core.add_report(self.con, tid, "failed", summary, ask=ask)
         core.touch_if(self.con, tid, ("running",), state="failed", pid=None)

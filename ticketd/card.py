@@ -272,7 +272,7 @@ def _user_round(con, tid: str) -> bool:
     """本轮是不是用户发起的（追问、授权、放开）；服务重启恢复、临时故障重试这类轮次不另发卡片。"""
     row = con.execute("SELECT kind FROM inputs WHERE ticket_id=? AND status='delivered' ORDER BY id DESC LIMIT 1",
                       (tid,)).fetchone()
-    return row is not None and row["kind"] in ("assignment", "followup", "grant", "release")
+    return row is not None and row["kind"] in ("assignment", "followup", "grant", "release", "fresh")
 
 
 def _refresh_one(con, t, now: float, create, patch) -> str:
