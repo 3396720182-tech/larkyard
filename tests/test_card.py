@@ -468,6 +468,31 @@ class CardTest(TicketdTestCase):
         t = self.t(tid)
         self.assertEqual((t["card_wanted"], t["card_attempts"]), (1, 1))
 
+    def test_patch_transient_giveup_only_drops_this_card(self):
+        # issue #11：断网约 3 小时，刷新失败满 30 次后整单再也不发卡
+        tid = self.new_ticket()
+        t0 = time.time()
+        self.refresh(t0)
+        self.run_state(tid, t0)
+        self.con.execute("UPDATE tickets SET card_attempts=? WHERE id=?", (self.card.PATCH_MAX_ATTEMPTS - 1, tid))
+        self.lark.fail = ('rc=4 {"type": "network", "retryable": true}', False)
+        self.refresh(t0 + 20)
+        t = self.t(tid)
+        self.assertEqual((t["card_wanted"], t["card_closed"], t["card_attempts"]), (1, 1, 0))
+        self.assertIsNone(self.card.live_card(t, t0 + 30))  # 这一轮的结果改发新消息
+        self.assertIn("这张卡不再刷新", (self.tmp / "home" / "logs" / "alerts.log").read_text(encoding="utf-8"))
+        # 网络恢复后，用户追问的新一轮跑久了照常另发一张卡
+        self.lark.fail = None
+        self.core.add_report(self.con, tid, "ready", "第一轮好了")
+        self.con.execute("UPDATE tickets SET state='idle' WHERE id=?", (tid,))
+        self.core.send_followup(self.con, tid, "om_2", "再改一下")
+        t1 = t0 + 1000
+        self.run_state(tid, t1)
+        n = len(self.lark.created)
+        self.refresh(t1 + 200)
+        self.assertEqual(len(self.lark.created), n + 1)
+        self.assertEqual(self.lark.created[-1][0], "om_2")
+
     def test_patch_gives_up_after_edit_window(self):
         tid = self.new_ticket()
         self.refresh()

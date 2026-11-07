@@ -222,6 +222,15 @@ def _failed(con, t, info: str, permanent: bool, now: float, what: str, creating:
     else:
         giveup = (permanent or attempts >= PATCH_MAX_ATTEMPTS
                   or now - (t["card_sent_at"] or t["created_at"]) > PATCH_WINDOW)
+    if (giveup and not creating and not permanent
+            and now - (t["card_sent_at"] or t["created_at"]) <= PATCH_WINDOW):
+        # 刷新连续失败（多半是长时间断网）：只放弃这张卡——收起、不再刷新，结果改发新消息；
+        # 这一单之后用户发起的轮次照常另发新卡（原来把 card_wanted 置 0，整单再也没有状态卡，issue #11）
+        con.execute("UPDATE tickets SET card_closed=1, card_round=NULL, card_attempts=0, card_retry_at=0"
+                    " WHERE id=?", (t["id"],))
+        outbox.alert("状态卡%s连续失败 %d 次，这张卡不再刷新，之后的轮次照常发卡（%s）：%s"
+                     % (what, attempts, t["id"], info))
+        return
     if giveup and round_card:
         # 追问轮次的卡发不出去：只放弃这一轮（记成这一轮已处理），以后的轮次照常
         con.execute("UPDATE tickets SET card_round=?, card_attempts=0, card_retry_at=0 WHERE id=?",
