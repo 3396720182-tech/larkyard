@@ -189,3 +189,15 @@ class IssueRegressionTest(unittest.TestCase):
         out = worker.summarize_event({"type": "result", "subtype": "success", "is_error": True,
                                       "result": "API Error: 400 bad", "duration_ms": 1000})
         self.assertEqual(out, ["本轮结束：出错（API Error: 400 bad），用时 1s，被拒操作 0 次"])
+
+
+class ImportErrorTextTest(unittest.TestCase):
+    def test_keeps_error_and_drops_notice(self):  # issue #12
+        from ticketd import publish
+        data = {"ok": False, "error": {"type": "auth", "code": 99991, "message": "strict mode: user identity disabled"},
+                "_notice": {"update": "x" * 500 + " lark-cli update"}}
+        text = publish._error_text(data, "")
+        self.assertIn("strict mode: user identity disabled", text)
+        self.assertNotIn("lark-cli update", text)
+        self.assertIn('"type": "network"', publish._error_text({"ok": False, "error": {"type": "network"}}, ""))
+        self.assertEqual(publish._error_text({}, "  plain failure  "), "plain failure")

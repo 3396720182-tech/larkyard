@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -73,8 +74,19 @@ def _import(path: Path, name: str) -> str:
     body = data.get("data") if data.get("ok") else None
     url = body.get("url") if isinstance(body, dict) else None
     if not url:
-        raise RuntimeError("rc=%s %s" % (p.returncode, (p.stderr or p.stdout)[-300:]))
+        raise RuntimeError("rc=%s %s" % (p.returncode, _error_text(data, p.stderr or p.stdout)))
     return url
+
+
+def _error_text(data: dict, raw: str) -> str:
+    """lark-cli 报错里真正的原因。它的 JSON 末尾常跟着一大段 _notice（升级提示），只截尾部会把原因截掉（issue #12）。
+    保留 type 字段原样（"type": "network"），发件箱靠它判断是不是网络故障。"""
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        keep = {k: err[k] for k in ("type", "subtype", "code", "message", "hint", "retryable") if k in err}
+        if keep:
+            return json.dumps(keep, ensure_ascii=False)[:500]
+    return (raw or "").strip()[:300]
 
 
 def _cached(con, p: Path):
