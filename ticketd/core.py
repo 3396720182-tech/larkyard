@@ -140,6 +140,25 @@ def _reply_target(con: sqlite3.Connection, ticket_id: str) -> str:
     return get(con, ticket_id)["origin_message_id"]
 
 
+def check_media_artifacts(workdir: str, artifacts: Iterable[str]) -> None:
+    """worker 交终态汇报时检查图片/视频产物：结果卡只显示工单目录内的媒体（发件箱的安全规则，§5.3），
+    目录外或不存在的当场报错，让 worker 复制进来再报（原来静默丢图，T0005 选图卡里一张图都没有）。
+    这里只是提前告诉 worker，安全检查仍以发件箱为准。"""
+    root = os.path.realpath(workdir)
+    bad = []
+    for a in artifacts:
+        if templates._URL.match(a) or not a.lower().endswith(templates.IMAGE_EXTS + templates.VIDEO_EXTS):
+            continue
+        real = os.path.realpath(os.path.join(workdir, a))  # 绝对路径时 join 返回 a 本身
+        if not real.startswith(root + os.sep):
+            bad.append("%s（不在工单目录内）" % a)
+        elif not os.path.isfile(real):
+            bad.append("%s（文件不存在）" % a)
+    if bad:
+        raise TicketError("这些图片/视频不会显示在结果卡里：%s。请先复制到工单目录（如 cp <文件> %s/），"
+                          "再用工单目录里的路径重新执行这条 ticket report" % ("；".join(bad), workdir))
+
+
 def _validate_report(status: str, summary: str) -> None:
     if status not in STATUSES:
         raise TicketError("未知状态：%s" % status)

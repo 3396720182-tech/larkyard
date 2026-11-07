@@ -226,6 +226,8 @@ def main(argv=None) -> int:
     try:
         if args.cmd == "report" and spool:
             # worker 沙箱内：只写工单目录下的待收件，绝不打开数据库
+            if args.status != "progress":
+                core.check_media_artifacts(os.path.dirname(spool.rstrip("/")), args.artifact)
             core.write_spool(spool, args.status, args.summary, args.artifact, args.ask)
             print("已记录汇报：%s" % args.status)
             return 0

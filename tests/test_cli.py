@@ -188,3 +188,30 @@ class CliSpoolTest(TicketdTestCase):
         self.assertTrue(marker.exists())
         p = self.run_cli("ls", env={"TICKETD_PYTHON": str(self.tmp / "missing-python")})
         self.assertNotEqual(p.returncode, 0)  # 显式指定的解释器不存在时不悄悄换成别的
+
+
+class ReportMediaCheckTest(TicketdTestCase):
+    def run_report(self, workdir, *args):
+        import subprocess
+        env = dict(os.environ, TICKETD_SPOOL=os.path.join(workdir, ".reports"), TICKETD_TICKET="T0001")
+        return subprocess.run([TICKET, "report"] + list(args),
+                              cwd=workdir, env=env, capture_output=True, text=True)
+
+    def test_media_outside_workdir_rejected_with_hint(self):
+        wd = self.tmp / "work" / "T0001-x"
+        wd.mkdir(parents=True)
+        outside = self.tmp / "elsewhere.jpg"
+        outside.write_bytes(b"x")
+        (wd / "in.jpg").write_bytes(b"x")
+        p = self.run_report(str(wd), "--status", "ready", "--summary", "好了", "--artifact", str(outside))
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("不在工单目录内", p.stderr)
+        self.assertFalse(list((wd / ".reports").glob("*.json")) if (wd / ".reports").exists() else [])
+        p = self.run_report(str(wd), "--status", "ready", "--summary", "好了", "--artifact", "missing.png")
+        self.assertIn("文件不存在", p.stderr)
+        # 工单目录内的图、文档、链接、progress 都照常
+        p = self.run_report(str(wd), "--status", "ready", "--summary", "好了", "--artifact", "in.jpg",
+                            "--artifact", "/x/结果.md", "--artifact", "https://example.com/a.png")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = self.run_report(str(wd), "--status", "progress", "--summary", "出图", "--artifact", str(outside))
+        self.assertEqual(p.returncode, 0, p.stderr)
