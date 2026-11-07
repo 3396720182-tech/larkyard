@@ -125,6 +125,7 @@ ticket new --chat <chat_id> --message <om_id> --title <标题> --slug <短名> \
    - 没有汇报：记一条 `failed` 汇报，附上 stream 里最后一段 assistant 文本。
    - 释放写锁。
 5. **任务卡内容**：原话、路由备注、可写目录、工单号、工单目录、汇报方式。不含任何主会话写的计划。
+   - **调整（2026-11-07，issue #21）**：Claude 单的任务卡多一行沙箱事实（只能写可写目录和临时目录、出网放开、本机端口 / unix socket / bind 被拒）和这张单的设置文件路径（`~/.ticketd/settings/<id>.json`）；worker 提示词加一节「被拒绝长什么样」，要求把失败归因到沙箱或系统权限之前先在工单目录里做一次对照。起因：另一台机器上 worker 把网络盘的间歇 `EINTR` 当成 TCC，烧掉一整轮并让用户去改系统设置。不做「blocked 但被拒操作为 0」的核对：`permission_denials` 只统计 Claude Code 权限规则的拒绝，沙箱在系统层的 EPERM 不计入，拿它核对会误报。
 
 ### 5.2.1 执行器（2026-11-01，T0004）
 

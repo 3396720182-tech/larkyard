@@ -201,3 +201,15 @@ class ImportErrorTextTest(unittest.TestCase):
         self.assertNotIn("lark-cli update", text)
         self.assertIn('"type": "network"', publish._error_text({"ok": False, "error": {"type": "network"}}, ""))
         self.assertEqual(publish._error_text({}, "  plain failure  "), "plain failure")
+
+
+class SandboxLineTest(unittest.TestCase):
+    def test_claude_card_points_to_settings_codex_does_not(self):  # issue #21
+        from ticketd import worker
+        t = {"id": "T0009", "title": "x", "workdir": "/w/T0009-x", "request_text": "做", "router_note": None,
+             "executor": "claude"}
+        card = worker.compose_card(t, [], [], include_assignment=True)
+        self.assertIn("沙箱：只能写可写目录", card)
+        self.assertIn("T0009.json", card)
+        t["executor"] = "codex"
+        self.assertNotIn("沙箱：", worker.compose_card(t, [], [], include_assignment=True))

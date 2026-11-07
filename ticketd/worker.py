@@ -12,7 +12,7 @@ ASSIGNMENT = """# 工单 {id}：{title}
 
 - 工单目录（当前 cwd）：{workdir}
 - 可写目录：{scope}
-- 结果文件：{workdir}/结果.md
+- 结果文件：{workdir}/结果.md{sandbox}
 
 ## 用户原话
 {request}
@@ -121,7 +121,7 @@ def compose_card(ticket, grant_paths: List[str], inputs, include_assignment: boo
             id=ticket["id"], title=ticket["title"], workdir=ticket["workdir"],
             scope="、".join([ticket["workdir"]] + list(grant_paths)) if grant_paths
             else templates.scope_text([]) + "（%s）" % ticket["workdir"],
-            request=ticket["request_text"], note=ticket["router_note"] or "无"))
+            request=ticket["request_text"], note=ticket["router_note"] or "无", sandbox=_sandbox_line(ticket)))
     for i in inputs:
         if i["kind"] == "assignment":
             continue
@@ -131,6 +131,15 @@ def compose_card(ticket, grant_paths: List[str], inputs, include_assignment: boo
             parts.append("## 系统通知（%s）\n%s" % (i["kind"], i["text"]))
     parts.append(REMINDER)
     return "\n\n".join(parts)
+
+
+def _sandbox_line(ticket) -> str:
+    """Claude worker 的沙箱事实（issue #21：worker 不知道自己的沙箱配了什么，把网络抖动误判成权限问题）。
+    Codex 的沙箱由 codex 自己管，这里不写。"""
+    if executor_of(ticket) != "claude":
+        return ""
+    return ("\n- 沙箱：只能写可写目录和临时目录；出网放开；连本机端口、unix socket（如 docker.sock）、"
+            "在本机 bind socket 都会被拒。完整设置：%s" % (config.settings_dir() / ("%s.json" % ticket["id"])))
 
 
 def build_command(ticket, settings_path, prompt_text: str) -> List[str]:
