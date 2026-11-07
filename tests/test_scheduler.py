@@ -89,6 +89,17 @@ class SchedulerTest(TicketdTestCase):
         self.assertEqual(rep["status"], "failed")
         self.assertIn("我忘了汇报", rep["summary"])
 
+    def test_balance_error_fails_with_reason_and_no_retry(self):
+        tid = self.new_ticket(request="[[fake:balance]]")
+        self.wait(lambda: self.state(tid) == "failed", self.sched)
+        rep = self.core.last_report(self.con, tid)
+        self.assertEqual(rep["status"], "failed")
+        self.assertTrue(rep["summary"].startswith("模型接口余额不足"))
+        self.assertIn("403 insufficient balance", rep["summary"])
+        self.assertIn("继续", rep["ask"])
+        self.assertEqual(len(self.argv_log(tid)), 1)  # 账户级故障不重试
+        self.assertEqual(self.core.get(self.con, tid)["retries"], 0)
+
     def test_transient_retry_then_ready(self):
         tid = self.new_ticket(request="[[fake:transient_once]]")
         self.wait(lambda: self.state(tid) == "idle" and self.core.last_report(self.con, tid) is not None,

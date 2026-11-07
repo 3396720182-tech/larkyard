@@ -149,3 +149,26 @@ class StepLabelTest(unittest.TestCase):
         self.assertEqual(last_step(ev), "写 b.py")
         self.assertIsNone(last_step({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}))
         self.assertIsNone(last_step({"type": "user"}))
+
+
+class AccountErrorTest(unittest.TestCase):
+    def test_detects_balance_and_auth(self):
+        from ticketd import worker
+        self.assertEqual(worker.account_error("Failed to authenticate. API Error: 403 insufficient balance"), "余额不足")
+        self.assertEqual(worker.account_error("", "Invalid API key · Please run /login"), "认证失败")
+        self.assertIsNone(worker.account_error("API Error: 529 overloaded", ""))
+
+    def test_result_error_text_only_for_errors(self):
+        from ticketd import worker
+        self.assertEqual(worker.result_error_text({"type": "result", "is_error": False, "result": "ok"}), "")
+        self.assertEqual(worker.result_error_text({"type": "result", "is_error": True, "result": " boom "}), "boom")
+        self.assertEqual(worker.result_error_text(None), "")
+
+    def test_bg_task_events(self):
+        from ticketd import worker
+        self.assertEqual(worker.bg_task_event({"type": "system", "subtype": "task_started", "task_id": "b1",
+                                               "description": "出图"}), ("start", "b1", "出图"))
+        self.assertEqual(worker.bg_task_event({"type": "system", "subtype": "task_notification", "task_id": "b1",
+                                               "status": "completed"}), ("end", "b1", ""))
+        self.assertIsNone(worker.bg_task_event({"type": "system", "subtype": "task_progress", "task_id": "b1"}))
+        self.assertTrue(worker.is_action({"type": "system", "subtype": "task_notification", "task_id": "b1"}))

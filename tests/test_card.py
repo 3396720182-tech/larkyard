@@ -400,6 +400,21 @@ class CardTest(TicketdTestCase):
         self.assertFalse(v["stalled"])
         self.assertIn("进行中", v["label"])
 
+    def test_bg_wait_view_not_stalled(self):
+        tid = self.new_ticket()
+        t0 = time.time()
+        self.refresh(t0)
+        self.run_state(tid, t0)
+        self.con.execute("UPDATE tickets SET last_action_at=?, bg_wait='后台批量出镜头' WHERE id=?", (t0 + 5, tid))
+        now = t0 + 5 + 1200
+        v = self.card.view(self.con, self.t(tid), now)
+        self.assertFalse(v["stalled"])
+        self.assertEqual(v["label"], "⏳ 等后台任务")
+        self.refresh(now)
+        dumped = json.dumps(self.lark.patched[-1][1], ensure_ascii=False)
+        self.assertIn("等后台任务：后台批量出镜头", dumped)
+        self.assertNotIn("疑似卡住", dumped)
+
     def test_stalled_view(self):
         tid = self.new_ticket()
         t0 = time.time()
@@ -606,6 +621,48 @@ class SchedulerCardTest(TicketdTestCase):
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
         self.core.stop(self.con, tid)
         self.wait(lambda: tid not in self.sched.running, self.sched)
+
+    def test_bg_wait_after_round_end_is_not_a_stall(self):
+        # T0005：本轮已结束、在等后台任务时被报「疑似卡住」，用户停单，后台出图一起被杀
+        os.environ["TICKETD_STALL_SECONDS"] = "1"
+        os.environ["FAKE_BG_SECONDS"] = "4"
+        tid = self.new_ticket(request="[[fake:bg_wait]]")
+        self.wait(lambda: self.core.get(self.con, tid)["bg_wait"] is not None, self.sched)
+        self.assertEqual(self.core.get(self.con, tid)["bg_wait"], "后台批量出镜头")
+        for _ in range(25):  # 等待期间远超卡住阈值
+            self.sched.tick()
+            time.sleep(0.1)
+        t = self.core.get(self.con, tid)
+        self.assertEqual(t["stall_alerted"], 0)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.assertEqual(self.state(tid), "running")
+        # 后台任务结束 → 模型被唤醒、交汇报
+        self.wait(lambda: self.state(tid) == "idle", self.sched)
+        t = self.core.get(self.con, tid)
+        self.assertIsNone(t["bg_wait"])
+        self.assertEqual(t["stall_alerted"], 0)
+        self.assertEqual(self.core.last_report(self.con, tid)["summary"], "后台任务跑完了")
+        log = open(os.path.join(t["workdir"], "过程.log"), encoding="utf-8").read()
+        self.assertIn("等后台任务：后台批量出镜头", log)
+        self.assertNotIn("疑似卡住", log)
+
+    def test_api_error_while_bg_running_alerts_once_then_fails_with_reason(self):
+        os.environ["TICKETD_STALL_SECONDS"] = "1"
+        os.environ["FAKE_BG_SECONDS"] = "3"
+        tid = self.new_ticket(request="[[fake:bg_api_error]]")
+        self.wait(lambda: self.con.execute("SELECT 1 FROM outbox").fetchone() is not None, self.sched)
+        self.assertEqual(self.state(tid), "running")  # 后台任务还在跑，不杀
+        first = self.con.execute("SELECT text FROM outbox ORDER BY id").fetchall()
+        self.assertEqual(len(first), 1)
+        self.assertIn("模型接口报错（余额不足）", first[0]["text"])
+        self.assertIn("后台批量出镜头", first[0]["text"])
+        self.wait(lambda: self.state(tid) == "failed", self.sched)
+        rep = self.core.last_report(self.con, tid)
+        self.assertIn("模型接口余额不足", rep["summary"])
+        self.assertIn("继续", rep["ask"])
+        texts = [r["text"] for r in self.con.execute("SELECT text FROM outbox ORDER BY id")]
+        self.assertEqual(len(texts), 2)  # 提醒一次 + 失败结果
+        self.assertEqual(sum("疑似卡住" in x for x in texts), 0)
 
     def test_stall_shown_on_live_card_not_pushed(self):
         os.environ["TICKETD_STALL_SECONDS"] = "1"

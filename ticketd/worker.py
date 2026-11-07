@@ -37,6 +37,15 @@ TRANSIENT_MARKERS = ("overloaded", "timed out", "timeout",
                      "stream disconnected", "error sending request")
 TRANSIENT_RE = re.compile(r"\b(?:api error|error|status|http)\b[^\n]{0,20}?\b(?:408|429|5\d\d)\b")
 
+# 账户级故障：重试不会好，所有工单一起失败，要用户去处理（充值、换 key、登录）。
+# 实测（网关）：「Failed to authenticate. API Error: 403 insufficient balance」
+ACCOUNT_MARKERS = (
+    ("余额不足", ("insufficient balance", "insufficient account balance", "credit balance is too low",
+                "insufficient_quota", "exceeded your current quota")),
+    ("认证失败", ("failed to authenticate", "invalid api key", "invalid x-api-key", "authentication_error",
+                "please run /login", "oauth token has expired")),
+)
+
 
 _short = templates.short
 
@@ -197,10 +206,10 @@ def summarize_event(d: dict) -> List[str]:
 
 
 def is_action(d: dict) -> bool:
-    """是否算一次「动作」：任何代理（含子代理）发起工具调用、收到工具结果，或后台任务报进度。"""
+    """是否算一次「动作」：任何代理（含子代理）发起工具调用、收到工具结果，或后台任务报进度、结束。"""
     t = d.get("type")
     if t == "system":
-        return d.get("subtype") == "task_progress"
+        return d.get("subtype") in ("task_progress", "task_notification")
     if t not in ("assistant", "user"):
         return False
     msg = d.get("message")
@@ -249,6 +258,39 @@ class StreamTail:
             if isinstance(ev, dict):
                 events.append(ev)
         return events
+
+
+def result_error_text(result_event: Optional[dict]) -> str:
+    """本轮 result 事件是错误时的报错原文（模型接口报错等）；不是错误返回空串。"""
+    if not isinstance(result_event, dict) or not result_event.get("is_error"):
+        return ""
+    return str(result_event.get("result") or result_event.get("subtype") or "").strip()
+
+
+def account_error(*texts: str) -> Optional[str]:
+    """报错里认出账户级故障时返回「余额不足」/「认证失败」，否则 None。余额判断在前（网关常把余额不足报成认证失败）。"""
+    low = "\n".join(t for t in texts if t).lower()
+    for label, markers in ACCOUNT_MARKERS:
+        if any(m in low for m in markers):
+            return label
+    return None
+
+
+def bg_task_event(d: dict):
+    """后台任务事件：返回 ("start", task_id, 描述) / ("end", task_id, "")；其他事件返回 None。
+    Claude Code 对后台 Bash、后台子代理发 system/task_started，结束（完成、失败、被停）时发 system/task_notification。"""
+    if d.get("type") != "system":
+        return None
+    tid = d.get("task_id")
+    if not isinstance(tid, str) or not tid:
+        return None
+    sub = d.get("subtype")
+    if sub == "task_started":
+        desc = d.get("description") or d.get("task_type") or "后台任务"
+        return ("start", tid, _short(desc, 60))
+    if sub == "task_notification":
+        return ("end", tid, "")
+    return None
 
 
 def is_transient(exit_code: Optional[int], result_event: Optional[dict], stderr_text: str) -> bool:

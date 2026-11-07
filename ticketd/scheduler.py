@@ -45,6 +45,14 @@ def _signal_group(proc_or_pid, sig: int, fallback: bool = True) -> None:
         pass
 
 
+def _short_join(descs) -> str:
+    descs = list(descs)
+    text = "、".join(descs[:2])
+    if len(descs) > 2:
+        text += " 等 %d 个" % len(descs)
+    return templates.short(text, 80)
+
+
 def _spool_of(workdir: str) -> str:
     return str(Path(workdir) / ".reports")  # 与 worker.worker_env 设置的 TICKETD_SPOOL 完全一致
 
@@ -125,6 +133,9 @@ class Running:
         self.action_moved = False
         self.reported = False
         self.idle_since: Optional[float] = None  # 最近一个事件是 result（本轮已结束、进程还挂着）的起始时刻
+        self.bg: Dict[str, str] = {}             # 还没结束的后台任务：task_id → 描述
+        self.bg_shown: Optional[str] = None      # 已写进 tickets.bg_wait 的内容
+        self.api_alerted = False                 # 本轮的模型接口报错已推过提醒
 
 
 class Scheduler:
@@ -154,7 +165,7 @@ class Scheduler:
             _sweep_orphans(_spool_of(t["workdir"]), signal.SIGKILL)
             core.ingest_spool(self.con, t["id"], str(Path(t["workdir"]) / ".reports"))
             with db.tx(self.con):
-                core.touch(self.con, t["id"], state="idle", pid=None)
+                core.touch(self.con, t["id"], state="idle", pid=None, bg_wait=None)
                 core.add_input(self.con, t["id"], "recovery", RECOVERY_TEXT)
             self.log(t["workdir"], "服务重启，已安排恢复")
         self.con.execute("DELETE FROM locks")
@@ -248,7 +259,8 @@ class Scheduler:
                 os.close(fd)
         # 不写 state：可能已被停止/暂停
         t0 = db.now()
-        core.touch(self.con, tid, pid=proc.pid, started_at=t0, last_action_at=t0, last_step=None, stall_alerted=0)
+        core.touch(self.con, tid, pid=proc.pid, started_at=t0, last_action_at=t0, last_step=None, stall_alerted=0,
+                   bg_wait=None)
         self.running[tid] = Running(proc, tid, str(workdir), ids, mark, so, eo, ex.name, t["session_id"])
         self.log(str(workdir), "开始第 %d 轮（输入 %d 条）" % (n, len(inputs)))
         return True
@@ -261,6 +273,12 @@ class Scheduler:
         if step:
             r.last_step = step
             r.activity_dirty = True
+        bg = worker.bg_task_event(ev)
+        if bg is not None:
+            if bg[0] == "start":
+                r.bg[bg[1]] = bg[2]
+            else:
+                r.bg.pop(bg[1], None)
         kind, sub = ev.get("type"), ev.get("subtype")
         if kind == "result":
             r.idle_since = time.monotonic()
@@ -330,11 +348,25 @@ class Scheduler:
                 (r.ticket_id, r.report_mark)).fetchone():
             r.reported = True
             self.log(r.workdir, "已收到终态汇报")
+        # 本轮已结束（最后一个事件是 result）、没交终态汇报、还有后台任务没结束：claude 在等后台任务的通知，
+        # 任务结束时会唤醒模型接着做。这不是卡住（T0005：被误报卡住后用户停单，后台出图一起被杀）
+        waiting = not r.reported and r.idle_since is not None and bool(r.bg)
+        self._show_bg_wait(r, waiting)
         if r.reported:
             if (r.term_at is None and r.idle_since is not None
                     and time.monotonic() - r.idle_since >= config.linger_grace()):
                 self._terminate(r, "已汇报且本轮已结束，结束仍在等待的后台任务")
             return
+        if waiting:
+            err = worker.result_error_text(r.result)
+            if err and not r.api_alerted:
+                # 模型接口报错（如余额不足）而后台任务还在跑：进程要等任务结束才会退出，马上告诉用户，
+                # 赶在后台任务结束、模型被唤醒之前处理好，这一轮就能接着做
+                r.api_alerted = True
+                core.enqueue_message(self.con, r.ticket_id, templates.api_error_message(
+                    r.ticket_id, err, worker.account_error(err), r.bg_shown))
+                self.log(r.workdir, "模型接口报错，后台任务还在跑，已提醒用户")
+            return  # 单轮超时照旧兜底
         quiet = db.now() - max(t["last_action_at"] or 0, t["started_at"] or 0)
         if quiet >= config.stall_seconds() and not t["stall_alerted"]:
             # 本轮有状态卡：卡片自己会标「疑似卡住」，不另推消息（不需要用户回答；真卡死到超时会报 blocked 提醒）
@@ -345,6 +377,14 @@ class Scheduler:
                                          templates.stall_message(r.ticket_id, int(quiet // 60), t["last_step"]))
                 self.con.execute("UPDATE tickets SET stall_alerted=1 WHERE id=?", (r.ticket_id,))
             self.log(r.workdir, "疑似卡住：%d 秒没有新动作，%s" % (quiet, "状态卡已标出" if on_card else "已提醒用户"))
+
+    def _show_bg_wait(self, r: Running, waiting: bool) -> None:
+        text = _short_join(r.bg.values()) if waiting else None
+        if text != r.bg_shown:
+            r.bg_shown = text
+            self.con.execute("UPDATE tickets SET bg_wait=? WHERE id=?", (text, r.ticket_id))
+            if text:
+                self.log(r.workdir, "本轮已结束，等后台任务：%s" % text)
 
     def _watch(self, tid: str) -> None:
         r = self.running[tid]
@@ -391,7 +431,7 @@ class Scheduler:
     def _settle(self, r: Running) -> None:
         tid = r.ticket_id
         self.con.execute("DELETE FROM locks WHERE ticket_id=?", (tid,))
-        core.touch(self.con, tid, pid=None)  # 进程已退出；下面的状态迁移即使因停止/暂停而落空，pid 也要清掉
+        core.touch(self.con, tid, pid=None, bg_wait=None)  # 进程已退出；下面的状态迁移即使因停止/暂停而落空，pid 也要清掉
         t = core.get(self.con, tid)
         if t["state"] != "stopped":
             self._ingest_round(r, t["workdir"])
@@ -414,6 +454,17 @@ class Scheduler:
                           pid=None, retries=0, retry_at=0)
             return
         stderr_text = _read_from(Path(r.workdir) / ".stderr.log", r.stderr_offset)
+        err = worker.result_error_text(r.result)
+        acct = worker.account_error(err, r.last_text, stderr_text)
+        if acct:
+            # 余额不足、认证失败：重试也不会好，直接让用户处理，给出原文和下一步
+            # （T0005/T0015/T0017 原来只报「worker 未交汇报就退出（code=1）」，看不出要做什么）
+            core.add_report(self.con, tid, "failed",
+                            "模型接口%s，这一轮没做完：%s" % (acct, worker._short(err or r.last_text or stderr_text, 200)),
+                            ask="处理好之后引用这条消息回复「继续」，我从中断处接着做")
+            core.touch_if(self.con, tid, ("running",), state="failed", pid=None)
+            self.log(r.workdir, "模型接口%s，本轮失败" % acct)
+            return
         delays = config.retry_delays()
         if worker.is_transient(code, r.result, stderr_text) and t["retries"] < len(delays):
             with db.tx(self.con):

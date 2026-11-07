@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """测试用的 claude：行为由任务卡里最后一个 [[fake:<mode>]] 标记决定。"""
 import json
+import os
 import re
 import subprocess
 import sys
@@ -74,6 +75,40 @@ elif mode == "stall":
     emit({"type": "assistant", "message": {"content": [
         {"type": "tool_use", "name": "Bash", "input": {"command": "sleep 600"}}]}})
     time.sleep(60)
+elif mode in ("bg_wait", "bg_api_error"):
+    # 照 T0005 的真实 stream：后台 Bash 起任务 → 本轮 result（不交汇报）→ 等任务通知 → 唤醒模型接着做
+    bg_seconds = float(os.environ.get("FAKE_BG_SECONDS", "3"))
+    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {
+        "command": "genshot shoot", "run_in_background": True}}]}})
+    emit({"type": "system", "subtype": "task_started", "task_id": "b1", "description": "后台批量出镜头",
+          "task_type": "local_bash"})
+    emit({"type": "user", "message": {"content": [{"type": "tool_result", "content": "started"}]}})
+    if mode == "bg_wait":
+        emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "后台在跑，跑完我再汇报"}]}})
+        emit({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 10, "permission_denials": []})
+    else:
+        emit({"type": "assistant", "message": {"content": [{"type": "text", "text":
+              "Failed to authenticate. API Error: 403 insufficient balance"}]}})
+        emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 10,
+              "result": "Failed to authenticate. API Error: 403 insufficient balance", "permission_denials": []})
+    time.sleep(bg_seconds)
+    emit({"type": "system", "subtype": "task_notification", "task_id": "b1", "status": "completed"})
+    emit({"type": "system", "subtype": "init", "session_id": sid})
+    if mode == "bg_api_error":
+        emit({"type": "assistant", "message": {"content": [{"type": "text", "text":
+              "Failed to authenticate. API Error: 403 Insufficient account balance"}]}})
+        emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 0,
+              "result": "Failed to authenticate. API Error: 403 Insufficient account balance"})
+        sys.exit(1)
+    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {
+        "command": "genshot sheet", "description": "出联系表"}}]}})
+    report("--status", "ready", "--summary", "后台任务跑完了")
+elif mode == "balance":
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text":
+          "Failed to authenticate. API Error: 403 insufficient balance"}]}})
+    emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 10,
+          "result": "Failed to authenticate. API Error: 403 insufficient balance"})
+    sys.exit(1)
 elif mode == "sleep_child":
     child = subprocess.Popen(["sleep", "60"])
     Path(".child_pid").write_text(str(child.pid))

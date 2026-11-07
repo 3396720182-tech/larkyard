@@ -192,6 +192,8 @@ def _status_lines(con, t) -> list:
         if v["last_action_at"]:
             out.append("最后动作：%s（%s）  最近一步：%s" % (
                 templates.hm(v["last_action_at"]), templates.ago(now - v["last_action_at"]), v["last_step"] or "—"))
+        if v["bg_wait"]:
+            out.append("本轮已结束，等后台任务：%s（结束后 worker 会自动接着做）" % v["bg_wait"])
     return out
 
 

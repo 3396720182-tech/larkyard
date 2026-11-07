@@ -93,7 +93,7 @@ def view(con, t, now: float) -> dict:
         "phase_at": progress["created_at"] if progress else None,
         "phases": core.phases(con, tid, since) if started else [],
         "last_step": t["last_step"], "last_action_at": last_action or None, "elapsed": None,
-        "queued_note": None,
+        "queued_note": None, "bg_wait": None,
     }
     if state == "stopped":
         v["label"], v["color"] = "⏹️ 已停止", "grey"
@@ -104,6 +104,10 @@ def view(con, t, now: float) -> dict:
         v["elapsed"] = now - started if started else None
         if final is not None:
             v["label"], v["color"] = "📮 已汇报，正在发送结果", "turquoise"
+        elif _bg_wait(t):
+            # 本轮已结束、在等后台任务（调度器从 stream 的 task_started / task_notification 判断）：不算卡住
+            v["bg_wait"] = _bg_wait(t)
+            v["label"], v["color"] = "⏳ 等后台任务", "blue"
         elif last_action and now - last_action >= config.stall_seconds():
             v["stalled"] = True
             v["label"], v["color"] = "⚠️ 疑似卡住", "orange"
@@ -138,9 +142,19 @@ def view(con, t, now: float) -> dict:
     return v
 
 
+def _bg_wait(t) -> Optional[str]:
+    try:
+        return t["bg_wait"] or None
+    except (KeyError, IndexError):  # 老库还没补这一列
+        return None
+
+
 def _activity(v: dict, now: float) -> Optional[dict]:
     if not v["last_action_at"]:
         return None
+    if v["bg_wait"]:
+        return note("本轮已结束，等后台任务：%s · %s开始等，结束后自动接着做" % (
+            short(v["bg_wait"], 50), ago(now - v["last_action_at"])))
     if v["stalled"]:
         s = "⚠️ 已 %s没有新动作" % ago(now - v["last_action_at"]).replace("前", "")
         if v["last_step"]:

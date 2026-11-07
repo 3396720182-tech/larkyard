@@ -73,6 +73,7 @@ MIGRATIONS = [
     ("tickets", "card_round", "REAL"),                            # 当前状态卡显示的是哪一轮（该轮的 started_at）
     ("tickets", "card_sent_at", "REAL"),                          # 当前状态卡的发出时间（飞书只能编辑 14 天内的消息）
     ("tickets", "executor", "TEXT NOT NULL DEFAULT 'claude'"),   # 建单时定下，之后不变（会话不能跨执行器迁移）
+    ("tickets", "bg_wait", "TEXT"),                               # 非空 = 本轮已结束但还在等后台任务（内容是任务描述）
     ("outbox", "card_json", "TEXT"),                             # 非空 = 发卡片（text 是卡片发不出去时的兜底）
     ("outbox", "report_id", "INTEGER"),                           # 这条消息对应的汇报
     ("outbox", "media_json", "TEXT"),                             # 非空 = 发视频消息（结果卡里放不进的视频；text 是发不出去时的兜底）
