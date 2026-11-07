@@ -352,3 +352,36 @@ class GrantOverlapTest(TicketdTestCase):
         for p in (self.tmp / "work", self.tmp, self.tmp / "home"):
             with self.assertRaises(core.TicketError, msg=str(p)):
                 self.new_ticket(grant_paths=[str(p)])
+
+
+class NetGrantTest(TicketdTestCase):
+    def setUp(self):
+        super().setUp()
+        from ticketd import core
+        self.core = core
+
+    def test_socket_grant_keeps_link_and_target(self):
+        import os
+        target = self.tmp / "real.sock"
+        target.write_text("")
+        link = self.tmp / "docker.sock"
+        os.symlink(str(target), str(link))
+        tid = self.new_ticket()
+        self.core.grant_net(self.con, tid, socket=str(link))
+        self.assertEqual(self.core.net_grants(self.con, tid)["sockets"], sorted([str(link), str(target)]))
+        last = self.con.execute("SELECT kind, text FROM inputs WHERE ticket_id=? ORDER BY id DESC", (tid,)).fetchone()
+        self.assertEqual(last["kind"], "grant")
+        self.assertIn("unix socket", last["text"])
+
+    def test_local_grant_and_validation(self):
+        tid = self.new_ticket()
+        self.assertFalse(self.core.net_grants(self.con, tid)["local"])
+        self.core.grant_net(self.con, tid, local=True)
+        self.assertTrue(self.core.net_grants(self.con, tid)["local"])
+        with self.assertRaises(self.core.TicketError):
+            self.core.grant_net(self.con, tid, socket="relative.sock")
+        with self.assertRaises(self.core.TicketError):
+            self.core.grant_net(self.con, tid, socket=str(self.tmp / "missing.sock"))
+        self.core.stop(self.con, tid)
+        with self.assertRaises(self.core.TicketError):
+            self.core.grant_net(self.con, tid, local=True)

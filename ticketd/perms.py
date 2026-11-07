@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from . import config, host
 
@@ -34,7 +34,7 @@ def _existing_on_linux(paths: List[str], keep: int) -> List[str]:
     return paths[:keep] + [p for p in paths[keep:] if os.path.isdir(p)]
 
 
-def build_settings(workdir: str, grant_paths: List[str]) -> dict:
+def build_settings(workdir: str, grant_paths: List[str], net: Optional[dict] = None) -> dict:
     paths = writable_paths(workdir, grant_paths)
     allow = list(BASE_ALLOW)
     for p in paths:
@@ -51,6 +51,13 @@ def build_settings(workdir: str, grant_paths: List[str]) -> dict:
     network = {"allowedDomains": ["*"]}
     if not host.is_linux():
         network["allowMachLookup"] = list(MACH_LOOKUP)
+    # 用户逐单授权的本机网络 / unix socket（issue #20）。字段名和语义按 Claude Code 2.1.316 内置的沙箱规则核对过：
+    # allowLocalBinding 一次放开本机 bind/listen 和连 localhost 的所有端口（不能按端口细分）；
+    # allowUnixSockets 按路径（含子路径）放开 unix socket 的连接和 bind
+    if net and net.get("local"):
+        network["allowLocalBinding"] = True
+    if net and net.get("sockets"):
+        network["allowUnixSockets"] = list(net["sockets"])
     return {
         "permissions": {"allow": allow, "deny": list(DENY)},
         "sandbox": {
@@ -113,10 +120,10 @@ def write_codex_rules() -> None:
         p.write_text(CODEX_RULES, encoding="utf-8")
 
 
-def write_settings(ticket_id: str, workdir: str, grant_paths: List[str]) -> Path:
+def write_settings(ticket_id: str, workdir: str, grant_paths: List[str], net: Optional[dict] = None) -> Path:
     d = config.settings_dir()
     d.mkdir(parents=True, exist_ok=True)
     p = d / ("%s.json" % ticket_id)
-    p.write_text(json.dumps(build_settings(workdir, grant_paths), ensure_ascii=False, indent=1),
+    p.write_text(json.dumps(build_settings(workdir, grant_paths, net), ensure_ascii=False, indent=1),
                  encoding="utf-8")
     return p

@@ -121,3 +121,21 @@ class PermsTest(TicketdTestCase):
         p = perms.write_settings("T0001", str(work), [])
         self.assertEqual(p.name, "T0001.json")
         self.assertTrue(json.loads(p.read_text(encoding="utf-8"))["sandbox"]["enabled"])
+
+
+class NetGrantSettingsTest(TicketdTestCase):
+    """issue #20：字段名和语义在 Claude Code 2.1.316 上实测过（默认四项全 EPERM；
+    allowLocalBinding 放开连本机端口和本机 bind；allowUnixSockets 放开路径下 socket 的连接和 bind）。"""
+
+    def test_default_has_no_local_network(self):
+        from ticketd import perms
+        net = perms.build_settings("/w", [])["sandbox"]["network"]
+        self.assertNotIn("allowLocalBinding", net)
+        self.assertNotIn("allowUnixSockets", net)
+
+    def test_grants_map_to_sandbox_fields(self):
+        from ticketd import perms
+        net = perms.build_settings("/w", [], {"local": True, "sockets": ["/var/run/docker.sock"]})["sandbox"]["network"]
+        self.assertIs(net["allowLocalBinding"], True)
+        self.assertEqual(net["allowUnixSockets"], ["/var/run/docker.sock"])
+        self.assertEqual(net["allowedDomains"], ["*"])

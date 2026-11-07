@@ -261,3 +261,30 @@ class StopSummaryTest(TicketdTestCase):
         lines = buf.getvalue().splitlines()
         self.assertEqual(lines[0], "⏸️ 已暂停 %s" % tid)
         self.assertIn("继续 %s" % tid, lines[1])
+
+
+class NetGrantCliTest(TicketdTestCase):
+    def cli(self, *argv):
+        import contextlib, io
+        from ticketd import cli
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_local_net_and_exclusive_args(self):
+        tid = self.new_ticket()
+        rc, out, _ = self.cli("grant", tid, "--local-net")
+        self.assertEqual(rc, 0)
+        self.assertIn("本机网络", out)
+        rc, _, err = self.cli("grant", tid)
+        self.assertEqual(rc, 2)
+        self.assertIn("一次只授权一样", err)
+        rc, _, err = self.cli("grant", tid, str(self.tmp), "--local-net")
+        self.assertEqual(rc, 2)
+
+    def test_codex_ticket_warns(self):
+        tid = self.new_ticket(executor="codex")
+        rc, out, _ = self.cli("grant", tid, "--local-net")
+        self.assertEqual(rc, 0)
+        self.assertIn("Codex 单", out)

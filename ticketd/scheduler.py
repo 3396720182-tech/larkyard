@@ -234,7 +234,7 @@ class Scheduler:
             card_path = workdir / (".input-%03d-%d.md" % (n, time.time_ns()))
             safefs.create_excl(card_path, card.encode("utf-8"))
             ex = executors.get(worker.executor_of(t))
-            cmd = ex.build_command(t, gp, executors.prompt_text(ex.name))
+            cmd = ex.build_command(t, gp, executors.prompt_text(ex.name), net=core.net_grants(self.con, tid))
             env = worker.worker_env(t)
             fin = safefs.open_read(card_path)
             if fin is None:

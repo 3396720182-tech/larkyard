@@ -74,6 +74,7 @@
 - 「恢复 / 接着做」一张**已停止**（`stopped`）的单 → `ticket release <id>`（同一个会话接着做）。
 - 「换新会话重来 / 会话坏了重开」→ `ticket restart <id>`（工单号和目录不变，换一个新会话，原话和历次追问自动带上）。
 - 「授权 X 目录」→ `ticket grant <id> <绝对路径>`
+- 「放开本机网络 / 允许连本机数据库、起本地服务」→ `ticket grant <id> --local-net`；「放开 socket <路径> / 允许用 docker」→ `ticket grant <id> --socket <绝对路径>`（docker 一般是 `/var/run/docker.sock`）。一次只授权一样，只对 Claude 单生效。
 
 **查进度**：执行 `ticket show <id>` 或 `ticket ls`，用一两句话回答。不要去打扰 worker。
 

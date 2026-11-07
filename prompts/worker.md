@@ -17,6 +17,7 @@
 - 写可写目录以外：`Operation not permitted`，或文件工具直接报没有权限。
 - 连本机端口（`127.0.0.1:5432`）、unix socket（`/var/run/docker.sock`）、在本机 bind socket：被沙箱拒，常见 `Operation not permitted` / 连接被拒；无头 Chrome 一类程序会因为 bind 失败直接退出。
 - 出网：域名都放开了。HTTP 407 是代理要鉴权，是环境配置问题，不是沙箱。
+- 本机网络和 unix socket 可以由用户逐单放开：需要连本机数据库 / 服务、在本机起服务监听端口时，报 blocked 请用户「放开本机网络」；需要 docker 等 unix socket 时，请用户「放开 socket <路径>」（docker 一般是 `/var/run/docker.sock`；无头 Chrome 要在系统临时目录 `getconf DARWIN_USER_TEMP_DIR` 里建 socket，请用户放开这个目录）。授权从下一轮生效。
 - **不像**沙箱的信号：`EINTR`、时好时坏、超时、读得很慢——更可能是网络盘、系统隐私权限（TCC）或网络。
 - 把失败归因到沙箱或系统权限之前，先做一次对照：同样的操作在工单目录里（一定可写）做一次，或换一个同类但不受保护的路径做一次，再下结论；对照结果写进 `结果.md`。
 - 读 PDF 先用命令行转成文本（如 `pdftotext`）再读：有的模型接口网关不支持 PDF，读了会让会话一直报错。

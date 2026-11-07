@@ -2,6 +2,7 @@
 
 ## 0.2.0 — 未发布
 
+- `ticket grant` 能放开文件系统以外的沙箱限制（#20）：`--local-net` 让 worker 连本机端口、在本机起服务监听；`--socket <路径>` 放开一个 unix socket（如 docker.sock，或无头 Chrome 需要的系统临时目录）。只对 Claude 单生效，下一轮起作用。worker 提示词和任务卡说明了什么时候该请用户放开。新表 `net_grants`。
 - 故障自动续跑：断网、接口故障（短重试用完后）、余额不足、认证失败时，工单不再直接失败，而是每 15 分钟自动续跑一次，最长 24 小时；只在开始时推一次「⏳ 等待」，网络恢复或充值后自动接着做，随时引用回复「继续」可马上重试。新配置项 `TICKETD_OUTAGE_RETRY_EVERY`、`TICKETD_OUTAGE_RETRY_HOURS`，`tickets` 表新增 `outage_since` 列。
 - 停止 / 暂停时交代停在哪一步、这一轮写了哪些文件、怎么接着做、怎么在终端接管（#17）。
 - 已停止的单可以用 `ticket release` 恢复，沿用同一个会话；主会话听到「恢复 T0001」就执行（#18）。

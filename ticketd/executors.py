@@ -19,7 +19,8 @@ NAMES = ("claude", "codex")
 class Executor:
     name = ""
 
-    def build_command(self, ticket, grant_paths: List[str], prompt_text: str) -> List[str]:
+    def build_command(self, ticket, grant_paths: List[str], prompt_text: str, net=None) -> List[str]:
+        """net：文件系统以外的沙箱授权（core.net_grants），执行器不支持时忽略。"""
         raise NotImplementedError
 
     def normalizer(self) -> Callable[[dict], List[dict]]:
@@ -37,8 +38,8 @@ class Executor:
 class ClaudeExecutor(Executor):
     name = "claude"
 
-    def build_command(self, ticket, grant_paths, prompt_text):
-        settings = perms.write_settings(ticket["id"], ticket["workdir"], grant_paths)
+    def build_command(self, ticket, grant_paths, prompt_text, net=None):
+        settings = perms.write_settings(ticket["id"], ticket["workdir"], grant_paths, net)
         return worker.build_command(ticket, settings, prompt_text)
 
     def takeover_hint(self, ticket):
@@ -74,7 +75,7 @@ class CodexExecutor(Executor):
             args += ["-m", config.codex_model()]
         return args
 
-    def build_command(self, ticket, grant_paths, prompt_text):
+    def build_command(self, ticket, grant_paths, prompt_text, net=None):  # Codex 沙箱没有本机网络/socket 的开关
         perms.write_codex_rules()
         common = ["--json", "--skip-git-repo-check"] + self.config_args(ticket, grant_paths, prompt_text)
         if ticket["session_started"]:

@@ -67,7 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
         x.add_argument("ticket")
     g = sub.add_parser("grant")
     g.add_argument("ticket")
-    g.add_argument("path")
+    g.add_argument("path", nargs="?", help="可写目录（绝对路径）")
+    g.add_argument("--local-net", action="store_true", help="放开本机网络：连本机端口、在本机监听（只对 Claude 单生效）")
+    g.add_argument("--socket", help="放开一个 unix socket 路径（如 /var/run/docker.sock；只对 Claude 单生效）")
     sub.add_parser("ls")
     return p
 
@@ -204,8 +206,17 @@ def cmd_restart(con, a) -> str:
 
 
 def cmd_grant(con, a) -> str:
-    p = core.grant(con, a.ticket, a.path)
-    return "已授权 %s 可写：%s" % (a.ticket, p)
+    n = sum(bool(x) for x in (a.path, a.local_net, a.socket))
+    if n != 1:
+        raise core.TicketError("grant 一次只授权一样：目录、--local-net 或 --socket <路径>")
+    if a.path:
+        p = core.grant(con, a.ticket, a.path)
+        return "已授权 %s 可写：%s" % (a.ticket, p)
+    what = core.grant_net(con, a.ticket, local=a.local_net, socket=a.socket)
+    out = "已授权 %s 使用%s" % (a.ticket, what)
+    if worker.executor_of(core.get(con, a.ticket)) != "claude":
+        out += "\n⚠️ 这是 Codex 单，Codex 的沙箱没有这个开关，授权不会生效"
+    return out
 
 
 def cmd_ls(con, a) -> str:

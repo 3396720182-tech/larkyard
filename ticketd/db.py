@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS grants(
   ticket_id TEXT NOT NULL, path TEXT NOT NULL, created_at REAL NOT NULL,
   PRIMARY KEY(ticket_id, path)
 );
+-- 文件系统以外的沙箱授权（issue #20）：kind=local（本机网络：bind/listen、连本机端口）/ socket（unix socket 路径）
+CREATE TABLE IF NOT EXISTS net_grants(
+  ticket_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, created_at REAL NOT NULL,
+  PRIMARY KEY(ticket_id, kind, value)
+);
 CREATE TABLE IF NOT EXISTS bindings(message_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS inputs(
   id INTEGER PRIMARY KEY AUTOINCREMENT,

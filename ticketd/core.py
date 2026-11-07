@@ -65,6 +65,48 @@ def _norm_grant(path: str) -> str:
     return str(p)
 
 
+def net_grants(con: sqlite3.Connection, ticket_id: str) -> dict:
+    """文件系统以外的沙箱授权：{"local": bool, "sockets": [路径...]}。"""
+    rows = con.execute("SELECT kind, value FROM net_grants WHERE ticket_id=? ORDER BY created_at, value",
+                       (ticket_id,)).fetchall()
+    return {"local": any(r["kind"] == "local" for r in rows),
+            "sockets": [r["value"] for r in rows if r["kind"] == "socket"]}
+
+
+def _norm_socket(path: str) -> List[str]:
+    """unix socket 授权的路径：绝对路径、要存在（socket 文件或放 socket 的目录）。沙箱按解析后的路径匹配，
+    所以链接（如 /var/run/docker.sock → ~/.docker/run/docker.sock）连同解析后的路径一起授权。"""
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        raise TicketError("socket 路径必须是绝对路径：%s" % path)
+    if not p.exists():
+        raise TicketError("socket 路径不存在：%s" % p)
+    out = [str(p)]
+    real = os.path.realpath(str(p))
+    if real not in out:
+        out.append(real)
+    return out
+
+
+def grant_net(con: sqlite3.Connection, ticket_id: str, local: bool = False, socket: Optional[str] = None) -> str:
+    """放开本机网络（--local-net）或一个 unix socket（--socket）。只对 Claude 单生效（Codex 的沙箱没有对应开关）。"""
+    paths = _norm_socket(socket) if socket else []
+    with db.tx(con):
+        t = get(con, ticket_id)
+        if t["state"] == "stopped":
+            raise TicketError("%s 已停止" % ticket_id)
+        now = db.now()
+        if local:
+            con.execute("INSERT OR IGNORE INTO net_grants VALUES(?,?,?,?)", (ticket_id, "local", "", now))
+            what = "本机网络（可以连本机端口、在本机监听端口）"
+        else:
+            for p in paths:
+                con.execute("INSERT OR IGNORE INTO net_grants VALUES(?,?,?,?)", (ticket_id, "socket", p, now))
+            what = "unix socket：%s" % paths[0]
+        add_input(con, ticket_id, "grant", "用户已授权%s。" % what)
+    return what
+
+
 def add_input(con: sqlite3.Connection, ticket_id: str, kind: str, text: str,
               source_message_id: Optional[str] = None) -> None:
     con.execute("INSERT INTO inputs(ticket_id, kind, text, source_message_id, created_at) VALUES(?,?,?,?,?)",

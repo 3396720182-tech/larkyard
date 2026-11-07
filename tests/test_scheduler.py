@@ -187,6 +187,19 @@ class SchedulerTest(TicketdTestCase):
         self.assertIsNone(self.core.get(self.con, tid)["outage_since"])
         self.wait(lambda: self.core.last_report(self.con, tid)["status"] == "ready", self.sched)
 
+    def test_net_grant_lands_in_next_round_settings(self):  # issue #20
+        import json as _json
+        from ticketd import config
+        tid = self.new_ticket()
+        self.wait(lambda: self.state(tid) == "idle", self.sched)
+        path = config.settings_dir() / ("%s.json" % tid)
+        self.assertNotIn("allowLocalBinding", _json.loads(path.read_text())["sandbox"]["network"])
+        self.core.grant_net(self.con, tid, local=True)
+        self.wait(lambda: len(self.argv_log(tid)) == 2, self.sched)
+        self.wait(lambda: self.state(tid) == "idle", self.sched)
+        self.assertIs(_json.loads(path.read_text())["sandbox"]["network"]["allowLocalBinding"], True)
+        self.assertIn("用户已授权本机网络", self.argv_log(tid)[1]["card"])
+
     def test_transient_retry_then_ready(self):
         tid = self.new_ticket(request="[[fake:transient_once]]")
         self.wait(lambda: self.state(tid) == "idle" and self.core.last_report(self.con, tid) is not None,

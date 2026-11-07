@@ -191,8 +191,11 @@ ticket report --status ready|blocked|failed|dropped|waiting \
 | `ticket release <id>` | 状态回到 `idle`，加一条 `release` 输入：「用户已放开暂停」，然后投递排队中的输入 |
 | `ticket restart <id>`（**2026-11-07 新增**，issue #14） | 换新会话从头续做：新的 session_id、`session_started=0`，工单号、目录、授权不变；加一条 `fresh` 输入（说明换了会话、先读 `结果.md` / `过程.log`，并附上历次追问，最多最近 10 条），首轮任务卡照常带上原话。运行中或排队中拒绝 |
 | `ticket grant <id> <dir>` | 增加可写目录，加一条 `grant` 输入，重新生成权限配置 |
+| `ticket grant <id> --local-net` / `--socket <路径>`（**2026-11-07 新增**，issue #20） | 文件系统以外的沙箱授权，记在 `net_grants` 表，加一条 `grant` 输入，下一轮生效。`--local-net` → `sandbox.network.allowLocalBinding: true`；`--socket` → `sandbox.network.allowUnixSockets`（路径是链接时连同解析后的路径一起写）。一次只授权一样；只对 Claude 单生效（Codex 沙箱没有对应开关，CLI 会提示） |
 
 只有用户在对话里明确说了，主会话才执行 stop、hold、release、restart 和 grant。
+
+**调整（2026-11-07，issue #20）沙箱的本机网络和 unix socket 授权**：原来 `grant` 只能给可写目录，worker 连本机数据库、docker.sock、在本机起服务、无头 Chrome（要在系统临时目录里 bind ProcessSingleton 的 socket）都只能报 blocked 让用户自己去终端跑。字段和语义在 Claude Code 2.1.316（macOS）上实测：默认设置下连本机端口、连 unix socket、本机 bind、在临时目录 bind socket 全是 `Operation not permitted`；`allowLocalBinding: true` 后连本机端口和本机 bind 都通（它一次放开 bind/listen、入站和连 `localhost:*` 的所有端口，**不能按端口细分**，所以没有做 `--port`）；`allowUnixSockets` 里的路径（含子路径）下 socket 的连接和 bind 都通（授权 `getconf DARWIN_USER_TEMP_DIR` 后 Chrome 式的 socket bind 能过）。未实测：授权后无头 Chrome 整个能否跑通（测试环境里沙箱外也起不来）、Linux（bubblewrap 下 worker 在独立网络命名空间里，`allowLocalBinding` 是否能连到宿主机 localhost 未知）。
 
 **调整（2026-11-07，issue #17 #18 #14）**：
 - 停止 / 暂停有交代：`ticket stop` / `ticket hold` 的输出（主会话原样回复给用户）多几行——停在哪个阶段、最近一步和多久前（运行中才有）、这一轮在工单目录里写了哪些文件（跳过隐藏文件和 `过程.log`，最多列 6 个）、怎么接着做、终端接管命令。信息都是 ticketd 已有的，不问 worker。原来停掉之后什么都不说，用户不知道能捡回什么。
