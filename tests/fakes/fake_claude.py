@@ -107,6 +107,13 @@ elif mode == "poison":
     msg = "API Error: 400 tool_result content[1] is a document, which the tool-result protocol cannot represent"
     emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 10, "result": msg})
     sys.exit(1)
+elif mode == "balance_until_marker":
+    # 余额不足，直到测试放下 .topped_up 标记（模拟用户充值）
+    if not Path(".topped_up").exists():
+        emit({"type": "result", "subtype": "success", "is_error": True, "duration_ms": 10,
+              "result": "Failed to authenticate. API Error: 403 insufficient balance"})
+        sys.exit(1)
+    report("--status", "ready", "--summary", "充值后接着做完了")
 elif mode == "balance":
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text":
           "Failed to authenticate. API Error: 403 insufficient balance"}]}})

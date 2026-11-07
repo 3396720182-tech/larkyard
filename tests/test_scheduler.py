@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 from helpers import TicketdTestCase
 
@@ -120,6 +121,71 @@ class SchedulerTest(TicketdTestCase):
         self.assertIn("原话在这", third["card"])
         self.assertIn("换了新会话", third["card"])
         self.assertIn("追问一句", third["card"])
+
+    def _outbox_texts(self):
+        return [r["text"] for r in self.con.execute("SELECT text FROM outbox ORDER BY id")]
+
+    def test_balance_outage_waits_then_resumes_automatically(self):
+        os.environ["TICKETD_OUTAGE_RETRY_HOURS"] = "24"
+        os.environ["TICKETD_OUTAGE_RETRY_EVERY"] = "3600"
+        tid = self.new_ticket(request="[[fake:balance_until_marker]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None, self.sched)
+        t = self.core.get(self.con, tid)
+        self.assertEqual(t["state"], "idle")
+        self.assertGreater(t["retry_at"], time.time() + 3000)
+        rep = self.core.last_report(self.con, tid)
+        self.assertEqual(rep["status"], "waiting")
+        self.assertIn("模型接口余额不足", rep["summary"])
+        self.assertIn("会自动接着做", rep["ask"])
+        n = len(self._outbox_texts())
+        # 到点自动重试，还是余额不足：不再推消息
+        self.con.execute("UPDATE tickets SET retry_at=0 WHERE id=?", (tid,))
+        self.wait(lambda: len(self.argv_log(tid)) == 2 and tid not in self.sched.running
+                  and self.state(tid) == "idle", self.sched)
+        self.assertEqual(len(self._outbox_texts()), n)
+        self.assertEqual(self.core.get(self.con, tid)["outage_since"], t["outage_since"])
+        # 用户充值后，下一次自动重试接着做完
+        open(os.path.join(t["workdir"], ".topped_up"), "w").close()
+        self.con.execute("UPDATE tickets SET retry_at=0 WHERE id=?", (tid,))
+        self.wait(lambda: self.core.last_report(self.con, tid)["status"] == "ready", self.sched)
+        self.wait(lambda: self.state(tid) == "idle" and tid not in self.sched.running, self.sched)
+        t = self.core.get(self.con, tid)
+        self.assertIsNone(t["outage_since"])
+        self.assertEqual(t["retries"], 0)
+        self.assertIn("上一轮因网络或模型接口临时故障中断", self.argv_log(tid)[-1]["card"])
+
+    def test_network_outage_after_short_retries_waits_quietly(self):
+        os.environ["TICKETD_OUTAGE_RETRY_HOURS"] = "24"
+        os.environ["TICKETD_OUTAGE_RETRY_EVERY"] = "3600"
+        tid = self.new_ticket(request="[[fake:transient]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None, self.sched)
+        self.assertEqual(len(self.argv_log(tid)), 4)  # 首次 + 3 次短重试
+        rep = self.core.last_report(self.con, tid)
+        self.assertEqual(rep["status"], "waiting")
+        self.assertIn("恢复后会自动接着做", rep["summary"])
+        self.assertIsNone(rep["ask"])
+        self.assertEqual(self.state(tid), "idle")
+
+    def test_outage_gives_up_after_limit(self):
+        os.environ["TICKETD_OUTAGE_RETRY_HOURS"] = "1"
+        tid = self.new_ticket(request="[[fake:balance]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None, self.sched)
+        self.con.execute("UPDATE tickets SET retry_at=0, outage_since=? WHERE id=?", (time.time() - 7200, tid))
+        self.wait(lambda: self.state(tid) == "failed", self.sched)
+        t = self.core.get(self.con, tid)
+        self.assertIsNone(t["outage_since"])
+        rep = self.core.last_report(self.con, tid)
+        self.assertEqual(rep["status"], "failed")
+        self.assertIn("继续", rep["ask"])
+
+    def test_followup_during_outage_runs_now(self):
+        os.environ["TICKETD_OUTAGE_RETRY_HOURS"] = "24"
+        os.environ["TICKETD_OUTAGE_RETRY_EVERY"] = "3600"
+        tid = self.new_ticket(request="[[fake:balance]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None, self.sched)
+        self.core.send_followup(self.con, tid, "om_2", "继续 [[fake:ready]]")
+        self.assertIsNone(self.core.get(self.con, tid)["outage_since"])
+        self.wait(lambda: self.core.last_report(self.con, tid)["status"] == "ready", self.sched)
 
     def test_transient_retry_then_ready(self):
         tid = self.new_ticket(request="[[fake:transient_once]]")

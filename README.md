@@ -185,6 +185,8 @@ sudo loginctl enable-linger "$USER"
 | `TICKETD_WORKROOT` | `~/larkyard-tickets` | 工单目录的根，每张单一个子目录 |
 | `TICKETD_MAX_WORKERS` | `3` | 同时运行的 worker 数 |
 | `TICKETD_TURN_TIMEOUT` | `7200` | 单轮超时（秒） |
+| `TICKETD_OUTAGE_RETRY_EVERY` | `900` | 故障等待期间多久自动续跑一次（秒）：断网、接口故障（短重试用完后）、余额不足、认证失败 |
+| `TICKETD_OUTAGE_RETRY_HOURS` | `24` | 故障等待最长多少小时，超过记失败；`0` 为不等待、直接失败 |
 | `TICKETD_MODEL` | 空 | Claude Code worker 用的模型，空为 claude 默认 |
 | `TICKETD_EXECUTOR` | `claude` | 新单默认的执行器：`claude` 或 `codex`（`ticket new --executor` 可逐单指定） |
 | `TICKETD_CODEX` | `codex` | Codex CLI 路径。服务（launchd / systemd）的 PATH 由 `install.sh` 生成，只含 node、lark-cli、claude（以及安装时找得到的 codex）所在目录；找不到时写绝对路径 |

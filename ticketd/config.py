@@ -153,6 +153,16 @@ def retry_delays() -> list:
     return [float(x) for x in _env("TICKETD_RETRY_DELAYS", "10,40,160").split(",")]
 
 
+def outage_retry_every() -> float:
+    """故障等待期间多久自动续跑一次（秒）：短重试用完的网络/接口故障，以及余额不足、认证失败。"""
+    return max(1.0, float(_env("TICKETD_OUTAGE_RETRY_EVERY", "900")))
+
+
+def outage_retry_hours() -> float:
+    """故障等待最长多久（小时），超过就记失败；0 = 不进入故障等待，短重试用完直接失败。"""
+    return max(0.0, float(_env("TICKETD_OUTAGE_RETRY_HOURS", "24")))
+
+
 def card_heartbeat() -> float:
     """运行中的状态卡没有阶段变化时，多久刷新一次（秒）。"""
     return float(_env("TICKETD_CARD_HEARTBEAT", "150"))

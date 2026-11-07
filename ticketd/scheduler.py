@@ -378,6 +378,45 @@ class Scheduler:
                 self.con.execute("UPDATE tickets SET stall_alerted=1 WHERE id=?", (r.ticket_id,))
             self.log(r.workdir, "疑似卡住：%d 秒没有新动作，%s" % (quiet, "状态卡已标出" if on_card else "已提醒用户"))
 
+    def _schedule_retry(self, r: Running, t, delay: float, **fields) -> None:
+        tid = r.ticket_id
+        with db.tx(self.con):
+            if t["session_started"]:
+                core.add_input(self.con, tid, "retry", RETRY_TEXT)
+            else:
+                self.con.executemany("UPDATE inputs SET status='pending' WHERE id=?", [(i,) for i in r.input_ids])
+            core.touch_if(self.con, tid, ("running",), state="idle", pid=None, retries=t["retries"] + 1,
+                          retry_at=db.now() + delay, **fields)
+
+    def _outage(self, r: Running, t, reason: str, detail: str, account: bool) -> None:
+        tid = r.ticket_id
+        now = db.now()
+        since = t["outage_since"] or now
+        limit = config.outage_retry_hours() * 3600
+        if now - since < limit:
+            every = config.outage_retry_every()
+            if t["outage_since"] is None:  # 只在进入故障等待时告诉用户一次，之后的自动重试不再打扰
+                until = time.strftime("%m-%d %H:%M", time.localtime(since + limit))
+                plan = "每 %d 分钟自动试一次，最晚到 %s" % (max(1, int(every // 60)), until)
+                if account:
+                    core.add_report(self.con, tid, "waiting", "%s，这一轮没做完：%s" % (reason, detail),
+                                    ask="处理好之后会自动接着做（%s）；也可以引用这条消息回复「继续」马上重试" % plan)
+                else:
+                    core.add_report(self.con, tid, "waiting",
+                                    "%s，这一轮没做完，恢复后会自动接着做（%s）：%s" % (reason, plan, detail))
+            self._schedule_retry(r, t, every, outage_since=since)
+            self.log(r.workdir, "%s，故障等待中，%.0fs 后自动重试" % (reason, every))
+            return
+        if account:
+            core.add_report(self.con, tid, "failed", "%s，这一轮没做完：%s" % (reason, detail),
+                            ask="处理好之后引用这条消息回复「继续」，我从中断处接着做")
+        else:
+            core.add_report(self.con, tid, "failed",
+                            "%s，自动重试 %.0f 小时仍未恢复：%s" % (reason, limit / 3600, detail),
+                            ask="恢复后引用这条消息回复「继续」，我从中断处接着做")
+        core.touch_if(self.con, tid, ("running",), state="failed", pid=None, outage_since=None)
+        self.log(r.workdir, "%s，不再自动重试，本轮失败" % reason)
+
     def _show_bg_wait(self, r: Running, waiting: bool) -> None:
         text = _short_join(r.bg.values()) if waiting else None
         if text != r.bg_shown:
@@ -451,31 +490,23 @@ class Scheduler:
         if reports:
             core.touch_if(self.con, tid, ("running",),
                           state="failed" if reports[-1]["status"] == "failed" else "idle",
-                          pid=None, retries=0, retry_at=0)
+                          pid=None, retries=0, retry_at=0, outage_since=None)
             return
         stderr_text = _read_from(Path(r.workdir) / ".stderr.log", r.stderr_offset)
         err = worker.result_error_text(r.result)
         acct = worker.account_error(err, r.last_text, stderr_text)
-        if acct:
-            # 余额不足、认证失败：重试也不会好，直接让用户处理，给出原文和下一步
-            # （T0005/T0015/T0017 原来只报「worker 未交汇报就退出（code=1）」，看不出要做什么）
-            core.add_report(self.con, tid, "failed",
-                            "模型接口%s，这一轮没做完：%s" % (acct, worker._short(err or r.last_text or stderr_text, 200)),
-                            ask="处理好之后引用这条消息回复「继续」，我从中断处接着做")
-            core.touch_if(self.con, tid, ("running",), state="failed", pid=None)
-            self.log(r.workdir, "模型接口%s，本轮失败" % acct)
-            return
+        transient = not acct and worker.is_transient(code, r.result, stderr_text)
         delays = config.retry_delays()
-        if worker.is_transient(code, r.result, stderr_text) and t["retries"] < len(delays):
-            with db.tx(self.con):
-                if t["session_started"]:
-                    core.add_input(self.con, tid, "retry", RETRY_TEXT)
-                else:
-                    self.con.executemany("UPDATE inputs SET status='pending' WHERE id=?",
-                                         [(i,) for i in r.input_ids])
-                core.touch_if(self.con, tid, ("running",), state="idle", pid=None, retries=t["retries"] + 1,
-                              retry_at=db.now() + delays[t["retries"]])
+        if transient and t["retries"] < len(delays):
+            self._schedule_retry(r, t, delays[t["retries"]])
             self.log(r.workdir, "临时故障，%.0fs 后第 %d 次重试" % (delays[t["retries"]], t["retries"] + 1))
+            return
+        if acct or transient:
+            # 余额不足、认证失败（重试不会马上好），或短重试用完还没恢复的网络/接口故障：进入故障等待，
+            # 隔一段时间自动续跑，用户处理好或网络恢复后不用再说什么（原来直接记失败，要人发现后回「继续」，
+            # 另一台机器上隔了 3 小时和 6.5 小时才被发现，issue #10）
+            self._outage(r, t, "模型接口%s" % acct if acct else "网络或模型接口故障",
+                         worker._short(err or r.last_text or stderr_text, 200), bool(acct))
             return
         summary = "worker 未交汇报就退出（code=%s）" % code
         if r.last_text:

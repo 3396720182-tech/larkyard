@@ -127,7 +127,8 @@ def send_followup(con: sqlite3.Connection, ticket_id: str, message_id: str, text
             return
         con.execute("INSERT OR IGNORE INTO bindings VALUES(?,?)", (message_id, ticket_id))
         add_input(con, ticket_id, "followup", text, message_id)
-        touch(con, ticket_id, retries=0, retry_at=0)
+        # 用户说话了：马上投递（不等故障重试的时间点），故障等待重新起算，再失败会重新告诉用户
+        touch(con, ticket_id, retries=0, retry_at=0, outage_since=None)
 
 
 def _reply_target(con: sqlite3.Connection, ticket_id: str) -> str:
@@ -340,7 +341,7 @@ def release(con: sqlite3.Connection, ticket_id: str) -> str:
         st = get(con, ticket_id)["state"]
         if st not in ("held", "stopped"):
             raise TicketError("%s 不在暂停中，也没有停止" % ticket_id)
-        touch(con, ticket_id, state="idle", retries=0, retry_at=0)
+        touch(con, ticket_id, state="idle", retries=0, retry_at=0, outage_since=None)
         add_input(con, ticket_id, "release", "用户已放开暂停，可以继续。" if st == "held" else RESUME_TEXT)
     return st
 
@@ -363,7 +364,7 @@ def restart(con: sqlite3.Connection, ticket_id: str) -> None:
         # 之前没投递的输入已经包含在上面的追问里，标掉，免得新会话里重复
         con.execute("UPDATE inputs SET status='delivered' WHERE ticket_id=? AND status='pending'", (ticket_id,))
         touch(con, ticket_id, session_id=str(uuid.uuid4()), session_started=0, state="idle",
-              retries=0, retry_at=0)
+              retries=0, retry_at=0, outage_since=None)
         add_input(con, ticket_id, "fresh", text)
 
 
