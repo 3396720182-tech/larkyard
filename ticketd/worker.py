@@ -33,6 +33,8 @@ REMINDER = """---
 TRANSIENT_MARKERS = ("overloaded", "timed out", "timeout",
                      "econnreset", "econnrefused", "etimedout", "socket hang up", "connection error",
                      "fetch failed", "network error",
+                     # 断网 / DNS：「API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)」（issue #10）
+                     "enotfound", "eai_again", "getaddrinfo", "can't reach the api server", "enetunreach", "ehostunreach",
                      # Codex：网关断流 / 请求发不出去（重连 5 次后以 turn.failed 结束）
                      "stream disconnected", "error sending request")
 TRANSIENT_RE = re.compile(r"\b(?:api error|error|status|http)\b[^\n]{0,20}?\b(?:408|429|5\d\d)\b")
@@ -200,8 +202,10 @@ def summarize_event(d: dict) -> List[str]:
                 if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("is_error"):
                     out.append("工具报错：%s" % _short(_result_text(c.get("content")), 200))
     elif t == "result":
+        # is_error 时 Claude Code 的 subtype 仍是 success，不能照抄（issue #15）
+        how = "出错（%s）" % _short(result_error_text(d), 120) if d.get("is_error") else d.get("subtype")
         out.append("本轮结束：%s，用时 %.0fs，被拒操作 %d 次" % (
-            d.get("subtype"), (d.get("duration_ms") or 0) / 1000.0, len(d.get("permission_denials") or [])))
+            how, (d.get("duration_ms") or 0) / 1000.0, len(d.get("permission_denials") or [])))
     return out
 
 

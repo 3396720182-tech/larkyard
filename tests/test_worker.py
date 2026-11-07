@@ -172,3 +172,20 @@ class AccountErrorTest(unittest.TestCase):
                                                "status": "completed"}), ("end", "b1", ""))
         self.assertIsNone(worker.bg_task_event({"type": "system", "subtype": "task_progress", "task_id": "b1"}))
         self.assertTrue(worker.is_action({"type": "system", "subtype": "task_notification", "task_id": "b1"}))
+
+
+class IssueRegressionTest(unittest.TestCase):
+    def test_enotfound_is_transient(self):  # issue #10
+        from ticketd import worker
+        ev = {"type": "result", "is_error": True,
+              "result": "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"}
+        self.assertTrue(worker.is_transient(1, ev, ""))
+        self.assertTrue(worker.is_transient(1, None, "getaddrinfo EAI_AGAIN api.example.com"))
+        self.assertFalse(worker.is_transient(1, {"type": "result", "is_error": True,
+                                                 "result": "API Error: 403 insufficient balance"}, ""))
+
+    def test_error_round_not_logged_as_success(self):  # issue #15
+        from ticketd import worker
+        out = worker.summarize_event({"type": "result", "subtype": "success", "is_error": True,
+                                      "result": "API Error: 400 bad", "duration_ms": 1000})
+        self.assertEqual(out, ["本轮结束：出错（API Error: 400 bad），用时 1s，被拒操作 0 次"])
