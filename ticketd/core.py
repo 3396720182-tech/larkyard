@@ -202,22 +202,48 @@ def check_media_artifacts(workdir: str, artifacts: Iterable[str]) -> None:
                           "再用工单目录里的路径重新执行这条 ticket report" % ("；".join(bad), workdir))
 
 
-def _validate_report(status: str, summary: str) -> None:
+def _validate_report(status: str, summary: str, run: Optional[dict] = None) -> None:
     if status not in STATUSES:
         raise TicketError("未知状态：%s" % status)
     if not summary.strip():
         raise TicketError("summary 不能为空")
+    if run is not None and status != "blocked":
+        raise TicketError("--run 只能和 --status blocked 一起用（要等用户批准）")
+
+
+RUN_MAX_BYTES = 8 * 1024
+RUN_DEFAULT_ASK = "要我在沙箱外执行上面这段脚本吗？同意就回复「执行」；不同意或要改，直接说怎么改"
+
+
+def read_run_script(workdir: str, path: str) -> dict:
+    """worker 申请沙箱外执行时读脚本（在 worker 沙箱里由 ticket report 调用）：必须是工单目录里的普通文件、
+    ≤8KB、UTF-8 文本。返回 {"path": 相对工单目录的路径, "script": 内容}，汇报时连内容一起存下来。"""
+    root = os.path.realpath(workdir)
+    real = os.path.realpath(os.path.join(workdir, path))
+    if not real.startswith(root + os.sep):
+        raise TicketError("--run 的脚本要放在工单目录里：%s" % path)
+    if not os.path.isfile(real):
+        raise TicketError("--run 的脚本不存在：%s" % path)
+    if os.path.getsize(real) > RUN_MAX_BYTES:
+        raise TicketError("--run 的脚本超过 %dKB，拆小一点，只放必须在沙箱外做的步骤" % (RUN_MAX_BYTES // 1024))
+    try:
+        script = Path(real).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise TicketError("--run 的脚本读不了（要是 UTF-8 文本）：%s" % e)
+    if not script.strip():
+        raise TicketError("--run 的脚本是空的")
+    return {"path": os.path.relpath(real, root), "script": script}
 
 
 def write_spool(spool_dir: str, status: str, summary: str, artifacts: Iterable[str] = (),
-                ask: Optional[str] = None) -> Path:
-    _validate_report(status, summary)
+                ask: Optional[str] = None, run: Optional[dict] = None) -> Path:
+    _validate_report(status, summary, run)
     d = Path(spool_dir)
     d.mkdir(parents=True, exist_ok=True)
     name = "%020d-%d.json" % (time.time_ns(), os.getpid())
     tmp = d / (".tmp-" + name)
     tmp.write_text(json.dumps({"status": status, "summary": summary, "artifacts": list(artifacts),
-                               "ask": ask}, ensure_ascii=False), encoding="utf-8")
+                               "ask": ask, "run": run}, ensure_ascii=False), encoding="utf-8")
     final = d / name
     os.replace(str(tmp), str(final))
     return final
@@ -240,6 +266,12 @@ def _check_spool_schema(d) -> None:
         if (not isinstance(arts, list) or len(arts) > 20
                 or any(not isinstance(a, str) or len(a) > 1000 for a in arts)):
             raise TypeError("bad artifacts")
+    run = d.get("run")
+    if run is not None:
+        if (not isinstance(run, dict) or not isinstance(run.get("path"), str) or len(run["path"]) > 1000
+                or not isinstance(run.get("script"), str) or not run["script"].strip()
+                or len(run["script"].encode("utf-8")) > RUN_MAX_BYTES):
+            raise TypeError("bad run")
 
 
 def _read_spool_file(dfd: int, name: str) -> dict:
@@ -283,7 +315,7 @@ def ingest_spool(con: sqlite3.Connection, ticket_id: str, spool_dir: str, limit:
                 data = _read_spool_file(dfd, claimed)
                 _check_spool_schema(data)
                 add_report(con, ticket_id, data["status"], data["summary"],
-                           data.get("artifacts") or [], data.get("ask"))
+                           data.get("artifacts") or [], data.get("ask"), run=data.get("run"))
             except (OSError, ValueError, KeyError, TypeError, TicketError):
                 mark_bad(name, claimed)
                 continue
@@ -298,16 +330,25 @@ def ingest_spool(con: sqlite3.Connection, ticket_id: str, spool_dir: str, limit:
 
 
 def add_report(con: sqlite3.Connection, ticket_id: str, status: str, summary: str,
-               artifacts: Iterable[str] = (), ask: Optional[str] = None) -> None:
-    _validate_report(status, summary)
+               artifacts: Iterable[str] = (), ask: Optional[str] = None, run: Optional[dict] = None) -> None:
+    _validate_report(status, summary, run)
     arts = list(artifacts)
+    if run is not None and not ask:
+        ask = RUN_DEFAULT_ASK
     with db.tx(con):
         t = get(con, ticket_id)
         now = db.now()
         rid = con.execute("INSERT INTO reports(ticket_id, status, summary, artifacts_json, ask, created_at)"
                           " VALUES(?,?,?,?,?,?)",
                           (ticket_id, status, summary, json.dumps(arts, ensure_ascii=False), ask, now)).lastrowid
-        msg = templates.report_message(ticket_id, status, summary, arts, ask)
+        if status != "progress":
+            # 新的终态汇报取代之前还没批准的申请：用户只能批准最新这一份
+            con.execute("UPDATE runs SET status='superseded' WHERE ticket_id=? AND status='pending'", (ticket_id,))
+        if run is not None:
+            run_id = con.execute("INSERT INTO runs(ticket_id, report_id, path, script, created_at) VALUES(?,?,?,?,?)",
+                                 (ticket_id, rid, run["path"], run["script"], now)).lastrowid
+            run = dict(run, id=run_id, timeout=config.run_timeout())
+        msg = templates.report_message(ticket_id, status, summary, arts, ask, run)
         if not msg:
             return
         card = None
@@ -315,7 +356,7 @@ def add_report(con: sqlite3.Connection, ticket_id: str, status: str, summary: st
             started = t["started_at"]
             card = templates.result_card(
                 ticket_id, t["title"], t["workdir"], status, summary, arts, ask,
-                phases(con, ticket_id, started or now), now - started if started else None)
+                phases(con, ticket_id, started or now), now - started if started else None, run=run)
         # 视频产物在发件箱发卡时处理：传云空间成功就放进卡片里，失败才另排一条视频消息（outbox.resolve_card_videos）
         enqueue_message(con, ticket_id, msg, card=card, report_id=rid)
 
@@ -408,6 +449,30 @@ def restart(con: sqlite3.Connection, ticket_id: str) -> None:
         touch(con, ticket_id, session_id=str(uuid.uuid4()), session_started=0, state="idle",
               retries=0, retry_at=0, outage_since=None)
         add_input(con, ticket_id, "fresh", text)
+
+
+def pending_run(con: sqlite3.Connection, ticket_id: str) -> Optional[sqlite3.Row]:
+    return con.execute("SELECT * FROM runs WHERE ticket_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                       (ticket_id,)).fetchone()
+
+
+def approve(con: sqlite3.Connection, ticket_id: str) -> int:
+    """用户批准最新一份沙箱外执行申请；守护进程下一个 tick 开始执行。返回申请编号。"""
+    with db.tx(con):
+        t = get(con, ticket_id)
+        run = pending_run(con, ticket_id)
+        if run is None:
+            raise TicketError("%s 没有待批准的沙箱外执行" % ticket_id)
+        if t["state"] not in ("idle", "failed"):
+            raise TicketError("%s 当前状态为 %s，不能执行（先放开或恢复）" % (ticket_id, t["state"]))
+        con.execute("UPDATE runs SET status='approved', approved_at=? WHERE id=?", (db.now(), run["id"]))
+        touch(con, ticket_id, retry_at=0)
+    return run["id"]
+
+
+def expire_pending_runs(con: sqlite3.Connection, ticket_id: str) -> None:
+    """worker 开新一轮（用户追问、放开等）时，之前没批准的申请作废：worker 会根据新情况重新判断。"""
+    con.execute("UPDATE runs SET status='expired' WHERE ticket_id=? AND status='pending'", (ticket_id,))
 
 
 def grant(con: sqlite3.Connection, ticket_id: str, path: str) -> str:

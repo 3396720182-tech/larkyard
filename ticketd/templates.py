@@ -223,6 +223,17 @@ def details_panel(rest: str, files: List[str], workdir: Optional[str]) -> dict:
             "elements": els}
 
 
+def run_elements(run: dict) -> list:
+    """沙箱外执行申请：完整脚本（worker 写的，plain_text）放在默认展开的面板里，用户看过再批准。"""
+    head = "🖥️ 申请在沙箱外执行（R%s · %s）" % (run["id"], short(run["path"], 60))
+    return [{"tag": "collapsible_panel", "expanded": True, "vertical_spacing": "4px",
+             "header": {"title": {"tag": "plain_text", "content": head, "text_size": "notation"}},
+             "elements": [text(run["script"].rstrip()[:9000]),  # 原样显示（含缩进），汇报时已限制在 8KB 以内
+                          note("回复「执行」才会执行：由 ticketd 在工单目录里、沙箱外运行这段脚本（最长 %d 分钟），"
+                               "输出交回 worker 接着做。脚本里调用的其他文件以批准时工单目录里的为准。"
+                               % max(1, int(run.get("timeout", 1800) // 60)))]}]
+
+
 def _ask_element(status: str, ask: str) -> dict:
     if status == "dropped":
         return text("说明：%s。不引用直接发我即可开新单。" % clip(ask, 400).rstrip("。"), color="grey")
@@ -239,7 +250,7 @@ def _link_buttons(links: List[str]) -> list:
 
 
 def result_elements(status: str, summary: str, artifacts: List[str], ask: Optional[str],
-                    workdir: Optional[str], images: bool = False) -> list:
+                    workdir: Optional[str], images: bool = False, run: Optional[dict] = None) -> list:
     """结果正文，所有状态通用。worker 可控的文字一律 plain_text，不经 Markdown 解析。
     有图片/视频（images=True，只用于推送的结果卡）→ 画廊：媒体占主体在最上面 → 一行结论 → 需要你（色块）
       → 链接 → 收起的详情（其余文字 + 本机文件）。
@@ -259,6 +270,8 @@ def result_elements(status: str, summary: str, artifacts: List[str], ask: Option
         els.append(headline)
         if ask:
             els.append(_ask_element(status, ask))
+        if run:
+            els += run_elements(run)
         els += _link_buttons(links)
         if rest or files:
             els.append(details_panel(rest, files, workdir))
@@ -266,6 +279,8 @@ def result_elements(status: str, summary: str, artifacts: List[str], ask: Option
     els = [text(head, size="heading-4")]
     if ask:
         els.append(_ask_element(status, ask))
+    if run:
+        els += run_elements(run)
     if rest:
         els.append(text(rest))
     els += _link_buttons(links)
@@ -292,13 +307,13 @@ def with_doc_links(card: dict, links: List[tuple]) -> dict:
 
 def result_card(ticket_id: str, title: str, workdir: Optional[str], status: str, summary: str,
                 artifacts: List[str], ask: Optional[str], phases: List[str],
-                elapsed: Optional[float]) -> dict:
+                elapsed: Optional[float], run: Optional[dict] = None) -> dict:
     """终态汇报的结果卡：本轮有状态卡时直接覆盖到状态卡上；没有时作为一条新消息推给用户。"""
     emoji, word, color = FINAL[status]
     sub = "%s %s" % (emoji, word)
     if elapsed is not None:
         sub += " · 用时 %s" % dur(elapsed)
-    els = result_elements(status, summary, artifacts, ask, workdir, images=True)
+    els = result_elements(status, summary, artifacts, ask, workdir, images=True, run=run)
     els.append(note(("过程：%s · " % trail(phases, done=True, limit=6) if phases else "") + "引用此卡可追问"))
     c = card("%s %s %s：%s" % (emoji, ticket_id, word, short(summary, 40)),
              title_of(ticket_id, title), sub, color, els)
@@ -335,7 +350,7 @@ def video_fallback(ticket_id: str, video: str, workdir: Optional[str] = None) ->
 
 
 def report_message(ticket_id: str, status: str, summary: str,
-                   artifacts: List[str], ask: Optional[str]) -> Optional[str]:
+                   artifacts: List[str], ask: Optional[str], run: Optional[dict] = None) -> Optional[str]:
     """汇报对应的文字消息；返回 None 表示不推消息。终态汇报实际发的是结果卡片，这段文字是卡片发不出去时的兜底。
     progress 只刷新状态卡，不发消息；除非带了 --ask（需要用户决策时才主动推）。"""
     if status == "progress" and not ask:
@@ -351,6 +366,8 @@ def report_message(ticket_id: str, status: str, summary: str,
             lines.append("说明：%s。不引用直接发我即可开新单。" % ask.rstrip("。"))
         else:
             lines.append("👉 需要你：" + ask)
+    if run:
+        lines.append("🖥️ 申请在沙箱外执行（R%s · %s）：\n%s" % (run["id"], run["path"], run["script"].rstrip()[:9000]))
     return "\n".join(lines)
 
 

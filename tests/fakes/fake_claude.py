@@ -114,6 +114,13 @@ elif mode == "balance_until_marker":
               "result": "Failed to authenticate. API Error: 403 insufficient balance"})
         sys.exit(1)
     report("--status", "ready", "--summary", "充值后接着做完了")
+elif mode == "run_request":
+    # 申请沙箱外执行；拿到执行结果的那一轮把结果写进汇报
+    if "沙箱外执行结果" in card:
+        report("--status", "ready", "--summary", "拿到执行结果：" + card[card.index("退出码"):][:300].replace("\n", " "))
+    else:
+        Path("push.sh").write_text(os.environ.get("FAKE_RUN_SCRIPT", "echo hello-from-outside\necho run=$TICKETD_RUN\npwd\n"))
+        report("--status", "blocked", "--summary", "要推送", "--run", "push.sh")
 elif mode == "balance":
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text":
           "Failed to authenticate. API Error: 403 insufficient balance"}]}})

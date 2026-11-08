@@ -61,6 +61,11 @@ def db_path() -> Path:
     return db_dir() / "ticketd.db"
 
 
+def runs_dir() -> Path:
+    """沙箱外执行的脚本快照（worker 写不到这里）。"""
+    return home() / "runs"
+
+
 def heartbeat_path() -> Path:
     return home() / "heartbeat"
 
@@ -151,6 +156,11 @@ def owner() -> str:
 
 def retry_delays() -> list:
     return [float(x) for x in _env("TICKETD_RETRY_DELAYS", "10,40,160").split(",")]
+
+
+def run_timeout() -> float:
+    """一次沙箱外执行最长多久（秒），超时先 SIGTERM，10 秒后 SIGKILL。"""
+    return max(1.0, float(_env("TICKETD_RUN_TIMEOUT", "1800")))
 
 
 def outage_retry_every() -> float:

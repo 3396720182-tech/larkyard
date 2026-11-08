@@ -56,6 +56,14 @@ CREATE TABLE IF NOT EXISTS outbox(
   next_at REAL NOT NULL DEFAULT 0, last_error TEXT, sent_message_id TEXT, created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS locks(path TEXT PRIMARY KEY, ticket_id TEXT NOT NULL);
+-- 沙箱外执行（worker 用 ticket report --run 申请，用户批准后由 ticketd 在沙箱外执行）：script 是汇报时的快照，
+-- 执行的是这份快照（写到 ~/.ticketd/runs/），不是工单目录里 worker 还能改的那个文件
+CREATE TABLE IF NOT EXISTS runs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id TEXT NOT NULL, report_id INTEGER, path TEXT NOT NULL, script TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending / approved / running / done / superseded / expired / interrupted
+  exit_code INTEGER, pid INTEGER, created_at REAL NOT NULL, approved_at REAL, started_at REAL, finished_at REAL
+);
 -- 视频传到云空间后的链接（按工单 + 内容哈希）：同一个视频再次汇报时复用，不重复上传
 CREATE TABLE IF NOT EXISTS drive_links(
   ticket_id TEXT NOT NULL, sha256 TEXT NOT NULL, url TEXT NOT NULL, created_at REAL NOT NULL,

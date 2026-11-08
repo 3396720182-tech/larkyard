@@ -127,6 +127,8 @@ def compose_card(ticket, grant_paths: List[str], inputs, include_assignment: boo
             continue
         if i["kind"] == "followup":
             parts.append(FOLLOWUP.format(mid=i["source_message_id"], text=i["text"]))
+        elif i["kind"] == "run_result":
+            parts.append(i["text"])  # 自带标题
         else:
             parts.append("## 系统通知（%s）\n%s" % (i["kind"], i["text"]))
     parts.append(REMINDER)

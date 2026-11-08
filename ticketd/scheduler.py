@@ -14,6 +14,9 @@ RECOVERY_TEXT = ("服务重启打断了上一轮。先检查工单目录和已�
 RETRY_TEXT = "上一轮因网络或模型接口临时故障中断，请从中断处继续。"
 STDERR_TAIL = 64 * 1024
 ROUND_MAX_REPORTS = 20  # 一轮最多收这么多份汇报（含 progress），防止 worker 刷屏
+RUN_TAIL_CHARS = 3000   # 沙箱外执行的输出交回 worker 时保留的末尾长度（完整输出在工单目录的日志里）
+RUN_INTERRUPTED_TEXT = ("## 沙箱外执行结果（R%d）\n服务重启打断了这次执行，结果未知：脚本可能执行了一部分。"
+                        "先检查它要做的事（推送、部署、文件）实际到了哪一步，需要的话重新用 --run 申请。")
 
 
 def overlaps(a: str, b: str) -> bool:
@@ -138,10 +141,30 @@ class Running:
         self.api_alerted = False                 # 本轮的模型接口报错已推过提醒
 
 
+class RunProc:
+    """一次正在进行的沙箱外执行（用户批准后由守护进程运行 worker 申请时存下的脚本快照）。"""
+
+    def __init__(self, proc, run_id: int, ticket_id: str, workdir: str, log_path: Path, script_path: Path):
+        self.proc = proc
+        self.run_id = run_id
+        self.ticket_id = ticket_id
+        self.workdir = workdir
+        self.log_path = log_path
+        self.script_path = script_path
+        self.started = time.monotonic()
+        self.term_at: Optional[float] = None
+        self.why: Optional[str] = None
+
+
+def _bash() -> str:
+    return "/bin/bash" if os.path.exists("/bin/bash") else "bash"
+
+
 class Scheduler:
     def __init__(self, con):
         self.con = con
         self.running: Dict[str, Running] = {}
+        self.runs: Dict[str, RunProc] = {}
 
     # ---------- 日志 ----------
     def log(self, workdir: str, line: str) -> None:
@@ -158,6 +181,13 @@ class Scheduler:
 
     # ---------- 生命周期 ----------
     def recover(self) -> None:
+        for run in self.con.execute("SELECT * FROM runs WHERE status='running'").fetchall():
+            if run["pid"] and _pid_matches(run["pid"], ["R%d.sh" % run["id"]]):
+                _signal_group(run["pid"], signal.SIGKILL)
+            with db.tx(self.con):
+                self.con.execute("UPDATE runs SET status='interrupted', finished_at=? WHERE id=?",
+                                 (db.now(), run["id"]))
+                core.add_input(self.con, run["ticket_id"], "run_result", RUN_INTERRUPTED_TEXT % run["id"])
         for t in self.con.execute("SELECT * FROM tickets WHERE state='running'").fetchall():
             if t["pid"] and _pid_matches(t["pid"], executors.get(worker.executor_of(t)).pid_markers(t)):
                 _signal_group(t["pid"], signal.SIGKILL)
@@ -171,6 +201,10 @@ class Scheduler:
         self.con.execute("DELETE FROM locks")
 
     def shutdown(self, wait: float = 10.0) -> None:
+        for rp in self.runs.values():  # 库里仍记为 running，下次启动时按「被打断」交代给 worker
+            if rp.proc.poll() is None:
+                _signal_group(rp.proc, signal.SIGTERM)
+        self.runs.clear()
         for r in self.running.values():
             if r.proc.poll() is None:
                 _signal_group(r.proc, signal.SIGTERM)
@@ -190,6 +224,17 @@ class Scheduler:
                 r = self.running.get(tid)
                 if r is not None:
                     self.log(r.workdir, "监视出错：%r" % e)
+        for tid in list(self.runs):
+            try:
+                self._watch_run(tid)
+            except Exception as e:
+                rp = self.runs.get(tid)
+                if rp is not None:
+                    self.log(rp.workdir, "监视沙箱外执行出错：%r" % e)
+        try:
+            self._launch_runs()
+        except Exception:
+            pass  # 单个申请出错已在 _start_run 里交代；这里只保证不耽误派单
         self._launch()
 
     # ---------- 启动 ----------
@@ -223,6 +268,7 @@ class Scheduler:
                                       (tid,)).fetchall()
             ids = [i["id"] for i in inputs]
             self.con.executemany("UPDATE inputs SET status='delivered' WHERE id=?", [(i,) for i in ids])
+            core.expire_pending_runs(self.con, tid)
             mark = self.con.execute("SELECT COALESCE(MAX(id),0) FROM reports WHERE ticket_id=?", (tid,)).fetchone()[0]
             core.touch(self.con, tid, state="running")
         fds: List[int] = []
@@ -377,6 +423,99 @@ class Scheduler:
                                          templates.stall_message(r.ticket_id, int(quiet // 60), t["last_step"]))
                 self.con.execute("UPDATE tickets SET stall_alerted=1 WHERE id=?", (r.ticket_id,))
             self.log(r.workdir, "疑似卡住：%d 秒没有新动作，%s" % (quiet, "状态卡已标出" if on_card else "已提醒用户"))
+
+    # ---------- 沙箱外执行（只跑用户批准过的脚本快照） ----------
+    def _launch_runs(self) -> None:
+        rows = self.con.execute(
+            "SELECT r.* FROM runs r JOIN tickets t ON t.id=r.ticket_id"
+            " WHERE r.status='approved' AND t.state IN ('idle','failed') ORDER BY r.id").fetchall()
+        for run in rows:
+            tid = run["ticket_id"]
+            if tid not in self.running and tid not in self.runs:
+                self._start_run(run)
+
+    def _start_run(self, run) -> None:
+        tid, rid = run["ticket_id"], run["id"]
+        now = db.now()
+        with db.tx(self.con):
+            t = core.get(self.con, tid)
+            cur = self.con.execute("SELECT status FROM runs WHERE id=?", (rid,)).fetchone()
+            if t["state"] not in ("idle", "failed") or cur is None or cur["status"] != "approved":
+                return
+            self.con.execute("UPDATE runs SET status='running', started_at=? WHERE id=?", (now, rid))
+            # 不改 started_at：这不是新的一轮，状态卡保持上一轮的结果；state=running 挡住同时起 worker
+            core.touch(self.con, tid, state="running", last_step="沙箱外执行 R%d" % rid, last_action_at=now)
+        workdir = t["workdir"]
+        log_path = Path(workdir) / ("沙箱外执行-R%d.log" % rid)
+        fout = None
+        try:
+            d = config.runs_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            os.chmod(str(d), 0o700)
+            script_path = d / ("R%d.sh" % rid)
+            fd = os.open(str(script_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, run["script"].encode("utf-8"))
+            finally:
+                os.close(fd)
+            fout = safefs.open_append(log_path)  # 工单目录对 worker 可写：不跟随链接
+            env = dict(os.environ, TICKETD_TICKET=tid, TICKETD_RUN="R%d" % rid)
+            env.pop("TICKETD_SPOOL", None)
+            proc = subprocess.Popen([_bash(), str(script_path)], cwd=workdir, stdin=subprocess.DEVNULL,
+                                    stdout=fout, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        except Exception as e:
+            with db.tx(self.con):
+                self.con.execute("UPDATE runs SET status='done', exit_code=-1, finished_at=? WHERE id=?",
+                                 (db.now(), rid))
+                core.add_input(self.con, tid, "run_result",
+                               "## 沙箱外执行结果（R%d）\n没能启动：%s。脚本没有执行。" % (rid, e))
+                core.touch_if(self.con, tid, ("running",), state="idle")
+            self.log(workdir, "沙箱外执行 R%d 没能启动：%r" % (rid, e))
+            return
+        finally:
+            if fout is not None:
+                os.close(fout)
+        self.con.execute("UPDATE runs SET pid=? WHERE id=?", (proc.pid, rid))
+        self.runs[tid] = RunProc(proc, rid, tid, workdir, log_path, script_path)
+        self.log(workdir, "沙箱外执行 R%d 开始（用户已批准）：%s" % (rid, run["path"]))
+
+    def _watch_run(self, tid: str) -> None:
+        rp = self.runs[tid]
+        if rp.proc.poll() is None:
+            state = core.get(self.con, tid)["state"]
+            if rp.term_at is None and state in ("stopped", "held"):
+                rp.why = "被用户%s中止" % ("停止" if state == "stopped" else "暂停")
+            elif rp.term_at is None and time.monotonic() - rp.started > config.run_timeout():
+                rp.why = "运行超过 %d 分钟被中止" % int(config.run_timeout() // 60)
+            if rp.why and rp.term_at is None:
+                _signal_group(rp.proc, signal.SIGTERM)
+                rp.term_at = time.monotonic()
+                self.log(rp.workdir, "沙箱外执行 R%d %s" % (rp.run_id, rp.why))
+            elif rp.term_at is not None and time.monotonic() - rp.term_at > 10:
+                _signal_group(rp.proc, signal.SIGKILL)
+            return
+        del self.runs[tid]
+        _signal_group(rp.proc.pid, signal.SIGTERM, fallback=False)  # 脚本留在进程组里的后台进程
+        code = rp.proc.returncode
+        took = time.monotonic() - rp.started
+        tail = _read_from(rp.log_path, 0)
+        if len(tail) > RUN_TAIL_CHARS:
+            tail = "…" + tail[-RUN_TAIL_CHARS:]
+        lines = ["## 沙箱外执行结果（R%d，用户批准后由 ticketd 在沙箱外执行）" % rp.run_id,
+                 "退出码：%s，用时 %s%s" % (code, templates.dur(took), "（%s）" % rp.why if rp.why else ""),
+                 "完整输出：%s" % rp.log_path,
+                 "输出末尾：", "```", tail.rstrip() or "（没有输出）", "```",
+                 "根据结果接着做。还需要在沙箱外做别的事，就再写脚本用 --run 申请。"]
+        with db.tx(self.con):
+            self.con.execute("UPDATE runs SET status='done', exit_code=?, finished_at=? WHERE id=?",
+                             (code, db.now(), rp.run_id))
+            core.add_input(self.con, tid, "run_result", "\n".join(lines))
+            core.touch_if(self.con, tid, ("running",), state="idle", last_action_at=db.now())
+        try:
+            rp.script_path.unlink()
+        except OSError:
+            pass
+        self.log(rp.workdir, "沙箱外执行 R%d 结束：退出码 %s，用时 %.0fs" % (rp.run_id, code, took))
 
     def _schedule_retry(self, r: Running, t, delay: float, **fields) -> None:
         tid = r.ticket_id

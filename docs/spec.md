@@ -191,9 +191,18 @@ ticket report --status ready|blocked|failed|dropped|waiting \
 | `ticket release <id>` | 状态回到 `idle`，加一条 `release` 输入：「用户已放开暂停」，然后投递排队中的输入 |
 | `ticket restart <id>`（**2026-11-07 新增**，issue #14） | 换新会话从头续做：新的 session_id、`session_started=0`，工单号、目录、授权不变；加一条 `fresh` 输入（说明换了会话、先读 `结果.md` / `过程.log`，并附上历次追问，最多最近 10 条），首轮任务卡照常带上原话。运行中或排队中拒绝 |
 | `ticket grant <id> <dir>` | 增加可写目录，加一条 `grant` 输入，重新生成权限配置 |
+| `ticket approve <id>`（**2026-11-07 新增**） | 批准这张单最新一份待批准的沙箱外执行申请（见下面的调整）。工单要在 `idle` / `failed`；没有待批准的申请时报错 |
 | `ticket grant <id> --local-net` / `--socket <路径>`（**2026-11-07 新增**，issue #20） | 文件系统以外的沙箱授权，记在 `net_grants` 表，加一条 `grant` 输入，下一轮生效。`--local-net` → `sandbox.network.allowLocalBinding: true`；`--socket` → `sandbox.network.allowUnixSockets`（路径是链接时连同解析后的路径一起写）。一次只授权一样；只对 Claude 单生效（Codex 沙箱没有对应开关，CLI 会提示） |
 
 只有用户在对话里明确说了，主会话才执行 stop、hold、release、restart 和 grant。
+
+**调整（2026-11-07）沙箱外执行通道**：运行复盘里 55 次 blocked/waiting 有 22 次是 worker 请主会话或用户「在沙箱外替我跑一下」（git push / 开 PR、无头 Chromium 渲染、部署重启），主会话临时代跑，没有记录，也没有限制。现在把它做成一条显式的通道：
+- 申请：worker 把命令写成工单目录里的脚本（≤8KB、UTF-8），`ticket report --status blocked --summary … --run <脚本>`。CLI 在沙箱里读出脚本，连内容一起写进待收件；守护进程收汇报时存进 `runs` 表（`status=pending`，记 `report_id`）。没带 `--ask` 时默认问「要我在沙箱外执行上面这段脚本吗？同意就回复「执行」…」。`--run` 只能配 `blocked`。
+- 展示：结果卡在「👉 需要你」下面放一个默认展开的面板，标题「🖥️ 申请在沙箱外执行（Rn · 路径）」，正文是完整脚本（plain_text，原样含缩进），下面一行说明批准后会发生什么；文字兜底消息里同样带脚本。`ticket show` 显示「沙箱外执行 Rn（路径）：待批准 / 已批准 / 执行中」。
+- 批准：只有用户明确同意时，主会话才执行 `ticket approve <id>`（同 grant）。新的终态汇报把之前没批准的申请标成 `superseded`；worker 开新一轮（用户追问等）时标成 `expired`，用户只能批准最新、仍然有效的那份。
+- 执行：守护进程每个 tick 取 `approved` 且工单在 `idle`/`failed` 的申请，把**数据库里的快照**写到 `~/.ticketd/runs/R<n>.sh`（目录 0700、文件 0600，worker 写不到），`bash` 运行，cwd 为工单目录，环境为守护进程的环境加 `TICKETD_TICKET`、`TICKETD_RUN`，输出写到工单目录的 `沙箱外执行-R<n>.log`。执行期间工单 `state=running`（不改 `started_at`，状态卡保持上一轮的结果），不会同时起 worker；所以批准和执行之间、执行当中都没有 worker 代码在跑，执行的文件就是 worker 汇报时留下的。超过 `TICKETD_RUN_TIMEOUT`（默认 1800 秒）或用户停止 / 暂停时先 SIGTERM、10 秒后 SIGKILL（整个进程组）。
+- 交回：结束后加一条 `run_result` 输入（退出码、用时、是否被中止、完整日志路径、输出末尾 3000 字），工单回到 `idle`，worker 下一轮接着做；被停止 / 暂停的，输入排队到恢复后。快照删掉。服务重启时还在 `running` 的申请标成 `interrupted`（命令行能对上时先杀掉进程组），交代给 worker「结果未知，先核对实际到了哪一步」。
+- 安全边界：这条通道让用户批准过的脚本以用户身份在沙箱外运行，把关只靠用户看过脚本再说「执行」。用户看到的是脚本本身，脚本调用的工单目录里的其他文件不在审批范围内（卡片上写明）；worker 提示词要求脚本里不藏和说明不符的动作、不调用之后还会改的文件。
 
 **调整（2026-11-07，issue #20）沙箱的本机网络和 unix socket 授权**：原来 `grant` 只能给可写目录，worker 连本机数据库、docker.sock、在本机起服务、无头 Chrome（要在系统临时目录里 bind ProcessSingleton 的 socket）都只能报 blocked 让用户自己去终端跑。字段和语义在 Claude Code 2.1.316（macOS）上实测：默认设置下连本机端口、连 unix socket、本机 bind、在临时目录 bind socket 全是 `Operation not permitted`；`allowLocalBinding: true` 后连本机端口和本机 bind 都通（它一次放开 bind/listen、入站和连 `localhost:*` 的所有端口，**不能按端口细分**，所以没有做 `--port`）；`allowUnixSockets` 里的路径（含子路径）下 socket 的连接和 bind 都通（授权 `getconf DARWIN_USER_TEMP_DIR` 后 Chrome 式的 socket bind 能过）。未实测：授权后无头 Chrome 整个能否跑通（测试环境里沙箱外也起不来）、Linux（bubblewrap 下 worker 在独立网络命名空间里，`allowLocalBinding` 是否能连到宿主机 localhost 未知）。
 

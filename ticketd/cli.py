@@ -61,8 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--summary", required=True)
     r.add_argument("--artifact", action="append", default=[])
     r.add_argument("--ask")
+    r.add_argument("--run", help="申请在沙箱外执行的脚本（工单目录里，≤8KB）；只能和 --status blocked 一起用")
 
-    for name in ("stop", "hold", "release", "restart", "show"):
+    for name in ("stop", "hold", "release", "restart", "approve", "show"):
         x = sub.add_parser(name)
         x.add_argument("ticket")
     g = sub.add_parser("grant")
@@ -120,7 +121,8 @@ def cmd_lookup(con, a) -> str:
 def cmd_report(con, a) -> str:
     if not a.ticket:
         raise core.TicketError("缺少 --ticket（或环境变量 TICKETD_TICKET）")
-    core.add_report(con, a.ticket, a.status, a.summary, a.artifact, a.ask)
+    run = core.read_run_script(core.get(con, a.ticket)["workdir"], a.run) if a.run else None
+    core.add_report(con, a.ticket, a.status, a.summary, a.artifact, a.ask, run=run)
     return "已记录 %s 的汇报：%s" % (a.ticket, a.status)
 
 
@@ -200,6 +202,11 @@ def cmd_release(con, a) -> str:
     return "▶️ 已放开 %s" % a.ticket
 
 
+def cmd_approve(con, a) -> str:
+    rid = core.approve(con, a.ticket)
+    return "▶️ 已批准 %s 的沙箱外执行（R%d），马上开始，结果会交给 worker 接着做" % (a.ticket, rid)
+
+
 def cmd_restart(con, a) -> str:
     core.restart(con, a.ticket)
     return "🔄 %s 换了新会话重新接着做（原话和历次追问已带上，工单目录不变）" % a.ticket
@@ -271,6 +278,12 @@ def _status_lines(con, t) -> list:
                 templates.hm(v["last_action_at"]), templates.ago(now - v["last_action_at"]), v["last_step"] or "—"))
         if v["bg_wait"]:
             out.append("本轮已结束，等后台任务：%s（结束后 worker 会自动接着做）" % v["bg_wait"])
+    run = con.execute("SELECT * FROM runs WHERE ticket_id=? AND status IN ('pending','approved','running')"
+                      " ORDER BY id DESC LIMIT 1", (t["id"],)).fetchone()
+    if run is not None:
+        what = {"pending": "待批准（用户明确同意后执行 `ticket approve %s`）" % t["id"],
+                "approved": "已批准，马上执行", "running": "执行中"}[run["status"]]
+        out.append("沙箱外执行 R%d（%s）：%s" % (run["id"], run["path"], what))
     return out
 
 
@@ -291,7 +304,7 @@ def cmd_show(con, a) -> str:
 
 COMMANDS = {
     "new": cmd_new, "send": cmd_send, "lookup": cmd_lookup, "report": cmd_report,
-    "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "restart": cmd_restart, "grant": cmd_grant,
+    "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "restart": cmd_restart, "approve": cmd_approve, "grant": cmd_grant,
     "ls": cmd_ls, "show": cmd_show,
 }
 
@@ -303,10 +316,15 @@ def main(argv=None) -> int:
     try:
         if args.cmd == "report" and spool:
             # worker 沙箱内：只写工单目录下的待收件，绝不打开数据库
+            workdir = os.path.dirname(spool.rstrip("/"))
             if args.status != "progress":
-                core.check_media_artifacts(os.path.dirname(spool.rstrip("/")), args.artifact)
-            core.write_spool(spool, args.status, args.summary, args.artifact, args.ask)
+                core.check_media_artifacts(workdir, args.artifact)
+            run = core.read_run_script(workdir, args.run) if args.run else None
+            core.write_spool(spool, args.status, args.summary, args.artifact, args.ask, run)
             print("已记录汇报：%s" % args.status)
+            if run:
+                print("沙箱外执行的申请已登记（%s）。现在结束本轮：用户批准后 ticketd 会执行它，"
+                      "退出码和输出会作为下一轮的输入交给你。" % run["path"])
             return 0
         con = db.connect()
         out = COMMANDS[args.cmd](con, args)
