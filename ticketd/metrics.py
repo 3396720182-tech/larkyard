@@ -148,9 +148,10 @@ def stats(con, days: float = 7, now: Optional[float] = None) -> str:
                                             time.strftime("%m-%d", time.localtime(now)))
     lines = [head]
     new = q("SELECT COUNT(*) n FROM tickets WHERE created_at>=?", since)[0]["n"]
-    r = q("SELECT COUNT(*) n, COALESCE(SUM(cost_usd),0) c FROM rounds WHERE ended_at>=? AND outcome<>'backfill'",
+    r = q("SELECT COUNT(*) n, COALESCE(SUM(cost_usd),0) c, SUM(outcome='backfill') b FROM rounds WHERE ended_at>=?",
           since)[0]
-    lines.append("工单：新开 %d 张，跑了 %d 轮，worker 成本约 %s" % (new, r["n"], _usd(r["c"])))
+    lines.append("工单：新开 %d 张，跑了 %d 轮，worker 成本约 %s%s" % (
+        new, r["n"], _usd(r["c"]), "（其中 %d 轮是从老工单补算的，没有结果记录）" % r["b"] if r["b"] else ""))
     outs = q("SELECT outcome, COUNT(*) n FROM rounds WHERE ended_at>=? AND outcome<>'backfill'"
              " GROUP BY outcome ORDER BY n DESC", since)
     if outs:
@@ -158,7 +159,7 @@ def stats(con, days: float = 7, now: Optional[float] = None) -> str:
                      idle="空闲", running="运行中")
         lines.append("每轮结果：" + "，".join("%s %d" % (names.get(o["outcome"], o["outcome"]), o["n"]) for o in outs))
     top = q("SELECT r.ticket_id, SUM(r.cost_usd) c, t.title FROM rounds r JOIN tickets t ON t.id=r.ticket_id"
-            " WHERE r.ended_at>=? AND r.outcome<>'backfill' GROUP BY r.ticket_id ORDER BY c DESC LIMIT 3", since)
+            " WHERE r.ended_at>=? GROUP BY r.ticket_id ORDER BY c DESC LIMIT 3", since)
     if top and top[0]["c"] > 0:
         lines.append("最花钱：" + "，".join("%s「%s」%s" % (x["ticket_id"], templates.short(x["title"], 12), _usd(x["c"]))
                                          for x in top if x["c"] > 0))

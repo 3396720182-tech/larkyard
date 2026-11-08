@@ -134,6 +134,8 @@ class StatsTest(TicketdTestCase):
         self.assertEqual(self.metrics.backfill_costs(self.con), 1)
         self.assertAlmostEqual(self.core.get(self.con, tid)["cost_usd"], 5.0)
         self.assertEqual(self.metrics.backfill_costs(self.con), 0)  # 可重复执行
+        text = self.metrics.stats(self.con, 7, time.time())
+        self.assertIn("跑了 4 轮，worker 成本约 $5.00（其中 4 轮是从老工单补算的", text)
 
 
 class DigestTest(TicketdTestCase):
