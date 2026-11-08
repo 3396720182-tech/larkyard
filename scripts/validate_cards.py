@@ -44,6 +44,15 @@ def samples():
                           ("failed", None, []), ("waiting", None, []), ("dropped", "不属于本单", [])):
         out.append(("结果卡 " + st, templates.result_card(tid, t()["title"], wd, st, "一句话结果\n第二行", arts, ask,
                                                      ["读代码", "写代码"], 600)))
+    # 沙箱外执行申请：脚本放在默认展开的面板里（画廊卡里是同一个组件）
+    run = {"id": 1, "path": "推送.sh", "timeout": 1800,
+           "script": "#!/bin/bash\n# 推送分支并开 PR\nset -e\ncd ~/Projects/x\n  git push -u origin fix/a\n"}
+    out.append(("结果卡 申请执行", templates.result_card(tid, t()["title"], wd, "blocked", "改好了，要推送",
+                                                    [wd + "/结果.md"], core.RUN_DEFAULT_ASK, ["写代码"], 600, run=run)))
+    # 状态卡：本轮已结束、在等后台任务
+    con.execute("UPDATE tickets SET bg_wait='后台批量出镜头', last_step='后台批量出镜头' WHERE id=?", (tid,))
+    out.append(("等后台任务", card.render(t(), card.view(con, t(), now + 3600), [], now + 3600)))
+    con.execute("UPDATE tickets SET bg_wait=NULL WHERE id=?", (tid,))
     # 画廊卡（T0010）：都走 result_card + 发件箱真实的视频/图片替换流程，上传器用桩（不传云空间）。
     # 含 img 的卡要真实存在的 img_key：--with-images 时先传两张小图（1x1、9x16）拿 key。
     out += _gallery_samples(tid, t()["title"], wd, "--with-images" in sys.argv)
