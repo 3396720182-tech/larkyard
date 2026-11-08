@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -36,6 +37,11 @@ CREATE TABLE IF NOT EXISTS published(
 CREATE TABLE IF NOT EXISTS doc_targets(
   ticket_id TEXT NOT NULL, path TEXT NOT NULL, url TEXT NOT NULL, created_at REAL NOT NULL,
   PRIMARY KEY(ticket_id, path)
+);
+-- 导入失败的稿子（按文件版本记）：发结果时在卡片上写一行原因，用户知道为什么没有「打开」按钮（issue #12）
+CREATE TABLE IF NOT EXISTS doc_failures(
+  path TEXT NOT NULL, mtime REAL NOT NULL, size INTEGER NOT NULL, reason TEXT NOT NULL, created_at REAL NOT NULL,
+  PRIMARY KEY(path, mtime, size)
 );
 """
 
@@ -111,6 +117,37 @@ def _error_text(data: dict, raw: str) -> str:
     return (raw or "").strip()[:300]
 
 
+def reason_text(err: str) -> str:
+    """给用户看的失败原因：lark-cli 报错 JSON 里的 message，否则原文；不超过 80 字。"""
+    m = re.search(r'"message":\s*"((?:[^"\\]|\\.)*)"', err or "")
+    text = m.group(1) if m else (err or "未知原因")
+    if "调用 lark-cli 失败" in (err or ""):
+        text = "调用 lark-cli 失败（网络或超时）"
+    text = " ".join(text.split())
+    return text if len(text) <= 80 else text[:80] + "…"
+
+
+def failures(con, ticket_id: str, workdir: str, artifacts: List[str]) -> List[Tuple[str, str, str]]:
+    """这份结果里没能导入的稿子：[(文件名, 本机路径, 原因)]。只认当前这个文件版本的失败记录，导入成功过的不算。
+    只读：表还没建（从没导入失败过）时当作没有记录，不在这里建表（库写不进去时也要能发结果）。"""
+    out = []
+    for p in candidates(con, ticket_id, workdir, artifacts):
+        try:
+            st, url = _cached(con, p)
+            row = None if url else con.execute(
+                "SELECT reason FROM doc_failures WHERE path=? AND mtime=? AND size=?",
+                (str(p), st.st_mtime, st.st_size)).fetchone()
+        except OSError:
+            continue
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e):
+                return []
+            raise
+        if row:
+            out.append((p.name, str(p), row["reason"]))
+    return out
+
+
 def _cached(con, p: Path):
     st = p.stat()
     row = con.execute("SELECT url FROM published WHERE path=? AND mtime=? AND size=?",
@@ -161,6 +198,8 @@ def doc_links(con, ticket_id: str, workdir: str, artifacts: List[str],
                 url = _import(p, name)
             except RuntimeError as e:
                 outbox.alert("%s 稿子导入云文档失败（%s）：%s" % (ticket_id, p.name, e))
+                con.execute("INSERT OR REPLACE INTO doc_failures VALUES(?,?,?,?,?)",
+                            (str(p), st.st_mtime, st.st_size, reason_text(str(e)), db.now()))
                 continue
             con.execute("INSERT OR REPLACE INTO doc_targets VALUES(?,?,?,?)", (ticket_id, str(p), url, db.now()))
         con.execute("INSERT OR REPLACE INTO published VALUES(?,?,?,?,?)",

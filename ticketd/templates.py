@@ -305,6 +305,18 @@ def with_doc_links(card: dict, links: List[tuple]) -> dict:
     return card
 
 
+def with_doc_failures(card: dict, fails: List[tuple], workdir: Optional[str] = None) -> dict:
+    """稿子没能导入云文档时，在稿子按钮的位置写一行灰字说明原因和本机路径（issue #12）。"""
+    if not fails:
+        return card
+    lines = ["📄 %s 没能导入云文档：%s。本机文件：%s" % (short(name, 30), short(reason, 80), short(nice_path(path, workdir), 80))
+             for name, path, reason in fails]
+    els = card["body"]["elements"]
+    at = next((i for i, e in enumerate(els) if e.get("tag") in ("collapsible_panel", "hr")), max(len(els) - 1, 0))
+    els[at:at] = [note("\n".join(lines))]
+    return card
+
+
 def result_card(ticket_id: str, title: str, workdir: Optional[str], status: str, summary: str,
                 artifacts: List[str], ask: Optional[str], phases: List[str],
                 elapsed: Optional[float], run: Optional[dict] = None) -> dict:

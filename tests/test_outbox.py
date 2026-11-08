@@ -288,6 +288,26 @@ class OutboxTest(TicketdTestCase):
         self.assertEqual(len(imports), 2)
         self.assertIn("（", imports[1][imports[1].index("--name") + 1])
 
+    def test_doc_import_failure_explained_on_card(self):  # issue #12
+        tid = self.new_ticket()
+        self._ready_with(tid, "稿子.md")
+        fail = self.tmp / "fail"
+        fail.write_text("1")
+        os.environ["FAKE_LARK_FAIL_FILE"] = str(fail)
+        os.environ["FAKE_LARK_PERMANENT"] = "1"
+        self.outbox.flush(self.con)
+        sent = " ".join(self.sent()[-1])
+        self.assertIn("稿子.md 没能导入云文档：boom", sent)
+        self.assertIn("本机文件：稿子.md", sent)
+        # 文件改过之后旧的失败记录不再算数
+        wd = self.core.get(self.con, tid)["workdir"]
+        p = os.path.join(wd, "稿子.md")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("# 第二版")
+        os.utime(p, (time.time() + 5, time.time() + 5))
+        from ticketd import publish
+        self.assertEqual(publish.failures(self.con, tid, wd, [p]), [])
+
     def test_doc_import_failure_still_delivers_result(self):
         tid = self.new_ticket()
         self._ready_with(tid, "稿子.md")

@@ -597,6 +597,11 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None,
     if links:  # 稿子按钮每次按缓存现加，不写回发件箱
         card = templates.with_doc_links(card, links)
         text += "".join("\n📄 %s：%s" % (name, url) for name, url in links)
+    fails = _doc_failures(con, r)
+    if fails:  # 导入失败的稿子：卡片上写一行原因，不让用户对着「没有按钮」猜
+        src = _doc_sources(con, r)
+        card = templates.with_doc_failures(card, fails, src[0] if src else None)
+        text += "".join("\n📄 %s 没能导入云文档：%s" % (name, reason) for name, _, reason in fails)
     if r["report_id"] is not None:
         from . import card as status_card  # card 依赖本模块的发送函数
         res = status_card.deliver(con, r["ticket_id"], card, patch=card_patcher)
@@ -644,6 +649,20 @@ def _doc_links(con, r, allow_import: bool = True) -> list:
         raise  # 库的问题交给 flush 分类（锁等待退避 / 故障告警），不当成导入失败吞掉
     except Exception as e:  # 导入是锦上添花：任何意外都不能挡住结果送达
         alert("%s 稿子链接生成异常：%r" % (r["ticket_id"], e))
+        return []
+
+
+def _doc_failures(con, r) -> list:
+    src = _doc_sources(con, r)
+    if src is None:
+        return []
+    from . import publish
+    try:
+        return publish.failures(con, r["ticket_id"], src[0], src[1])
+    except sqlite3.OperationalError:
+        raise
+    except Exception as e:
+        alert("%s 稿子失败原因读取异常：%r" % (r["ticket_id"], e))
         return []
 
 
