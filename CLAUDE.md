@@ -19,6 +19,7 @@
 1. 先读 `docs/spec.md` 对应章节，再读代码。
 2. 小步改，测试跟着改：`/usr/bin/python3 -m unittest discover -s tests`。6 个查看真实进程的孤儿清理用例（macOS 用 `ps`，Linux 读 `/proc`）在禁止这样做的沙箱里会失败，属环境限制，不要为此改代码。CI（`.github/workflows/tests.yml`）在 ubuntu-latest 和 macos-latest 上各跑一遍全部单测。
 3. 改了卡片结构，跑 `/usr/bin/python3 scripts/validate_cards.py`（会调飞书 cardkit 校验，不发消息；离线时用 `--dump`）。
+   改了调度、沙箱、沙箱外执行或卡住处置，或者升级了 Claude Code，跑 `/usr/bin/python3 scripts/selftest.py`（真实 claude + 真实沙箱，不碰飞书，几分钟、几美分）。
 4. 新增配置项：加在 `ticketd/config.py`（经 `_env` 读取，自动支持 `config.env`），同步 `config.example.env` 和 README 的配置表。
 5. 用户可见的变化记到 `CHANGELOG.md`。
 

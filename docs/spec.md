@@ -323,6 +323,7 @@ ticket report --status ready|blocked|failed|dropped|waiting \
   - stream-json 的格式能否解析。
 - **V2 单元测试**（`python3 -m unittest`）：用一个假 claude 脚本代替真 worker，覆盖排队、并发上限、项目锁、汇报转消息、发件箱顺序和重试、超时、重启恢复、hold 和 release、stop 之后拒绝续做。
 - **V3 端到端**：真派一张小单（在工单目录写一个文件），走完 确认 → 结果推送 → 引用追问 → 续做 → stop。
+- **V4 自检（2026-11-08 新增）**：`scripts/selftest.py` 在临时目录里起调度器，用真实的 claude（默认 haiku）和真实的沙箱跑四组检查，飞书一侧换成假 lark-cli、不发消息：① 沙箱语义（默认拒绝连本机端口、连 / bind unix socket、本机 bind；`allowLocalBinding`、`allowUnixSockets` 分别放开对应的项）；② 普通工单跑完一轮、成本落库；③ 沙箱外执行：申请 → 批准 → 执行 → 输出交回 worker → ready；④ 卡住处置：前台挂住的命令被结束，worker 收到报错后自己汇报。首次运行（2026-11-08，Claude Code 2.1.316）9 项全过，worker 成本约 $0.02。升级 Claude Code 之后先跑这个，替代 §6 的手工复核。
 
 ## 10. 上线与回滚
 
