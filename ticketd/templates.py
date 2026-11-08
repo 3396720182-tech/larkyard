@@ -317,6 +317,14 @@ def with_doc_failures(card: dict, fails: List[tuple], workdir: Optional[str] = N
     return card
 
 
+def cost_hint(ticket_id: str, session_cost: float, threshold: float) -> Optional[str]:
+    """会话很长时的成本提示（T0005：一张单 $88，后期每次追问 $5～8，因为每轮都按整段上下文计费）。"""
+    if not threshold or session_cost < threshold:
+        return None
+    return ("💰 这张单的会话已累计约 $%.0f，之后每次追问都按整段上下文计费。换了目标就开新单；"
+            "同一件事要接着做，可以说「换新会话重来 %s」（工单目录和历次追问会带上）" % (session_cost, ticket_id))
+
+
 def result_card(ticket_id: str, title: str, workdir: Optional[str], status: str, summary: str,
                 artifacts: List[str], ask: Optional[str], phases: List[str],
                 elapsed: Optional[float], run: Optional[dict] = None) -> dict:

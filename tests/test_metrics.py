@@ -159,3 +159,33 @@ class DigestTest(TicketdTestCase):
         os.environ["TICKETD_DIGEST"] = ""
         self.assertFalse(self.metrics.maybe_digest(self.con, time.time()))
         self.assertEqual(self.sent(), 0)
+
+
+class CostHintTest(TicketdTestCase):
+    def setUp(self):
+        super().setUp()
+        from ticketd import core
+        self.core = core
+
+    def last(self):
+        return self.con.execute("SELECT text, card_json FROM outbox ORDER BY id DESC LIMIT 1").fetchone()
+
+    def test_long_session_gets_hint_on_result(self):
+        tid = self.new_ticket()
+        self.con.execute("UPDATE tickets SET session_cost=88 WHERE id=?", (tid,))
+        self.core.add_report(self.con, tid, "ready", "好了")
+        row = self.last()
+        self.assertIn("会话已累计约 $88", row["card_json"])
+        self.assertIn("换新会话重来 %s" % tid, row["card_json"])
+        self.assertIn("会话已累计约 $88", row["text"])
+        card = json.loads(row["card_json"])
+        self.assertIn("引用此卡可追问", json.dumps(card["body"]["elements"][-1], ensure_ascii=False))  # 页脚仍在最后
+
+    def test_short_session_or_dropped_no_hint(self):
+        tid = self.new_ticket()
+        self.con.execute("UPDATE tickets SET session_cost=5 WHERE id=?", (tid,))
+        self.core.add_report(self.con, tid, "ready", "好了")
+        self.assertNotIn("会话已累计", self.last()["card_json"])
+        self.con.execute("UPDATE tickets SET session_cost=88 WHERE id=?", (tid,))
+        self.core.add_report(self.con, tid, "dropped", "不属于本单", ask="另一个目标")
+        self.assertNotIn("会话已累计", self.last()["card_json"] or "")

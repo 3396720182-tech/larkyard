@@ -2,6 +2,7 @@
 
 ## 0.2.0 — 未发布
 
+- 长会话成本提示：一张单的会话累计成本超过 `TICKETD_COST_HINT_USD`（默认 $30）时，结果卡上提示后续追问每轮都按整段上下文计费，建议换目标就开新单、或换新会话重来。worker 遇到把工单带向另一个目标的追问会报「不属于本单」。
 - 运营指标：worker 成本按轮落库（`ticket ls` / `show` 显示每张单花了多少）；关键事件（卡住、中断、故障等待、沙箱外执行、没送达……）落库；新命令 `ticket stats` 给出最近几天的概况，`--backfill` 补老工单的成本；结果没送达、媒体任务卡住时私信主用户（原来只写本机日志）；每周一 10:00 私信一份运行概况。新配置项 `TICKETD_DIGEST`、`TICKETD_COST_HINT_USD`，新表 `rounds`、`events`、`kv`。
 - 卡住分级处置（#16）：没有动作满 30 分钟、且这次命令的进程没在消耗 CPU，ticketd 结束这条命令，worker 收到报错后接着做或汇报（会话和上下文都在）；满 60 分钟仍没进展就中止这一轮、报「需要你决定」，回复「继续」用同一个会话接着做。还在消耗 CPU 的慢命令、等后台任务的都不算卡住。新配置项 `TICKETD_STALL_INTERRUPT`、`TICKETD_STALL_ABORT`。
 - worker 的补充环境（#19）：新配置项 `TICKETD_WORKER_PATH`（追加到 PATH）和 `TICKETD_WORKER_ENV`（变量名白名单，值从 `config.env` 取），worker 和沙箱外执行的脚本都生效；`ticket show` 显示 worker 实际的 PATH。代理变量到不了沙箱里的命令（Claude Code 沙箱用自己的代理）。

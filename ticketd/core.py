@@ -359,6 +359,10 @@ def add_report(con: sqlite3.Connection, ticket_id: str, status: str, summary: st
             card = templates.result_card(
                 ticket_id, t["title"], t["workdir"], status, summary, arts, ask,
                 phases(con, ticket_id, started or now), now - started if started else None, run=run)
+            hint = templates.cost_hint(ticket_id, t["session_cost"] or 0, config.cost_hint_usd())
+            if hint and status != "dropped":
+                card["body"]["elements"].insert(len(card["body"]["elements"]) - 1, templates.note(hint))
+                msg += "\n" + hint
         # 视频产物在发件箱发卡时处理：传云空间成功就放进卡片里，失败才另排一条视频消息（outbox.resolve_card_videos）
         enqueue_message(con, ticket_id, msg, card=card, report_id=rid)
 

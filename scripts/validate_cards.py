@@ -64,6 +64,9 @@ def samples():
     out.append(("结果卡 稿子导入失败", templates.with_doc_failures(
         templates.result_card(tid, t()["title"], wd, "ready", "一句话结果", [wd + "/稿子.md"], None, ["读代码"], 600),
         [("稿子.md", wd + "/稿子.md", "strict mode: user identity disabled")], wd)))
+    c = templates.result_card(tid, t()["title"], wd, "ready", "一句话结果", [wd + "/结果.md"], None, ["读代码"], 600)
+    c["body"]["elements"].insert(len(c["body"]["elements"]) - 1, templates.note(templates.cost_hint(tid, 88, 30)))
+    out.append(("结果卡 成本提示", c))
     out.append(("收起", card.render(t(), card.view(con, t(), now), [], now)))
     con.execute("UPDATE outbox SET status='dead'")
     out.append(("终态直写", card.render(t(), card.view(con, t(), now), [], now)))
