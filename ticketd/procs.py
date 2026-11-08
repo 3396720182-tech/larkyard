@@ -1,6 +1,6 @@
 """查看 worker 进程：重启恢复时核对 pid、收割后清理残留进程。
 
-调度器只调这里的四个函数，不直接跑 ps / lsof。
+调度器只调这里的函数，不直接跑 ps / lsof。
 - macOS：ps 和 lsof。
 - Linux（含 WSL2）：直接读 /proc，不依赖 ps / lsof（精简系统上常常没装 lsof）。
 """
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from . import host
 
@@ -92,6 +92,72 @@ def cwd_within(pids: Iterable[int], workdir: str) -> Set[int]:
 
 
 # ---------- macOS ----------
+def tree(root: int) -> List[Tuple[int, float, float]]:
+    """root 的所有后代进程（不含 root）：[(pid, 已运行秒数, 累计 CPU 秒数)]。卡住处置用它找出当前这次工具调用起的
+    进程、判断它们还在不在干活。拿不到返回空列表，永不抛异常。"""
+    try:
+        table = _linux_table() if host.is_linux() else _darwin_table()
+    except Exception:
+        return []
+    kids: Dict[int, List[int]] = {}
+    for pid, (ppid, _, _) in table.items():
+        kids.setdefault(ppid, []).append(pid)
+    out, stack, seen = [], [root], {root}
+    while stack:
+        for pid in kids.get(stack.pop(), []):
+            if pid not in seen:
+                seen.add(pid)
+                stack.append(pid)
+                out.append((pid, table[pid][1], table[pid][2]))
+    return out
+
+
+def _clock_seconds(text: str) -> float:
+    """ps 的 etime / time 格式：[[dd-]hh:]mm:ss[.cc] → 秒。"""
+    days = 0
+    if "-" in text:
+        d, text = text.split("-", 1)
+        days = int(d)
+    total = 0.0
+    for part in text.split(":"):
+        total = total * 60 + float(part)
+    return days * 86400 + total
+
+
+def _darwin_table() -> Dict[int, Tuple[int, float, float]]:
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,etime=,time="], capture_output=True, text=True,
+                         timeout=10).stdout
+    table = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or not parts[0].isdigit():
+            continue
+        try:
+            table[int(parts[0])] = (int(parts[1]), _clock_seconds(parts[2]), _clock_seconds(parts[3]))
+        except ValueError:
+            continue
+    return table
+
+
+def _linux_table() -> Dict[int, Tuple[int, float, float]]:
+    """/proc/<pid>/stat：ppid 是 ')' 之后第 2 个字段，utime / stime / starttime 是第 12、13、20 个（单位是时钟滴答）。"""
+    hz = float(os.sysconf("SC_CLK_TCK")) if hasattr(os, "sysconf") else 100.0
+    with open("%s/uptime" % PROC, "rb") as f:
+        uptime = float(f.read().split()[0])
+    table = {}
+    for name in os.listdir(PROC):
+        if not name.isdigit():
+            continue
+        try:
+            data = _proc_read(int(name), "stat")
+            fields = data[data.rfind(b")") + 1:].split()
+            table[int(name)] = (int(fields[1]), max(0.0, uptime - int(fields[19]) / hz),
+                                (int(fields[11]) + int(fields[12])) / hz)
+        except (OSError, ValueError, IndexError):
+            continue
+    return table
+
+
 def _utf8_env() -> dict:
     # 非 UTF-8 locale 下 ps / lsof 会把中文路径转义成 M-eM-7… / \xe5…，导致一个都匹配不上
     return dict(os.environ, LC_ALL="en_US.UTF-8")

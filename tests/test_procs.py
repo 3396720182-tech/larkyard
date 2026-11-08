@@ -21,11 +21,14 @@ class FakeProc:
         (root / "self").mkdir()  # 非数字条目要跳过
         (root / "uptime").write_text("1 1")
 
-    def add(self, pid, ppid=1, state="S", tty=0, comm="sleep", argv=("sleep", "60"), env=(), cwd=None):
+    def add(self, pid, ppid=1, state="S", tty=0, comm="sleep", argv=("sleep", "60"), env=(), cwd=None,
+            utime=0, stime=0, start=0):
         d = self.root / str(pid)
         d.mkdir()
-        (d / "stat").write_bytes(("%d (%s) %s %d %d %d %d -1 4194560 0 0" % (
-            pid, comm, state, ppid, pid, pid, tty)).encode("utf-8"))
+        # 真实 stat 的字段顺序：pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt
+        # utime stime cutime cstime priority nice num_threads itrealvalue starttime …（时间单位是时钟滴答）
+        (d / "stat").write_bytes(("%d (%s) %s %d %d %d %d -1 4194560 0 0 0 0 %d %d 0 0 20 0 1 0 %d 0 0" % (
+            pid, comm, state, ppid, pid, pid, tty, utime, stime, start)).encode("utf-8"))
         (d / "cmdline").write_bytes(b"\0".join(os.fsencode(a) for a in argv) + b"\0")
         (d / "environ").write_bytes(b"".join(os.fsencode(e) + b"\0" for e in env))
         if cwd is not None:
@@ -149,9 +152,22 @@ class LinuxProcsTest(TicketdTestCase):
             self.assertEqual(scheduler._sweep_orphans(spool, 15), 2)
         self.assertEqual({c.args for c in kill.call_args_list}, {(marked, 15), (stray, 15)})
 
+    def test_tree_reads_age_and_cpu(self):  # issue #16
+        hz = float(os.sysconf("SC_CLK_TCK"))
+        (self.fake.root / "uptime").write_text("1000.0 50.0")
+        self.fake.add(100, ppid=1, comm="claude")
+        self.fake.add(101, ppid=100, comm="zsh", utime=int(2 * hz), stime=int(1 * hz), start=int(990 * hz))
+        self.fake.add(102, ppid=101, comm="ls", start=int(995 * hz))
+        self.fake.add(103, ppid=1, comm="other")
+        got = {pid: (round(age), round(cpu)) for pid, age, cpu in self.procs.tree(100)}
+        self.assertEqual(got, {101: (10, 3), 102: (5, 0)})
+        self.assertEqual(self.procs.tree(4242), [])
+
 
 def _ps_result(stdout):
     return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+
 
 
 class DarwinProcsTest(unittest.TestCase):
@@ -194,6 +210,19 @@ class DarwinProcsTest(unittest.TestCase):
         self.assertEqual(found, {100, 102})
         self.assertEqual(run.call_args.args[0][0], "/usr/sbin/lsof")
         self.assertIn("100,101,102", run.call_args.args[0])
+
+    def test_tree_parses_ps_times(self):  # issue #16
+        out = "\n".join([
+            "  100     1    01:02:03     0:01.50",
+            "  101   100       00:10     0:03.25",
+            "  102   101 1-00:00:05  1:02:03.00",
+            "  103     1       00:01     0:00.00",
+            "garbage",
+        ])
+        with self.run_with(out) as run:
+            got = {pid: (age, cpu) for pid, age, cpu in self.procs.tree(100)}
+        self.assertEqual(got, {101: (10.0, 3.25), 102: (86405.0, 3723.0)})
+        self.assertEqual(run.call_args.args[0][:3], ["ps", "-A", "-o"])
 
     def test_is_gone_and_command_line(self):
         with self.run_with("Ss\n"):
