@@ -2,6 +2,7 @@
 
 ## 0.2.0 — 未发布
 
+- 卡住分级处置（#16）：没有动作满 30 分钟、且这次命令的进程没在消耗 CPU，ticketd 结束这条命令，worker 收到报错后接着做或汇报（会话和上下文都在）；满 60 分钟仍没进展就中止这一轮、报「需要你决定」，回复「继续」用同一个会话接着做。还在消耗 CPU 的慢命令、等后台任务的都不算卡住。新配置项 `TICKETD_STALL_INTERRUPT`、`TICKETD_STALL_ABORT`。
 - worker 的补充环境（#19）：新配置项 `TICKETD_WORKER_PATH`（追加到 PATH）和 `TICKETD_WORKER_ENV`（变量名白名单，值从 `config.env` 取），worker 和沙箱外执行的脚本都生效；`ticket show` 显示 worker 实际的 PATH。代理变量到不了沙箱里的命令（Claude Code 沙箱用自己的代理）。
 - 稿子导入云文档失败时，结果卡上写一行原因和本机路径，不再只是少一个按钮、什么也不说（#12）。
 - 沙箱外执行通道：worker 遇到沙箱里做不了的步骤（推送、开 PR、部署重启等），把命令写成脚本，用 `ticket report --status blocked --run <脚本>` 申请；结果卡上显示完整脚本，你回复「执行」后主会话执行 `ticket approve`，ticketd 在工单目录里、沙箱外运行汇报时存下的脚本快照，退出码和输出交回 worker 接着做。原来这类事要主会话或你手动在终端里跑。新命令 `ticket approve`，新配置项 `TICKETD_RUN_TIMEOUT`，新表 `runs`。

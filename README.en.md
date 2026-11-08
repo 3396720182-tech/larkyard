@@ -181,6 +181,8 @@ Everything lives in `~/.ticketd/config.env` (environment variables of the same n
 | `TICKETD_WORKER_PATH` | empty | Directories appended to the PATH of workers and out-of-sandbox scripts (colon-separated). The service's PATH is shorter than a login shell's; tools in `/opt/homebrew/bin` or Docker.app go here |
 | `TICKETD_WORKER_ENV` | empty | Allowlist of variable names (comma-separated) whose values, taken from `config.env` or the service environment, are passed to workers and out-of-sandbox scripts, e.g. `NPM_CONFIG_REGISTRY` |
 | `TICKETD_RUN_TIMEOUT` | `1800` | Longest run for an approved out-of-sandbox script (seconds); stopped when exceeded |
+| `TICKETD_STALL_INTERRUPT` | `1800` | Stall handling: after this many seconds without an action, if the current command's processes are not using CPU, end that command (the worker gets a tool error and carries on); `0` turns it off |
+| `TICKETD_STALL_ABORT` | `3600` | Still no progress after this many seconds: stop the round and report blocked (the session is kept; reply "继续" to continue); `0` turns it off |
 | `TICKETD_OUTAGE_RETRY_EVERY` | `900` | While waiting out an outage, how often to resume automatically (seconds): network or API failures after the short retries, insufficient balance, authentication failures |
 | `TICKETD_OUTAGE_RETRY_HOURS` | `24` | How long to keep waiting out an outage before marking the ticket failed (hours); `0` fails right away |
 | `TICKETD_MODEL` | empty | Model for Claude Code workers; empty means Claude Code's default |

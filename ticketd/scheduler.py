@@ -14,6 +14,8 @@ RECOVERY_TEXT = ("服务重启打断了上一轮。先检查工单目录和已�
 RETRY_TEXT = "上一轮因网络或模型接口临时故障中断，请从中断处继续。"
 STDERR_TAIL = 64 * 1024
 ROUND_MAX_REPORTS = 20  # 一轮最多收这么多份汇报（含 progress），防止 worker 刷屏
+STALL_SAMPLE = 30.0     # 疑似卡住之后，每隔多少秒看一次这次工具调用起的进程有没有在消耗 CPU
+STALL_CPU_SHARE = 0.03  # 两次采样之间这些进程至少用了 3% 的单核 CPU，就算还在干活（30 秒采样约 0.9 秒）
 RUN_TAIL_CHARS = 3000   # 沙箱外执行的输出交回 worker 时保留的末尾长度（完整输出在工单目录的日志里）
 RUN_INTERRUPTED_TEXT = ("## 沙箱外执行结果（R%d）\n服务重启打断了这次执行，结果未知：脚本可能执行了一部分。"
                         "先检查它要做的事（推送、部署、文件）实际到了哪一步，需要的话重新用 --run 申请。")
@@ -139,6 +141,14 @@ class Running:
         self.bg: Dict[str, str] = {}             # 还没结束的后台任务：task_id → 描述
         self.bg_shown: Optional[str] = None      # 已写进 tickets.bg_wait 的内容
         self.api_alerted = False                 # 本轮的模型接口报错已推过提醒
+        # 卡住分级处置（issue #16）
+        self.tool_started: Optional[float] = None  # 最近一次工具调用（含子代理）的墙钟时间
+        self.cpu_last: Optional[float] = None      # 上次采样时这次工具调用起的进程累计 CPU 秒数
+        self.cpu_sampled = 0.0                     # 上次采样的 monotonic 时间
+        self.flat_since: Optional[float] = None    # CPU 从什么时候起不再增长（monotonic）
+        self.busy_logged = False
+        self.interrupted = False
+        self.stall_aborted = False
 
 
 class RunProc:
@@ -333,6 +343,10 @@ class Scheduler:
         if worker.is_action(ev):
             r.last_action_at = db.now()
             r.activity_dirty = r.action_moved = True
+            r.cpu_last = r.flat_since = None  # 有了新动作：卡住处置从头算
+            r.busy_logged = r.interrupted = False
+        if worker.last_step(ev):
+            r.tool_started = time.time()
         if ev.get("type") == "system" and ev.get("subtype") == "init":
             sid = ev.get("session_id")
             if isinstance(sid, str) and sid and sid != r.session_id:
@@ -423,6 +437,52 @@ class Scheduler:
                                          templates.stall_message(r.ticket_id, int(quiet // 60), t["last_step"]))
                 self.con.execute("UPDATE tickets SET stall_alerted=1 WHERE id=?", (r.ticket_id,))
             self.log(r.workdir, "疑似卡住：%d 秒没有新动作，%s" % (quiet, "状态卡已标出" if on_card else "已提醒用户"))
+        if quiet >= config.stall_seconds():
+            self._escalate_stall(r, t, quiet)
+
+    def _tool_procs(self, r: Running) -> list:
+        """这次工具调用起的进程：worker 的后代里，启动时间不早于最近一次工具调用的（后台任务、MCP 服务更早，不碰）。"""
+        if r.tool_started is None:
+            return []
+        window = time.time() - r.tool_started + 2
+        return [(pid, cpu) for pid, age, cpu in procs.tree(r.proc.pid) if age <= window]
+
+    def _escalate_stall(self, r: Running, t, quiet: float) -> None:
+        """卡住分级处置（issue #16，实测 Claude Code 2.1.316 的 -p 模式）：
+        ① 标「疑似卡住」（上面）；② 没有动作满 TICKETD_STALL_INTERRUPT、且这次工具调用起的进程这段时间没在消耗 CPU：
+        结束这些进程，worker 收到工具报错后由模型接着做或汇报（给 claude 发 SIGINT 会直接结束这一轮、交不了汇报，不用）；
+        ③ 满 TICKETD_STALL_ABORT 仍没进展（如进程卡在不可中断的 I/O 里）：中止这一轮，报 blocked，会话保留。
+        还在消耗 CPU 的是在跑的慢命令，不算卡死，静止计时从头算。"""
+        now = time.monotonic()
+        if r.flat_since is not None and now - r.cpu_sampled < STALL_SAMPLE:
+            pass
+        else:
+            tool = self._tool_procs(r)
+            cpu = sum(c for _, c in tool)
+            busy = r.cpu_last is not None and cpu - r.cpu_last >= max(0.01, STALL_CPU_SHARE * (now - r.cpu_sampled))
+            if r.cpu_last is None or busy:
+                if r.cpu_last is not None and not r.busy_logged:
+                    self.log(r.workdir, "疑似卡住，但这次命令还在消耗 CPU（+%.0f 秒），先不中断" % (cpu - r.cpu_last))
+                    r.busy_logged = True
+                r.flat_since = now
+            r.cpu_last, r.cpu_sampled = cpu, now
+        flat = now - r.flat_since
+        stall = config.stall_seconds()
+        interrupt, abort = config.stall_interrupt(), config.stall_abort()
+        if interrupt and not r.interrupted and quiet >= interrupt and flat >= interrupt - stall:
+            r.interrupted = True
+            tool = self._tool_procs(r)
+            for pid, _ in tool:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            self.log(r.workdir, "卡住 %d 分钟、命令没在消耗 CPU：%s" % (
+                quiet // 60, "已结束这次命令的 %d 个进程，worker 会收到报错接着做" % len(tool) if tool
+                else "没有找到可中断的命令进程"))
+        if (abort and r.term_at is None and quiet >= abort and flat >= abort - stall):
+            r.stall_aborted = True
+            self._terminate(r, "卡住 %d 分钟没有进展" % (quiet // 60))
 
     # ---------- 沙箱外执行（只跑用户批准过的脚本快照） ----------
     def _launch_runs(self) -> None:
@@ -617,6 +677,14 @@ class Scheduler:
         self.log(r.workdir, "进程退出 code=%s" % code)
         if t["state"] in ("stopped", "held"):
             core.touch(self.con, tid, pid=None)
+            return
+        if r.stall_aborted:
+            step = t["last_step"] or "当前步骤"
+            core.add_report(self.con, tid, "blocked",
+                            "卡在「%s」超过 %d 分钟没有进展，已中止这一轮" % (templates.short(step, 40),
+                                                                   int(config.stall_abort() // 60)),
+                            ask="多半是环境问题（网络盘、权限、外部服务）。处理好后引用这条回复「继续」，会用同一个会话接着做")
+            core.touch_if(self.con, tid, ("running",), state="idle", pid=None)
             return
         if r.timed_out:
             core.add_report(self.con, tid, "blocked",

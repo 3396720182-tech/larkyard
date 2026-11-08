@@ -188,6 +188,17 @@ def stall_seconds() -> float:
     return float(_env("TICKETD_STALL_SECONDS", "600"))
 
 
+def stall_interrupt() -> float:
+    """卡住处置第二级（秒，从最后一个动作算起；0 = 不做）：这次工具调用起的进程期间没在消耗 CPU，就结束它们，
+    worker 收到工具报错后接着做（issue #16）。"""
+    return max(0.0, float(_env("TICKETD_STALL_INTERRUPT", "1800")))
+
+
+def stall_abort() -> float:
+    """卡住处置第三级（秒；0 = 不做）：仍然没有进展就中止这一轮、报 blocked（会话保留，回复「继续」接着做）。"""
+    return max(0.0, float(_env("TICKETD_STALL_ABORT", "3600")))
+
+
 def linger_grace() -> float:
     """worker 已交终态汇报、本轮也已结束，但进程还挂着（在等后台任务）时，再等多久就结束它。"""
     return float(_env("TICKETD_LINGER_GRACE", "60"))

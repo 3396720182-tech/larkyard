@@ -121,6 +121,22 @@ elif mode == "run_request":
     else:
         Path("push.sh").write_text(os.environ.get("FAKE_RUN_SCRIPT", "echo hello-from-outside\necho run=$TICKETD_RUN\npwd\n"))
         report("--status", "blocked", "--summary", "要推送", "--run", "push.sh")
+elif mode in ("hang_tool", "busy_tool"):
+    # 像 Bash 工具那样起一个子进程跑命令：hang_tool 一直挂着不耗 CPU（卡在网络盘上那种），busy_tool 是在算的慢命令
+    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {
+        "command": "ls /Volumes/x", "description": "列网络盘"}}]}})
+    time.sleep(0.5)
+    code = ("import time; time.sleep(600)" if mode == "hang_tool"
+            else "import time\nt=time.time()\nwhile time.time()-t<float(%s): pass" % os.environ.get("FAKE_BUSY_SECONDS", "4"))
+    child = subprocess.Popen([sys.executable, "-c", code])
+    Path(".child_pid").write_text(str(child.pid))
+    rc = child.wait()
+    emit({"type": "user", "message": {"content": [{"type": "tool_result", "is_error": rc != 0,
+                                                    "content": "Exit code %s" % rc}]}})
+    if rc != 0:
+        report("--status", "blocked", "--summary", "列网络盘的命令卡住被中断了", "--ask", "网络盘是不是断了？")
+    else:
+        report("--status", "ready", "--summary", "慢命令跑完了")
 elif mode == "balance":
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text":
           "Failed to authenticate. API Error: 403 insufficient balance"}]}})

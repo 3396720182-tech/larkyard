@@ -188,6 +188,8 @@ sudo loginctl enable-linger "$USER"
 | `TICKETD_WORKER_PATH` | 空 | 追加到 worker 和沙箱外执行脚本 PATH 里的目录（冒号分隔）。服务的 PATH 比登录 shell 短，装在 `/opt/homebrew/bin`、Docker.app 里的工具要加在这里 |
 | `TICKETD_WORKER_ENV` | 空 | 变量名白名单（逗号分隔），值从 `config.env` 或服务环境里取，传给 worker 和沙箱外执行的脚本，如 `NPM_CONFIG_REGISTRY` |
 | `TICKETD_RUN_TIMEOUT` | `1800` | 沙箱外执行（用户批准的 worker 脚本）最长多少秒，超时中止 |
+| `TICKETD_STALL_INTERRUPT` | `1800` | 卡住处置：没有动作满这么多秒、且这次命令的进程没在消耗 CPU，就结束这条命令（worker 收到报错接着做）；`0` 为关 |
+| `TICKETD_STALL_ABORT` | `3600` | 仍没进展满这么多秒就中止这一轮、报「需要你决定」（会话保留，回复「继续」接着做）；`0` 为关 |
 | `TICKETD_OUTAGE_RETRY_EVERY` | `900` | 故障等待期间多久自动续跑一次（秒）：断网、接口故障（短重试用完后）、余额不足、认证失败 |
 | `TICKETD_OUTAGE_RETRY_HOURS` | `24` | 故障等待最长多少小时，超过记失败；`0` 为不等待、直接失败 |
 | `TICKETD_MODEL` | 空 | Claude Code worker 用的模型，空为 claude 默认 |

@@ -200,6 +200,51 @@ class SchedulerTest(TicketdTestCase):
         self.assertIs(_json.loads(path.read_text())["sandbox"]["network"]["allowLocalBinding"], True)
         self.assertIn("用户已授权本机网络", self.argv_log(tid)[1]["card"])
 
+    def _fast_stall(self, interrupt="2", abort="100"):
+        from ticketd import scheduler
+        os.environ.update({"TICKETD_STALL_SECONDS": "1", "TICKETD_STALL_INTERRUPT": interrupt,
+                           "TICKETD_STALL_ABORT": abort})
+        orig = scheduler.STALL_SAMPLE
+        scheduler.STALL_SAMPLE = 0.2
+        self.addCleanup(setattr, scheduler, "STALL_SAMPLE", orig)
+
+    def _log(self, tid):
+        with open(os.path.join(self.core.get(self.con, tid)["workdir"], "过程.log"), encoding="utf-8") as f:
+            return f.read()
+
+    def test_stalled_tool_is_interrupted_and_worker_continues(self):  # issue #16
+        self._fast_stall()
+        tid = self.new_ticket(request="[[fake:hang_tool]]")
+        self.child_marker(tid)
+        self.wait(lambda: self.core.last_report(self.con, tid) is not None, self.sched, timeout=30)
+        rep = self.core.last_report(self.con, tid)
+        self.assertEqual(rep["status"], "blocked")
+        self.assertIn("卡住被中断", rep["summary"])  # worker 收到工具报错后自己交了汇报：会话和上下文都在
+        self.assertIn("已结束这次命令的 1 个进程", self._log(tid))
+        self.wait(lambda: self.state(tid) == "idle", self.sched)
+
+    def test_busy_command_is_not_interrupted(self):
+        self._fast_stall()
+        os.environ["FAKE_BUSY_SECONDS"] = "5"
+        tid = self.new_ticket(request="[[fake:busy_tool]]")
+        self.child_marker(tid)
+        self.wait(lambda: self.core.last_report(self.con, tid) is not None, self.sched, timeout=30)
+        self.assertEqual(self.core.last_report(self.con, tid)["summary"], "慢命令跑完了")
+        log = self._log(tid)
+        self.assertIn("还在消耗 CPU", log)
+        self.assertNotIn("已结束这次命令", log)
+
+    def test_no_progress_aborts_round_as_blocked(self):
+        self._fast_stall(interrupt="2", abort="4")
+        tid = self.new_ticket(request="[[fake:stall]]")  # 没有子进程：模型自己卡住，中断不了，只能中止
+        self.wait(lambda: self.core.last_report(self.con, tid) is not None, self.sched, timeout=30)
+        rep = self.core.last_report(self.con, tid)
+        self.assertEqual(rep["status"], "blocked")
+        self.assertIn("没有进展，已中止这一轮", rep["summary"])
+        self.assertIn("继续", rep["ask"])
+        self.wait(lambda: self.state(tid) == "idle", self.sched)
+        self.assertIn("没有找到可中断的命令进程", self._log(tid))
+
     def test_transient_retry_then_ready(self):
         tid = self.new_ticket(request="[[fake:transient_once]]")
         self.wait(lambda: self.state(tid) == "idle" and self.core.last_report(self.con, tid) is not None,
