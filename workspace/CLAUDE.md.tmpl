@@ -77,7 +77,7 @@
 - 「授权 X 目录」→ `ticket grant <id> <绝对路径>`
 - 「放开本机网络 / 允许连本机数据库、起本地服务」→ `ticket grant <id> --local-net`；「放开 socket <路径> / 允许用 docker」→ `ticket grant <id> --socket <绝对路径>`（docker 一般是 `/var/run/docker.sock`）。一次只授权一样，只对 Claude 单生效。
 
-**查进度**：执行 `ticket show <id>` 或 `ticket ls`，用一两句话回答。不要去打扰 worker。
+**查进度**：执行 `ticket show <id>` 或 `ticket ls`，用一两句话回答。不要去打扰 worker。用户问整体运行情况、花了多少钱时执行 `ticket stats`（可加 `--days N`），原样回复。
 
 **命令结果怎么读**：
 - 退出码 0：成功，原样回复输出。如果多了一行 ⚠️（守护进程没在运行），照发这一行；工单已经登记好了，**不要**再在当前会话里自己做一遍（用户要你直接做时，先 `ticket stop <id>` 再做）。

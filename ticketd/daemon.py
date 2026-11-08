@@ -9,7 +9,7 @@ import time
 import traceback
 from typing import Optional
 
-from . import card, config, db, outbox
+from . import card, config, db, metrics, outbox
 from .scheduler import Scheduler
 
 ALERT_INTERVAL = 600.0
@@ -146,6 +146,10 @@ class MediaLane:
         for rid, t in stuck:
             outbox.alert("媒体任务 outbox %d（%s）已运行 %d 秒仍未结束，可能卡死：已让出并发名额，"
                          "这一行要等它结束或重启服务后才会再处理" % (rid, t["ticket"], now - t["started"]))
+            if self.con is not None:
+                metrics.notify(self.con, t["ticket"], "media_stuck",
+                               "%s 的图片 / 视频 / 稿子准备了 %d 分钟还没结束，结果要等它结束或重启服务后才发出"
+                               % (t["ticket"], (now - t["started"]) // 60))
 
     def _dispatch(self) -> None:
         if self.con is None:
@@ -287,6 +291,7 @@ def main(argv=None) -> int:
         _guarded(throttle, "card", lambda: card.refresh(con))  # 先发新单的状态卡，再发结果消息
         # 只发已经准备好的行；要上传/导入的行先在媒体通道线程里准备，慢上传不拖住主循环
         _guarded(throttle, "flush", lambda: outbox.flush(con, lane=outbox.LANE_FAST))
+        _guarded(throttle, "digest", lambda: metrics.maybe_digest(con))
         _beat()
         time.sleep(next_sleep(throttle.streak()))
     media.stop()

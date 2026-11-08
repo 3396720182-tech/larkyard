@@ -181,6 +181,8 @@ Everything lives in `~/.ticketd/config.env` (environment variables of the same n
 | `TICKETD_WORKER_PATH` | empty | Directories appended to the PATH of workers and out-of-sandbox scripts (colon-separated). The service's PATH is shorter than a login shell's; tools in `/opt/homebrew/bin` or Docker.app go here |
 | `TICKETD_WORKER_ENV` | empty | Allowlist of variable names (comma-separated) whose values, taken from `config.env` or the service environment, are passed to workers and out-of-sandbox scripts, e.g. `NPM_CONFIG_REGISTRY` |
 | `TICKETD_RUN_TIMEOUT` | `1800` | Longest run for an approved out-of-sandbox script (seconds); stopped when exceeded |
+| `TICKETD_DIGEST` | `mon 10:00` | When to send the weekly summary (`ticket stats`) to the owner as a direct message; empty turns it off |
+| `TICKETD_COST_HINT_USD` | `30` | Once a session's cumulative cost reaches this (USD), suggest a fresh session or a new ticket; `0` turns it off |
 | `TICKETD_STALL_INTERRUPT` | `1800` | Stall handling: after this many seconds without an action, if the current command's processes are not using CPU, end that command (the worker gets a tool error and carries on); `0` turns it off |
 | `TICKETD_STALL_ABORT` | `3600` | Still no progress after this many seconds: stop the round and report blocked (the session is kept; reply "继续" to continue); `0` turns it off |
 | `TICKETD_OUTAGE_RETRY_EVERY` | `900` | While waiting out an outage, how often to resume automatically (seconds): network or API failures after the short retries, insufficient balance, authentication failures |

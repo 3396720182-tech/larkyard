@@ -55,6 +55,47 @@ class CostTest(TicketdTestCase):
         self.assertEqual(self.rounds(tid)[0][1], "failed")
 
 
+class NotifyTest(TicketdTestCase):
+    def setUp(self):
+        super().setUp()
+        from ticketd import core, metrics, outbox
+        self.core, self.metrics, self.outbox = core, metrics, outbox
+
+    def owner_rows(self):
+        return self.con.execute("SELECT * FROM outbox WHERE ticket_id=?", (self.metrics.SYSTEM_TICKET,)).fetchall()
+
+    def test_dead_result_pushes_owner_once_per_hour(self):
+        tid = self.new_ticket()
+        self.con.execute("UPDATE tickets SET card_wanted=0 WHERE id=?", (tid,))  # 不等状态卡，结果直接发
+        self.core.add_report(self.con, tid, "ready", "好了")
+        fail = self.tmp / "fail"
+        fail.write_text("10")  # 重试满 24 小时、最后的文字兜底也失败：这一行彻底没送达
+        os.environ["FAKE_LARK_FAIL_FILE"] = str(fail)
+        self.con.execute("UPDATE outbox SET created_at=?", (time.time() - 25 * 3600,))
+        self.outbox.flush(self.con)
+        os.environ.pop("FAKE_LARK_FAIL_FILE")
+        self.assertEqual(self.con.execute("SELECT status FROM outbox WHERE ticket_id=?", (tid,)).fetchone()[0], "dead")
+        rows = self.owner_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["reply_to"], "ou_owner")  # 私信主用户，不进群
+        self.assertIn("结果没送达", rows[0]["text"])
+        self.assertIn("ticket show %s" % tid, rows[0]["text"])
+        # 私信这条用 --user-id 发出去
+        self.outbox.flush(self.con)
+        self.assertEqual(self.owner_rows()[0]["status"], "sent")
+        sent = [json.loads(x) for x in (self.tmp / "lark.log").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any("--user-id" in a and "ou_owner" in a for a in sent))
+        # 一小时内同一类只推一次，其余只落库
+        self.metrics.notify(self.con, tid, "delivery_dead", "又一条")
+        self.assertEqual(len(self.owner_rows()), 1)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE kind='delivery_dead'").fetchone()[0], 2)
+
+    def test_no_owner_no_push(self):
+        os.environ["TICKETD_OWNER"] = ""
+        self.metrics.notify(self.con, "T0001", "media_stuck", "卡了")
+        self.assertEqual(self.owner_rows(), [])
+
+
 class StatsTest(TicketdTestCase):
     def setUp(self):
         super().setUp()
@@ -93,3 +134,28 @@ class StatsTest(TicketdTestCase):
         self.assertEqual(self.metrics.backfill_costs(self.con), 1)
         self.assertAlmostEqual(self.core.get(self.con, tid)["cost_usd"], 5.0)
         self.assertEqual(self.metrics.backfill_costs(self.con), 0)  # 可重复执行
+
+
+class DigestTest(TicketdTestCase):
+    def setUp(self):
+        super().setUp()
+        from ticketd import metrics
+        self.metrics = metrics
+
+    def sent(self):
+        return self.con.execute("SELECT COUNT(*) FROM outbox WHERE ticket_id=?",
+                                (self.metrics.SYSTEM_TICKET,)).fetchone()[0]
+
+    def test_sends_once_per_slot_and_not_on_first_run(self):
+        os.environ["TICKETD_DIGEST"] = "mon 10:00"
+        monday = time.mktime((2026, 11, 9, 10, 30, 0, 0, 0, -1))  # 周一 10:30
+        self.assertFalse(self.metrics.maybe_digest(self.con, monday))  # 第一次运行只记下时刻
+        self.assertTrue(self.metrics.maybe_digest(self.con, monday + 7 * 86400))
+        self.assertFalse(self.metrics.maybe_digest(self.con, monday + 7 * 86400 + 60))
+        self.assertEqual(self.sent(), 1)
+        self.assertIn("运行概况", self.con.execute("SELECT text FROM outbox").fetchone()[0])
+
+    def test_disabled(self):
+        os.environ["TICKETD_DIGEST"] = ""
+        self.assertFalse(self.metrics.maybe_digest(self.con, time.time()))
+        self.assertEqual(self.sent(), 0)

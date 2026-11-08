@@ -286,6 +286,16 @@ ticket report --status ready|blocked|failed|dropped|waiting \
 - 卡片的 message_id 写入 `bindings`，引用卡片追问能路由到工单。
 - 主动推新消息只有三种：终态汇报（同 §5.3）、需要用户决策（blocked 或带 `--ask`）、疑似卡死（运行中 `TICKETD_STALL_SECONDS`（默认 600 秒）没有任何工具调用，含子代理；每次安静期只推一次，只提醒不杀）。
 
+### 7.2 运营指标（2026-11-08，运行复盘后新增）
+
+起因：这次运行复盘里的问题——3 条结果没送达、40% 的 blocked 是沙箱、余额耗尽、一张单花了 $88——都是手工翻库、翻 alerts.log、逐个解析 `.stream.jsonl` 才看到的；告警只写在本机，T0016 的结果丢了没人知道。现在把这件事变成系统自己的例行动作（`ticketd/metrics.py`）：
+
+- **成本落库**：Claude 的 result 事件里 `total_cost_usd` 是**会话累计值**（实测：同一会话后一轮的值包含前面所有轮）。调度器按「这次值 − 上次记的值」换算成新增成本（值变小说明换了会话，`ticket restart` 也会把 `session_cost` 清零），累加到 `tickets.cost_usd`，当前会话累计记在 `tickets.session_cost`；每轮结束在 `rounds` 表记一行（开始、结束、成本、结果：本轮最后一份终态汇报的状态，没有汇报时为 retry / stopped / held / failed）。Codex 的事件不带成本，记 0。老工单可以用 `ticket stats --backfill` 从 `.stream.jsonl` 补（只补没有轮次记录的单，可重复执行）。
+- **事件落库**（`events` 表）：疑似卡住、卡住后中断命令、卡住后中止一轮、进入故障等待、模型接口报错（后台任务还在跑时）、申请 / 批准沙箱外执行、结果没送达、媒体任务卡住、状态卡放弃。
+- **紧急事件私信主用户**：结果（或任何一条消息）彻底没送达、媒体任务卡住，发一条「🚨 …」私信给 `TICKETD_OWNER`（`lark-cli im +messages-send --user-id`，不进任何群；发件箱里工单号记为 `_ticketd`）。同一类一小时最多一条，其余只落库；系统消息自己没送达不再嵌套通知。
+- **`ticket stats [--days N]`**：最近 N 天（默认 7）的概况：新开工单、跑了几轮、worker 成本、每轮结果分布、最花钱的 3 张单、会话已很长的单（`session_cost` ≥ `TICKETD_COST_HINT_USD`）、需要你的次数（其中申请 / 批准沙箱外执行、授权）、你回复的中位 / 最慢时间、失败次数和最近原因、事件计数、没送达的消息和本机告警条数。
+- **每周概况**：守护进程按 `TICKETD_DIGEST`（默认 `mon 10:00`，空 = 不发）把最近 7 天的 `ticket stats` 私信给主用户。每个时刻只发一次（`kv` 表记 `digest_last`，跨重启不重发）；第一次运行只记下时刻、不补发。
+
 ## 8. 容错
 
 | 情况 | 处理 |

@@ -77,9 +77,11 @@ def _reply_gone(info: str) -> bool:
 
 
 def _target_args(to: str) -> list:
-    """om_ 开头：回复那条消息；oc_ 开头（回复目标被撤回后改投）：直接发到会话。"""
+    """om_ 开头：回复那条消息；oc_ 开头（回复目标被撤回后改投）：直接发到会话；ou_ 开头（告警、周报）：私信这个人。"""
     if (to or "").startswith("oc_"):
         return ["im", "+messages-send", "--as", "bot", "--chat-id", to]
+    if (to or "").startswith("ou_"):
+        return ["im", "+messages-send", "--as", "bot", "--user-id", to]
     return ["im", "+messages-reply", "--as", "bot", "--message-id", to]
 
 
@@ -716,6 +718,8 @@ def _poison(con, r, sender, e: Exception) -> bool:
         return True
     _db_faults.pop(r["id"], None)
     alert("outbox %d %s（%s）：发送异常 %r" % (r["id"], "已改发文字" if tok else "dead", r["ticket_id"], e))
+    if not tok:
+        _notify_dead(con, r, repr(e))
     return False
 
 
@@ -886,11 +890,29 @@ def flush(con, sender=None, limit: int = 5, card_sender=None, card_patcher=None,
             _release(rid)
 
 
+def _notify_dead(con, r, info: str) -> None:
+    """一条消息彻底没送达：私信主用户（原来只写本机 alerts.log，T0016 的结果丢了没人知道）。系统消息自己没送达就不再嵌套通知。"""
+    from . import metrics
+    if r["ticket_id"] == metrics.SYSTEM_TICKET:
+        return
+    what = "结果" if r["report_id"] is not None else "一条消息"
+    metrics.notify(con, r["ticket_id"], "delivery_dead",
+                   "%s 的%s没能送达（%s）。内容可以用 ticket show %s 查看" % (
+                       r["ticket_id"], what, short_error(info), r["ticket_id"]))
+
+
+def short_error(info: str) -> str:
+    err = _parse_error(info)
+    if err.get("message"):
+        return "%s%s" % (err.get("message"), "，code %s" % err["code"] if err.get("code") else "")
+    return (info or "")[:80]
+
+
 def _flush_row(con, r, sender, card_sender, card_patcher, lane) -> bool:
     """发一行并按结果记账。返回 True = 本轮不要再发其余行（网络/超时、库被占用或写不进去）。"""
     try:
         ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher=card_patcher, lane=lane)
-        if not ok and _reply_gone(info) and not r["reply_to"].startswith("oc_"):
+        if not ok and _reply_gone(info) and not r["reply_to"].startswith(("oc_", "ou_")):
             moved = _redirect_to_chat(con, r, info)
             if moved is not None:
                 r = moved
@@ -945,6 +967,7 @@ def _settle(con, r, ok: bool, info: str, permanent: bool, sender) -> bool:
         con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
                     (attempts, info, r["id"]))
         alert("outbox %d dead（%s）：%s" % (r["id"], r["ticket_id"], info))
+        _notify_dead(con, r, info)
     elif db.now() - r["created_at"] > 24 * 3600:
         media = r["media_json"] if "media_json" in r.keys() else None
         if r["card_json"] or media:
@@ -961,6 +984,7 @@ def _settle(con, r, ok: bool, info: str, permanent: bool, sender) -> bool:
         con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
                     (attempts, info, r["id"]))
         alert("outbox %d dead（%s）：重试 %d 次仍失败：%s" % (r["id"], r["ticket_id"], attempts, info))
+        _notify_dead(con, r, info)
     else:
         delay = min(5 * 2 ** (attempts - 1), 300)
         con.execute("UPDATE outbox SET attempts=?, next_at=?, last_error=? WHERE id=?",
