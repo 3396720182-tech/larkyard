@@ -147,4 +147,7 @@ elif mode == "sleep_child":
     child = subprocess.Popen(["sleep", "60"])
     Path(".child_pid").write_text(str(child.pid))
     time.sleep(60)
-emit({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 10, "permission_denials": []})
+final = {"type": "result", "subtype": "success", "is_error": False, "duration_ms": 10, "permission_denials": []}
+if os.environ.get("FAKE_COST"):  # 会话累计成本（和真实 claude 一样按会话累计，不是本轮）
+    final["total_cost_usd"] = float(os.environ["FAKE_COST"])
+emit(final)

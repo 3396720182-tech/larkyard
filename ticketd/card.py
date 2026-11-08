@@ -240,6 +240,8 @@ def _failed(con, t, info: str, permanent: bool, now: float, what: str, creating:
     if giveup:
         con.execute("UPDATE tickets SET card_wanted=0, card_attempts=? WHERE id=?", (attempts, t["id"]))
         outbox.alert("状态卡%s失败，已放弃（%s）：%s" % (what, t["id"], info))
+        con.execute("INSERT INTO events(ticket_id, kind, detail, created_at) VALUES(?,?,?,?)",
+                    (t["id"], "card_giveup", info[:300], now))
         return
     con.execute("UPDATE tickets SET card_attempts=?, card_retry_at=? WHERE id=?",
                 (attempts, now + min(5 * 2 ** (attempts - 1), 300), t["id"]))

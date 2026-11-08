@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import card, config, core, db, executors, safefs, templates, worker
+from . import card, config, core, db, executors, metrics, safefs, templates, worker
 
 HEARTBEAT_STALE = 60
 
@@ -72,6 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--local-net", action="store_true", help="放开本机网络：连本机端口、在本机监听（只对 Claude 单生效）")
     g.add_argument("--socket", help="放开一个 unix socket 路径（如 /var/run/docker.sock；只对 Claude 单生效）")
     sub.add_parser("ls")
+    st = sub.add_parser("stats", help="最近几天的运行概况（成本、需要你的次数、失败、事件）")
+    st.add_argument("--days", type=float, default=7)
+    st.add_argument("--backfill", action="store_true", help="先从老工单的 .stream.jsonl 补成本（只补没有记录的单）")
     return p
 
 
@@ -239,6 +242,8 @@ def cmd_ls(con, a) -> str:
             extra = "  阶段：%s" % (v["phase"] or "—")
             if v["elapsed"] is not None:
                 extra += "  用时 %s" % templates.dur(v["elapsed"])
+        if t["cost_usd"]:
+            extra += "  $%.2f" % t["cost_usd"]
         lines.append("%s  %-7s  %s  %s%s  可写：%s  最近：%s" % (
             t["id"], t["state"], t["title"], v["label"], extra,
             templates.scope_text(core.grants(con, t["id"])), _report_line(con, t["id"])))
@@ -287,6 +292,24 @@ def _status_lines(con, t) -> list:
     return out
 
 
+def cmd_stats(con, a) -> str:
+    out = []
+    if a.backfill:
+        out.append("补了 %d 张老工单的成本" % metrics.backfill_costs(con))
+    out.append(metrics.stats(con, a.days))
+    return "\n".join(out)
+
+
+def _cost_text(t) -> str:
+    try:
+        cost, sess = t["cost_usd"] or 0, t["session_cost"] or 0
+    except (KeyError, IndexError):
+        return ""
+    if not cost:
+        return ""
+    return "本单约 $%.2f（当前会话累计 $%.2f）" % (cost, sess)
+
+
 def cmd_show(con, a) -> str:
     t = core.get(con, a.ticket)
     log = Path(t["workdir"]) / "过程.log"
@@ -294,6 +317,7 @@ def cmd_show(con, a) -> str:
     info = _status_lines(con, t) + [
         "目录：%s" % t["workdir"],
         "执行器：%s" % worker.executor_of(t),
+        "成本：%s" % (_cost_text(t) or "—"),
         "worker PATH：%s" % worker.worker_env(t).get("PATH", ""),
         "终端接管：%s" % executors.get(worker.executor_of(t)).takeover_hint(t),
         "可写：%s" % templates.scope_text(core.grants(con, t["id"])),
@@ -306,7 +330,7 @@ def cmd_show(con, a) -> str:
 COMMANDS = {
     "new": cmd_new, "send": cmd_send, "lookup": cmd_lookup, "report": cmd_report,
     "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "restart": cmd_restart, "approve": cmd_approve, "grant": cmd_grant,
-    "ls": cmd_ls, "show": cmd_show,
+    "ls": cmd_ls, "show": cmd_show, "stats": cmd_stats,
 }
 
 

@@ -199,6 +199,16 @@ def stall_abort() -> float:
     return max(0.0, float(_env("TICKETD_STALL_ABORT", "3600")))
 
 
+def digest() -> str:
+    """每周运行概况私信给主用户的时刻，如 "mon 10:00"；空 = 不发。"""
+    return _env("TICKETD_DIGEST", "mon 10:00").strip()
+
+
+def cost_hint_usd() -> float:
+    """会话累计成本到这个数（美元）就在结果卡和周报里提示「会话已很长，换新会话或开新单更便宜」；0 = 不提示。"""
+    return max(0.0, float(_env("TICKETD_COST_HINT_USD", "30")))
+
+
 def linger_grace() -> float:
     """worker 已交终态汇报、本轮也已结束，但进程还挂着（在等后台任务）时，再等多久就结束它。"""
     return float(_env("TICKETD_LINGER_GRACE", "60"))

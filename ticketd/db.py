@@ -38,6 +38,17 @@ CREATE TABLE IF NOT EXISTS net_grants(
   ticket_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, created_at REAL NOT NULL,
   PRIMARY KEY(ticket_id, kind, value)
 );
+-- 运营指标（metrics.py）：每轮的成本和结果、关键事件、少量键值状态（周报时刻、推送节流）
+CREATE TABLE IF NOT EXISTS rounds(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id TEXT NOT NULL, started_at REAL NOT NULL, ended_at REAL NOT NULL, cost_usd REAL NOT NULL DEFAULT 0,
+  outcome TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS bindings(message_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS inputs(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,7 +97,9 @@ MIGRATIONS = [
     ("tickets", "card_round", "REAL"),                            # 当前状态卡显示的是哪一轮（该轮的 started_at）
     ("tickets", "card_sent_at", "REAL"),                          # 当前状态卡的发出时间（飞书只能编辑 14 天内的消息）
     ("tickets", "executor", "TEXT NOT NULL DEFAULT 'claude'"),   # 建单时定下，之后不变（会话不能跨执行器迁移）
-    ("tickets", "outage_since", "REAL"),                          # 非空 = 故障等待中（断网、余额不足等），从这一刻起算时限
+    ("tickets", "outage_since", "REAL"),
+    ("tickets", "cost_usd", "REAL NOT NULL DEFAULT 0"),           # 这张单 worker 累计花了多少（美元，Claude 报的）
+    ("tickets", "session_cost", "REAL NOT NULL DEFAULT 0"),       # 当前会话的累计成本（Claude 的 total_cost_usd 按会话累计）                          # 非空 = 故障等待中（断网、余额不足等），从这一刻起算时限
     ("tickets", "bg_wait", "TEXT"),                               # 非空 = 本轮已结束但还在等后台任务（内容是任务描述）
     ("outbox", "card_json", "TEXT"),                             # 非空 = 发卡片（text 是卡片发不出去时的兜底）
     ("outbox", "report_id", "INTEGER"),                           # 这条消息对应的汇报

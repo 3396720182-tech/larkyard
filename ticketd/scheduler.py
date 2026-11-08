@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import card as status_card, config, core, db, executors, procs, safefs, templates, worker
+from . import card as status_card, config, core, db, executors, metrics, procs, safefs, templates, worker
 
 RECOVERY_TEXT = ("服务重启打断了上一轮。先检查工单目录和已发出的消息，确认哪些外部动作已经完成，"
                  "再决定是否重做；不要重复发送或重复创建。")
@@ -149,6 +149,8 @@ class Running:
         self.busy_logged = False
         self.interrupted = False
         self.stall_aborted = False
+        self.cost_seen = 0.0                       # 已经记进库的会话累计成本（Claude 的 total_cost_usd 按会话累计）
+        self.round_cost = 0.0
 
 
 class RunProc:
@@ -318,6 +320,7 @@ class Scheduler:
         core.touch(self.con, tid, pid=proc.pid, started_at=t0, last_action_at=t0, last_step=None, stall_alerted=0,
                    bg_wait=None)
         self.running[tid] = Running(proc, tid, str(workdir), ids, mark, so, eo, ex.name, t["session_id"])
+        self.running[tid].cost_seen = float(t["session_cost"] or 0) if t["session_started"] else 0.0
         self.log(str(workdir), "开始第 %d 轮（输入 %d 条）" % (n, len(inputs)))
         return True
 
@@ -370,6 +373,19 @@ class Scheduler:
                     r.last_text = text
         elif ev.get("type") == "result":
             r.result = ev
+            self._add_cost(r, ev.get("total_cost_usd"))
+
+    def _add_cost(self, r: Running, total) -> None:
+        """result 事件带的是会话累计成本：和上次记的差就是这段新增；变小了说明换了会话（ticket restart）。"""
+        if not isinstance(total, (int, float)) or isinstance(total, bool):
+            return
+        delta = total - r.cost_seen if total >= r.cost_seen else total
+        r.cost_seen = total
+        if delta <= 0:
+            return
+        r.round_cost += delta
+        self.con.execute("UPDATE tickets SET cost_usd=cost_usd+?, session_cost=? WHERE id=?",
+                         (delta, total, r.ticket_id))
 
     def _terminate(self, r: Running, why: str) -> None:
         _signal_group(r.proc, signal.SIGTERM)
@@ -426,6 +442,7 @@ class Scheduler:
                 core.enqueue_message(self.con, r.ticket_id, templates.api_error_message(
                     r.ticket_id, err, worker.account_error(err), r.bg_shown))
                 self.log(r.workdir, "模型接口报错，后台任务还在跑，已提醒用户")
+                metrics.record(self.con, r.ticket_id, "api_error", err)
             return  # 单轮超时照旧兜底
         quiet = db.now() - max(t["last_action_at"] or 0, t["started_at"] or 0)
         if quiet >= config.stall_seconds() and not t["stall_alerted"]:
@@ -437,6 +454,7 @@ class Scheduler:
                                          templates.stall_message(r.ticket_id, int(quiet // 60), t["last_step"]))
                 self.con.execute("UPDATE tickets SET stall_alerted=1 WHERE id=?", (r.ticket_id,))
             self.log(r.workdir, "疑似卡住：%d 秒没有新动作，%s" % (quiet, "状态卡已标出" if on_card else "已提醒用户"))
+            metrics.record(self.con, r.ticket_id, "stall_flag", t["last_step"] or "")
         if quiet >= config.stall_seconds():
             self._escalate_stall(r, t, quiet)
 
@@ -477,11 +495,13 @@ class Scheduler:
                     os.kill(pid, signal.SIGTERM)
                 except (ProcessLookupError, PermissionError):
                     pass
+            metrics.record(self.con, r.ticket_id, "stall_interrupt", "%d 个进程" % len(tool))
             self.log(r.workdir, "卡住 %d 分钟、命令没在消耗 CPU：%s" % (
                 quiet // 60, "已结束这次命令的 %d 个进程，worker 会收到报错接着做" % len(tool) if tool
                 else "没有找到可中断的命令进程"))
         if (abort and r.term_at is None and quiet >= abort and flat >= abort - stall):
             r.stall_aborted = True
+            metrics.record(self.con, r.ticket_id, "stall_abort", t["last_step"] or "")
             self._terminate(r, "卡住 %d 分钟没有进展" % (quiet // 60))
 
     # ---------- 沙箱外执行（只跑用户批准过的脚本快照） ----------
@@ -595,6 +615,7 @@ class Scheduler:
         if now - since < limit:
             every = config.outage_retry_every()
             if t["outage_since"] is None:  # 只在进入故障等待时告诉用户一次，之后的自动重试不再打扰
+                metrics.record(self.con, tid, "outage_start", "%s：%s" % (reason, detail))
                 until = time.strftime("%m-%d %H:%M", time.localtime(since + limit))
                 plan = "每 %d 分钟自动试一次，最晚到 %s" % (max(1, int(every // 60)), until)
                 if account:
@@ -657,6 +678,8 @@ class Scheduler:
             self.log(r.workdir, "清理残留进程 %d 个" % swept)
         try:
             self._settle(r)
+            t = core.get(self.con, tid)
+            metrics.add_round(self.con, t, r.round_cost, metrics.round_outcome(self.con, t))
         except Exception as e:  # 收割出错也不能让工单卡在 running、锁不释放
             self.con.execute("DELETE FROM locks WHERE ticket_id=?", (tid,))
             core.touch_if(self.con, tid, ("running",), state="failed", pid=None)

@@ -348,6 +348,8 @@ def add_report(con: sqlite3.Connection, ticket_id: str, status: str, summary: st
             run_id = con.execute("INSERT INTO runs(ticket_id, report_id, path, script, created_at) VALUES(?,?,?,?,?)",
                                  (ticket_id, rid, run["path"], run["script"], now)).lastrowid
             run = dict(run, id=run_id, timeout=config.run_timeout())
+            con.execute("INSERT INTO events(ticket_id, kind, detail, created_at) VALUES(?,?,?,?)",
+                        (ticket_id, "run_requested", "R%d %s" % (run_id, run["path"]), now))
         msg = templates.report_message(ticket_id, status, summary, arts, ask, run)
         if not msg:
             return
@@ -447,7 +449,7 @@ def restart(con: sqlite3.Connection, ticket_id: str) -> None:
         # 之前没投递的输入已经包含在上面的追问里，标掉，免得新会话里重复
         con.execute("UPDATE inputs SET status='delivered' WHERE ticket_id=? AND status='pending'", (ticket_id,))
         touch(con, ticket_id, session_id=str(uuid.uuid4()), session_started=0, state="idle",
-              retries=0, retry_at=0, outage_since=None)
+              retries=0, retry_at=0, outage_since=None, session_cost=0)
         add_input(con, ticket_id, "fresh", text)
 
 
@@ -466,6 +468,8 @@ def approve(con: sqlite3.Connection, ticket_id: str) -> int:
         if t["state"] not in ("idle", "failed"):
             raise TicketError("%s 当前状态为 %s，不能执行（先放开或恢复）" % (ticket_id, t["state"]))
         con.execute("UPDATE runs SET status='approved', approved_at=? WHERE id=?", (db.now(), run["id"]))
+        con.execute("INSERT INTO events(ticket_id, kind, detail, created_at) VALUES(?,?,?,?)",
+                    (ticket_id, "run_approved", "R%d" % run["id"], db.now()))
         touch(con, ticket_id, retry_at=0)
     return run["id"]
 
