@@ -294,6 +294,7 @@ def cmd_show(con, a) -> str:
     info = _status_lines(con, t) + [
         "目录：%s" % t["workdir"],
         "执行器：%s" % worker.executor_of(t),
+        "worker PATH：%s" % worker.worker_env(t).get("PATH", ""),
         "终端接管：%s" % executors.get(worker.executor_of(t)).takeover_hint(t),
         "可写：%s" % templates.scope_text(core.grants(con, t["id"])),
         "最近汇报：%s" % _report_line(con, t["id"]),

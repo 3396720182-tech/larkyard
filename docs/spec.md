@@ -198,6 +198,8 @@ ticket report --status ready|blocked|failed|dropped|waiting \
 
 只有用户在对话里明确说了，主会话才执行 stop、hold、release、restart 和 grant。
 
+**调整（2026-11-08，issue #19）worker 的补充环境**：worker 的环境从守护进程继承（launchd / systemd 给的最小环境），PATH 比用户登录 shell 短、没有代理和镜像源设置，worker 找不到 docker 之类的工具、下载被代理 407。新增 `TICKETD_WORKER_PATH`（追加到 PATH，已有的目录不重复）和 `TICKETD_WORKER_ENV`（变量名白名单，值先取服务环境、再取 `config.env`；没有值的跳过），由 `worker.user_env` 统一加到 worker 和沙箱外执行的脚本上；`ticket show` 显示 worker 实际的 PATH。不跑登录 shell 取环境（Codex 那边已经因为 shell 快照踩过坑），只做显式的白名单。实测（Claude Code 2.1.316）：普通变量能原样进到沙箱里的命令；`HTTP(S)_PROXY`、`ALL_PROXY`、`NO_PROXY` 等在沙箱里被换成 Claude Code 自己的本机代理，所以代理变量只对 claude 进程本身和沙箱外执行的脚本有效。
+
 **调整（2026-11-07）沙箱外执行通道**：运行复盘里 55 次 blocked/waiting 有 22 次是 worker 请主会话或用户「在沙箱外替我跑一下」（git push / 开 PR、无头 Chromium 渲染、部署重启），主会话临时代跑，没有记录，也没有限制。现在把它做成一条显式的通道：
 - 申请：worker 把命令写成工单目录里的脚本（≤8KB、UTF-8），`ticket report --status blocked --summary … --run <脚本>`。CLI 在沙箱里读出脚本，连内容一起写进待收件；守护进程收汇报时存进 `runs` 表（`status=pending`，记 `report_id`）。没带 `--ask` 时默认问「要我在沙箱外执行上面这段脚本吗？同意就回复「执行」…」。`--run` 只能配 `blocked`。
 - 展示：结果卡在「👉 需要你」下面放一个默认展开的面板，标题「🖥️ 申请在沙箱外执行（Rn · 路径）」，正文是完整脚本（plain_text，原样含缩进），下面一行说明批准后会发生什么；文字兜底消息里同样带脚本。`ticket show` 显示「沙箱外执行 Rn（路径）：待批准 / 已批准 / 执行中」。

@@ -197,5 +197,23 @@ def prompt_file() -> Path:
     return REPO / "prompts" / "worker.md"
 
 
+def worker_path() -> list:
+    """追加到 worker（和沙箱外执行的脚本）PATH 里的目录，冒号分隔。服务由 launchd / systemd 托管，
+    PATH 比登录 shell 短，装在 /opt/homebrew/bin、Docker.app 里的工具 worker 找不到（issue #19）。"""
+    return [p for p in _env("TICKETD_WORKER_PATH", "").split(os.pathsep) if p.strip()]
+
+
+def worker_env_names() -> list:
+    """白名单：这些变量从 config.env（或服务环境）里取值传给 worker 和沙箱外执行的脚本，逗号分隔。"""
+    return [n.strip() for n in _env("TICKETD_WORKER_ENV", "").split(",") if n.strip()]
+
+
+def worker_env_value(name: str):
+    """白名单变量的值：服务环境优先，其次 config.env；都没有返回 None。"""
+    if name in os.environ:
+        return os.environ[name]
+    return _file_values().get(name)
+
+
 def bin_dir() -> Path:
     return REPO / "bin"

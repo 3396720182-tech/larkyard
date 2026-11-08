@@ -185,6 +185,8 @@ sudo loginctl enable-linger "$USER"
 | `TICKETD_WORKROOT` | `~/larkyard-tickets` | 工单目录的根，每张单一个子目录 |
 | `TICKETD_MAX_WORKERS` | `3` | 同时运行的 worker 数 |
 | `TICKETD_TURN_TIMEOUT` | `7200` | 单轮超时（秒） |
+| `TICKETD_WORKER_PATH` | 空 | 追加到 worker 和沙箱外执行脚本 PATH 里的目录（冒号分隔）。服务的 PATH 比登录 shell 短，装在 `/opt/homebrew/bin`、Docker.app 里的工具要加在这里 |
+| `TICKETD_WORKER_ENV` | 空 | 变量名白名单（逗号分隔），值从 `config.env` 或服务环境里取，传给 worker 和沙箱外执行的脚本，如 `NPM_CONFIG_REGISTRY` |
 | `TICKETD_RUN_TIMEOUT` | `1800` | 沙箱外执行（用户批准的 worker 脚本）最长多少秒，超时中止 |
 | `TICKETD_OUTAGE_RETRY_EVERY` | `900` | 故障等待期间多久自动续跑一次（秒）：断网、接口故障（短重试用完后）、余额不足、认证失败 |
 | `TICKETD_OUTAGE_RETRY_HOURS` | `24` | 故障等待最长多少小时，超过记失败；`0` 为不等待、直接失败 |
@@ -224,6 +226,7 @@ sudo loginctl enable-linger "$USER"
 - 主会话（bridge 里做判断和派单的那个会话）目前只在 Claude Code 上写过、验证过：工作区约定是 `CLAUDE.md`。bridge 的 Codex 主会话（profile `agentKind: "codex"`）还没验证；能路由给 Codex 的是 worker。
 - 主会话由 bridge 管理，同一个会话一直续用（`--resume`），聊得越久上下文越长：实测一个主会话用了一天多累计约 35 美元，后面每条消息都在为整段历史付费，判断也更容易被旧话题带偏。ticketd 管不到这个会话；隔一段时间（比如一批工作做完）在飞书里发 `/new` 重开即可，工单不受影响（工单号、状态都在 ticketd 里，引用旧消息照常能追问）。
 - 沙箱外执行（`ticket report --run` + `ticket approve`）让你批准过的脚本以你的身份在沙箱外运行，把关只靠你看过脚本再说「执行」：卡片上是完整脚本，但脚本调用的工单目录里的其他文件不在审批范围内。脚本在 ticketd 的环境里跑（服务的 PATH 较短、没有登录 shell 的代理设置）。
+- `TICKETD_WORKER_ENV` 里的代理变量（`HTTPS_PROXY` 等）到不了 worker 沙箱里的命令：Claude Code 沙箱一律把它们换成自己的本机代理（实测）。它们只对 claude 进程本身和沙箱外执行的脚本生效；Claude Code 的本机代理会不会经由上游代理出网，没有实测。
 - `ticket grant --local-net` 一次放开本机所有端口（Claude Code 沙箱不能按端口细分），`--socket` 放开的服务（如 docker.sock）实际上能在沙箱外做事，按需逐单给。这两种授权只对 Claude 单生效；在 macOS 上实测过连本机端口、本机 bind、unix socket，Linux 上没实测。无头浏览器（Chrome 渲染、截图）授权了也跑不起来（实测会被沙箱的其他限制拦下），要走沙箱外执行。
 - worker 的沙箱和权限依赖 Claude Code 的 `--permission-mode dontAsk` 与 sandbox 设置，Claude Code 升级后建议按 `docs/spec.md` §6 的实测结论复核一遍。
 - 飞书卡片没有视频组件，视频不能在卡片里直接播放：卡里放封面和按钮，点开走云空间播放器。100MB 以内的视频传云空间（超过 20MB 时 lark-cli 自动分片上传）；传不上去时，≤30MB 的改为卡片后另发一条视频消息，再大就只给本机路径。

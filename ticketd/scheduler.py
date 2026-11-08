@@ -459,7 +459,7 @@ class Scheduler:
             finally:
                 os.close(fd)
             fout = safefs.open_append(log_path)  # 工单目录对 worker 可写：不跟随链接
-            env = dict(os.environ, TICKETD_TICKET=tid, TICKETD_RUN="R%d" % rid)
+            env = worker.user_env(dict(os.environ, TICKETD_TICKET=tid, TICKETD_RUN="R%d" % rid))
             env.pop("TICKETD_SPOOL", None)
             proc = subprocess.Popen([_bash(), str(script_path)], cwd=workdir, stdin=subprocess.DEVNULL,
                                     stdout=fout, stderr=subprocess.STDOUT, env=env, start_new_session=True)

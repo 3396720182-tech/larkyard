@@ -213,3 +213,28 @@ class SandboxLineTest(unittest.TestCase):
         self.assertIn("T0009.json", card)
         t["executor"] = "codex"
         self.assertNotIn("沙箱：", worker.compose_card(t, [], [], include_assignment=True))
+
+
+class UserEnvTest(TicketdTestCase):  # issue #19
+    def test_path_and_whitelisted_vars(self):
+        import os
+        from ticketd import config, worker
+        config.home().mkdir(parents=True, exist_ok=True)
+        config.config_file().write_text("TICKETD_WORKER_ENV=FROM_FILE,FROM_ENV,MISSING\nFROM_FILE=file-value\n"
+                                        "TICKETD_WORKER_PATH=/opt/x/bin:/usr/bin\n", encoding="utf-8")
+        os.environ["FROM_ENV"] = "env-value"
+        t = {"id": "T0001", "workdir": str(self.tmp / "w"), "executor": "claude"}
+        env = worker.worker_env(t)
+        self.assertEqual(env["FROM_FILE"], "file-value")
+        self.assertEqual(env["FROM_ENV"], "env-value")
+        self.assertNotIn("MISSING", env)
+        parts = env["PATH"].split(os.pathsep)
+        self.assertEqual(parts[0], str(config.bin_dir()))
+        self.assertEqual(parts[-1], "/opt/x/bin")
+        self.assertEqual(parts.count("/usr/bin"), 1)  # 已经有的不重复加
+
+    def test_nothing_configured_changes_nothing(self):
+        import os
+        from ticketd import worker
+        before = dict(os.environ)
+        self.assertEqual(worker.user_env(dict(before)), before)

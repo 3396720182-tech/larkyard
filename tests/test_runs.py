@@ -150,6 +150,18 @@ class RunExecutionTest(TicketdTestCase):
         self.assertIn("hello-from-outside", card)
         self.wait(lambda: self.state(tid) == "idle" and tid not in self.sched.running, self.sched)
 
+    def test_run_gets_user_env(self):  # issue #19：沙箱外执行的脚本和 worker 用同一套补充环境
+        os.environ["TICKETD_WORKER_ENV"] = "LY_EXTRA"
+        os.environ["LY_EXTRA"] = "extra-ok"
+        os.environ["TICKETD_WORKER_PATH"] = "/opt/ly-test/bin"
+        tid = self.request('echo "extra=$LY_EXTRA"\necho "$PATH"\n')
+        self.core.approve(self.con, tid)
+        self.wait(lambda: self.run_row()["status"] == "done", self.sched)
+        wd = Path(self.core.get(self.con, tid)["workdir"])
+        log = (wd / ("沙箱外执行-R%d.log" % self.run_row()["id"])).read_text(encoding="utf-8")
+        self.assertIn("extra=extra-ok", log)
+        self.assertIn("/opt/ly-test/bin", log)
+
     def test_worker_not_started_while_run_in_progress(self):
         tid = self.request("sleep 2\necho done\n")
         self.core.approve(self.con, tid)

@@ -159,8 +159,22 @@ def build_command(ticket, settings_path, prompt_text: str) -> List[str]:
     return cmd
 
 
+def user_env(env: dict) -> dict:
+    """按配置补上用户自己的环境（issue #19）：TICKETD_WORKER_ENV 白名单里的变量、TICKETD_WORKER_PATH 追加的目录。
+    worker 和沙箱外执行的脚本共用。原地修改并返回 env。"""
+    for name in config.worker_env_names():
+        value = config.worker_env_value(name)
+        if value is not None:
+            env[name] = value
+    extra = config.worker_path()
+    if extra:
+        have = env.get("PATH", "").split(os.pathsep)
+        env["PATH"] = os.pathsep.join(have + [p for p in extra if p not in have])
+    return env
+
+
 def worker_env(ticket) -> dict:
-    env = dict(os.environ)
+    env = user_env(dict(os.environ))
     env["TICKETD_TICKET"] = ticket["id"]
     env["TICKETD_SPOOL"] = str(Path(ticket["workdir"]) / ".reports")
     env["PATH"] = str(config.bin_dir()) + os.pathsep + env.get("PATH", "")
