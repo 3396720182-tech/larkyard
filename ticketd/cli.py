@@ -402,6 +402,15 @@ def _cost_text(t) -> str:
     return "本单约 $%.2f（当前会话累计 $%.2f）" % (cost, sess)
 
 
+def _ctx_text(con, t) -> str:
+    n = con.execute("SELECT COUNT(*) ok, SUM(outcome='compact_failed') bad FROM rounds WHERE ticket_id=?"
+                    " AND outcome IN ('compact','compact_failed')", (t["id"],)).fetchone()
+    size = "上一轮约 %d 万 token" % (t["ctx_tokens"] // 10000) if t["ctx_tokens"] else "—"
+    if n["ok"]:
+        size += "；压缩过 %d 次%s" % (n["ok"], "（失败 %d 次）" % n["bad"] if n["bad"] else "")
+    return size
+
+
 def cmd_show(con, a) -> str:
     t = core.get(con, a.ticket)
     log = Path(t["workdir"]) / "过程.log"
@@ -410,6 +419,7 @@ def cmd_show(con, a) -> str:
         "目录：%s" % t["workdir"],
         "执行器：%s" % worker.executor_of(t),
         "成本：%s" % (_cost_text(t) or "—"),
+        "上下文：%s" % _ctx_text(con, t),
         "worker PATH：%s" % worker.worker_env(t).get("PATH", ""),
         "终端接管：%s" % executors.get(worker.executor_of(t)).takeover_hint(t),
         "可写：%s" % templates.scope_text(core.grants(con, t["id"])),

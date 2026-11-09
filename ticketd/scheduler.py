@@ -152,6 +152,7 @@ class Running:
         self.cost_seen = 0.0                       # 已经记进库的会话累计成本（Claude 的 total_cost_usd 按会话累计）
         self.round_cost = 0.0
         self.ctx_max = 0                           # 这一轮的上下文峰值（token）
+        self.started_wall = db.now()               # 这一轮（含压缩轮）真实的开始时刻，rounds 表用
         self.compact = False                       # 这是一轮会话压缩（不投递输入、不要求汇报）
         self.compacted = False                     # 看到了 compact_boundary
 
@@ -786,7 +787,7 @@ class Scheduler:
                 outcome = metrics.round_outcome(self.con, t)
                 if r.ctx_max:
                     core.touch(self.con, tid, ctx_tokens=r.ctx_max)
-            metrics.add_round(self.con, t, r.round_cost, outcome, r.ctx_max)
+            metrics.add_round(self.con, t, r.round_cost, outcome, r.ctx_max, started=r.started_wall)
         except Exception as e:  # 收割出错也不能让工单卡在 running、锁不释放
             self.con.execute("DELETE FROM locks WHERE ticket_id=?", (tid,))
             core.touch_if(self.con, tid, ("running",), state="failed", pid=None)

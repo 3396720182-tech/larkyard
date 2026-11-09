@@ -132,6 +132,20 @@ class StatsTest(TicketdTestCase):
         self.assertIn("疑似卡住 1", text)
         self.assertIn("你的回复：中位 0 分钟", text)
 
+    def test_context_and_executor_lines(self):  # 审查 C、D
+        now = time.time()
+        a = self.new_ticket(title="长单")
+        b = self.new_ticket(message="om_2", title="codex 单", executor="codex")
+        ins = ("INSERT INTO rounds(ticket_id, started_at, ended_at, cost_usd, outcome, ctx_tokens)"
+               " VALUES(?,?,?,?,?,?)")
+        for row in ((a, now - 50, now - 49, 6.0, "ready", 900000), (a, now - 40, now - 39, 2.0, "compact", 0),
+                    (a, now - 30, now - 29, 0.1, "ready", 30000), (b, now - 20, now - 19, 0.0, "ready", 0)):
+            self.con.execute(ins, row)
+        text = self.metrics.stats(self.con, 7, now)
+        self.assertIn("上下文：每轮平均 46 万 token（最大 %s 90 万）" % a, text)
+        self.assertIn("自动压缩 1 次（失败 0 次，花 $2.00），压缩前一轮平均 90 万 → 压缩后一轮平均 3 万 token", text)
+        self.assertIn("按执行器：Claude 3 轮 $8.10，Codex 1 轮 $0.00（不报成本、不自动压缩）", text)
+
     def test_backfill_from_stream(self):
         tid = self.new_ticket()
         wd = Path(self.core.get(self.con, tid)["workdir"])
@@ -441,4 +455,9 @@ class CompactTest(TicketdTestCase):
         # 审查 B：开着自动压缩、但压缩失败了：结果卡上要说会话仍然很长
         card = self.con.execute("SELECT card_json FROM outbox ORDER BY id DESC LIMIT 1").fetchone()[0]
         self.assertIn("没能自动压缩", card)
+        # 审查 C：压缩轮有自己的开始时间，不和前一轮共用
+        rows = self.con.execute("SELECT started_at FROM rounds WHERE ticket_id=? ORDER BY id", (tid,)).fetchall()
+        self.assertGreater(rows[1]["started_at"], rows[0]["started_at"])
+        from ticketd import cli
+        self.assertIn("压缩过 1 次（失败 1 次）", cli._ctx_text(self.con, self.core.get(self.con, tid)))
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE kind='compact_failed'").fetchone()[0], 1)

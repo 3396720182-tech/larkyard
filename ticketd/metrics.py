@@ -82,9 +82,46 @@ def round_outcome(con, t) -> str:
     return t["state"]
 
 
-def add_round(con, t, cost: float, outcome: str, ctx_tokens: int = 0) -> None:
+def add_round(con, t, cost: float, outcome: str, ctx_tokens: int = 0, started: Optional[float] = None) -> None:
+    """started：这一轮自己的开始时刻（压缩轮不改 tickets.started_at，不能拿它当开始时间）。"""
     con.execute("INSERT INTO rounds(ticket_id, started_at, ended_at, cost_usd, outcome, ctx_tokens) VALUES(?,?,?,?,?,?)",
-                (t["id"], t["started_at"] or db.now(), db.now(), cost, outcome, ctx_tokens))
+                (t["id"], started or t["started_at"] or db.now(), db.now(), cost, outcome, ctx_tokens))
+
+
+COMPACT_OUTCOMES = ("compact", "compact_failed")
+
+
+def context_summary(con, since: float) -> Optional[str]:
+    """上下文成本：每轮平均 / 最大、自动压缩次数和失败、压缩花了多少、压缩前后下一轮的上下文。没有数据返回 None。"""
+    work = con.execute("SELECT ticket_id, ctx_tokens FROM rounds WHERE ended_at>=? AND ctx_tokens>0"
+                       " AND outcome NOT IN ('compact','compact_failed','backfill')", (since,)).fetchall()
+    comp = con.execute("SELECT id, ticket_id, outcome, cost_usd FROM rounds WHERE ended_at>=? AND outcome IN"
+                       " ('compact','compact_failed') ORDER BY id", (since,)).fetchall()
+    if not work and not comp:
+        return None
+    parts = []
+    if work:
+        top = max(work, key=lambda x: x["ctx_tokens"])
+        parts.append("每轮平均 %.0f 万 token（最大 %s %.0f 万）" % (
+            sum(w["ctx_tokens"] for w in work) / len(work) / 1e4, top["ticket_id"], top["ctx_tokens"] / 1e4))
+    if comp:
+        ok = [c for c in comp if c["outcome"] == "compact"]
+        before, after = [], []
+        for c in ok:
+            b = con.execute("SELECT ctx_tokens FROM rounds WHERE ticket_id=? AND id<? AND outcome NOT IN"
+                            " ('compact','compact_failed') ORDER BY id DESC LIMIT 1", (c["ticket_id"], c["id"])).fetchone()
+            a = con.execute("SELECT ctx_tokens FROM rounds WHERE ticket_id=? AND id>? AND outcome NOT IN"
+                            " ('compact','compact_failed') AND ctx_tokens>0 ORDER BY id LIMIT 1",
+                            (c["ticket_id"], c["id"])).fetchone()
+            if b and a and b["ctx_tokens"]:
+                before.append(b["ctx_tokens"])
+                after.append(a["ctx_tokens"])
+        text = "自动压缩 %d 次（失败 %d 次，花 %s）" % (len(comp), len(comp) - len(ok), _usd(sum(c["cost_usd"] for c in comp)))
+        if before:
+            text += "，压缩前一轮平均 %.0f 万 → 压缩后一轮平均 %.0f 万 token" % (
+                sum(before) / len(before) / 1e4, sum(after) / len(after) / 1e4)
+        parts.append(text)
+    return "上下文：" + "；".join(parts)
 
 
 def stream_costs(path: Path) -> Optional[tuple]:
@@ -174,6 +211,15 @@ def stats(con, days: float = 7, now: Optional[float] = None) -> str:
           since)[0]
     lines.append("工单：新开 %d 张，跑了 %d 轮，worker 成本约 %s%s" % (
         new, r["n"], _usd(r["c"]), "（其中 %d 轮是从老工单补算的，没有结果记录）" % r["b"] if r["b"] else ""))
+    by_exec = q("SELECT t.executor e, COUNT(*) n, COALESCE(SUM(r.cost_usd),0) c FROM rounds r JOIN tickets t"
+                " ON t.id=r.ticket_id WHERE r.ended_at>=? GROUP BY t.executor ORDER BY c DESC", since)
+    if len(by_exec) > 1:  # 两种执行器都有时分开列：Codex 不报成本、也不自动压缩，直接比会不公平
+        lines.append("按执行器：" + "，".join(
+            "%s %d 轮 %s%s" % ("Claude" if x["e"] == "claude" else "Codex", x["n"], _usd(x["c"]),
+                             "（不报成本、不自动压缩）" if x["e"] == "codex" else "") for x in by_exec))
+    ctx = context_summary(con, since)
+    if ctx:
+        lines.append(ctx)
     outs = q("SELECT outcome, COUNT(*) n FROM rounds WHERE ended_at>=? AND outcome<>'backfill'"
              " GROUP BY outcome ORDER BY n DESC", since)
     if outs:
