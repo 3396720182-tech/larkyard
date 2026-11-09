@@ -309,6 +309,7 @@ def cmd_doctor(con, a) -> str:
         elif env is not None and file is None and k not in ("TICKETD_HOME", "TICKETD_SPOOL", "TICKETD_TICKET",
                                                               "TICKETD_RUN", "TICKETD_PYTHON"):
             lines.append("⚠️ %s：只在当前环境里有，config.env 没有，守护进程看不到" % k)
+    lines += _workspace_drift()
     owner = config.file_value("TICKETD_OWNER") or ""
     if not owner.startswith("ou_"):
         bad += 1
@@ -330,6 +331,37 @@ def cmd_doctor(con, a) -> str:
     bad = sum(1 for line in lines if line.startswith("❌"))
     lines.insert(0, "配置自检：%s" % ("没有发现问题" if not bad else "%d 个问题" % bad))
     return "\n".join(lines)
+
+
+def _bridge_workspace() -> str:
+    """bridge 的默认工作目录：先看 TICKETD_WORKSPACE，再尽力读 bridge 的配置（只读；格式是上游的，读不懂就算了）。"""
+    ws = config.workspace()
+    if ws:
+        return os.path.expanduser(ws)
+    try:
+        import json
+        home = os.environ.get("LARK_CHANNEL_HOME") or os.path.expanduser("~/.lark-channel")
+        cfg = json.loads(Path(home, "config.json").read_text(encoding="utf-8"))
+        return cfg["profiles"][cfg["activeProfile"]]["workspaces"]["default"]
+    except Exception:
+        return ""
+
+
+def _workspace_drift() -> list:
+    """主会话约定（工作目录的 CLAUDE.md）是不是本仓库模板渲染出来的最新版（2026-11-08 发现线上那份停在 11-01）。"""
+    ws = _bridge_workspace()
+    if not ws:
+        return ["⚠️ 找不到 bridge 的工作目录，没检查主会话约定（可以在 config.env 里写 TICKETD_WORKSPACE=<目录>）"]
+    live = Path(ws) / "CLAUDE.md"
+    try:
+        want = (config.REPO / "workspace" / "CLAUDE.md.tmpl").read_text(encoding="utf-8").replace("@LARKYARD@", str(config.REPO))
+        have = live.read_text(encoding="utf-8")
+    except OSError as e:
+        return ["❌ 读不了主会话约定（%s）：%s" % (live, e)]
+    if have == want:
+        return ["✅ 主会话约定和本仓库的模板一致"]
+    return ["❌ 主会话约定（%s）和本仓库的模板不一致，可能落后了：确认没有手改的内容后，执行 "
+            "scripts/setup-workspace.sh %s --force 同步（会先备份）" % (live, ws)]
 
 
 def _doctor_dm(con, timeout: float = 45.0):

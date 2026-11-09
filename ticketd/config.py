@@ -204,6 +204,11 @@ def stall_abort() -> float:
     return max(0.0, float(_env("TICKETD_STALL_ABORT", "3600")))
 
 
+def workspace() -> str:
+    """bridge 的工作目录（放主会话约定 CLAUDE.md 的地方）。没配时 ticket doctor 尝试从 bridge 的配置里读默认工作目录。"""
+    return _env("TICKETD_WORKSPACE", "").strip()
+
+
 def digest() -> str:
     """每周运行概况私信给主用户的时刻，如 "mon 10:00"；空 = 不发。"""
     return _env("TICKETD_DIGEST", "mon 10:00").strip()

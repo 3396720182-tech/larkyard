@@ -29,7 +29,8 @@ class TicketdTestCase(unittest.TestCase):
             "TICKETD_LARK": str(FAKES / "fake_lark.py"),
             "FAKE_LARK_LOG": str(self.tmp / "lark.log"),
             "TICKETD_RETRY_DELAYS": "0,0,0",
-            "TICKETD_OUTAGE_RETRY_HOURS": "0",  # 默认不进入故障等待（短重试用完直接失败）；测故障等待的用例自己打开
+            "TICKETD_OUTAGE_RETRY_HOURS": "0",
+            "LARK_CHANNEL_HOME": str(self.tmp / "lark-channel"),  # 不读本机真实的 bridge 配置  # 默认不进入故障等待（短重试用完直接失败）；测故障等待的用例自己打开
             "TICKETD_MAX_WORKERS": "3",
             "TICKETD_TURN_TIMEOUT": "7200",
         })

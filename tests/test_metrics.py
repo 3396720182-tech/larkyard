@@ -256,3 +256,32 @@ class DaemonViewOwnerTest(TicketdTestCase):
         outbox.flush(self.con)
         self.assertEqual(self.con.execute("SELECT status FROM outbox WHERE id=?", (rid,)).fetchone()[0], "dead")
         self.assertIn("ticket doctor", (self.tmp / "home" / "logs" / "alerts.log").read_text(encoding="utf-8"))
+
+
+class WorkspaceDriftTest(TicketdTestCase):
+    def test_drift_detected_and_cleared(self):
+        from ticketd import cli, config
+        ws = self.tmp / "ws"
+        ws.mkdir()
+        os.environ["TICKETD_WORKSPACE"] = str(ws)
+        want = (config.REPO / "workspace" / "CLAUDE.md.tmpl").read_text(encoding="utf-8").replace(
+            "@LARKYARD@", str(config.REPO))
+        (ws / "CLAUDE.md").write_text(want.replace("ticket stats", "ticket ls"), encoding="utf-8")  # 落后的旧版
+        self.assertTrue(cli._workspace_drift()[0].startswith("❌ 主会话约定"))
+        (ws / "CLAUDE.md").write_text(want, encoding="utf-8")
+        self.assertEqual(cli._workspace_drift(), ["✅ 主会话约定和本仓库的模板一致"])
+
+
+class SetupWorkspaceTest(TicketdTestCase):
+    def test_local_file_has_no_example_rules(self):
+        import subprocess
+        from helpers import REPO
+        ws = self.tmp / "ws"
+        ws.mkdir()
+        p = subprocess.run(["/bin/sh", str(REPO / "scripts" / "setup-workspace.sh"), str(ws)],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        local = (ws / "CLAUDE.local.md").read_text(encoding="utf-8")
+        self.assertNotIn("（例）", local)  # 示例句不进个人覆盖，免得主会话当真
+        self.assertIn("CLAUDE.local.example.md", local)
+        self.assertIn(str(REPO) + "/bin/ticket", (ws / "CLAUDE.md").read_text(encoding="utf-8"))

@@ -24,6 +24,7 @@ fi
 sed -e "s|@LARKYARD@|$REPO|g" "$REPO/workspace/CLAUDE.md.tmpl" > "$WS/CLAUDE.md"
 echo "written: $WS/CLAUDE.md"
 if [ ! -e "$WS/CLAUDE.local.md" ]; then
-  cp "$REPO/workspace/CLAUDE.local.example.md" "$WS/CLAUDE.local.md"
-  echo "created: $WS/CLAUDE.local.md（个人覆盖，按需修改）"
+  # 不拷示例文件：示例里的「（例）」句子会被主会话当成真规则执行。只放一句说明，示例另看
+  printf '# 个人覆盖\n\n只属于你自己的约定写在这里（不进仓库）。和 CLAUDE.md 冲突时以这里为准。示例见 %s/workspace/CLAUDE.local.example.md。\n' "$REPO" > "$WS/CLAUDE.local.md"
+  echo "created: $WS/CLAUDE.local.md（个人覆盖，空的，按需写；示例见 workspace/CLAUDE.local.example.md）"
 fi
