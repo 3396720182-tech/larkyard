@@ -285,3 +285,37 @@ class SetupWorkspaceTest(TicketdTestCase):
         self.assertNotIn("（例）", local)  # 示例句不进个人覆盖，免得主会话当真
         self.assertIn("CLAUDE.local.example.md", local)
         self.assertIn(str(REPO) + "/bin/ticket", (ws / "CLAUDE.md").read_text(encoding="utf-8"))
+
+
+class BridgeCostTest(TicketdTestCase):
+    def setUp(self):
+        super().setUp()
+        from ticketd import metrics
+        self.metrics = metrics
+        home = Path(os.environ["LARK_CHANNEL_HOME"])
+        logs = home / "profiles" / "p1" / "logs"
+        logs.mkdir(parents=True)
+        (home / "config.json").write_text(json.dumps({"activeProfile": "p1"}))
+        day = time.strftime("%Y%m%d")
+        evs = [{"event": "enter", "chatId": "oc_a", "chatType": "p2p"},
+               {"event": "usage", "chatId": "oc_a", "costUsd": 3.0},
+               {"event": "usage", "chatId": "oc_a", "costUsd": 35.0},
+               {"event": "enter", "chatId": "oc_b", "chatType": "group"},
+               {"event": "usage", "chatId": "oc_b", "costUsd": 0.5}]
+        (logs / ("bridge-%s.jsonl" % day)).write_text("\n".join(json.dumps(e) for e in evs) + "\nnot json\n")
+
+    def test_latest_cost_per_chat(self):
+        got = self.metrics.bridge_costs(time.time() - 86400)
+        self.assertEqual(got, [("私聊", 35.0), ("群聊 1", 0.5)])
+
+    def test_stats_suggests_new_over_threshold(self):
+        text = self.metrics.stats(self.con, 7)
+        self.assertIn("主会话当前累计：私聊 $35，群聊 1 $0.50", text)
+        self.assertIn("发 /new", text)
+        os.environ["TICKETD_COST_HINT_USD"] = "100"
+        self.assertNotIn("/new", self.metrics.stats(self.con, 7))
+
+    def test_missing_bridge_logs_is_fine(self):
+        os.environ["LARK_CHANNEL_HOME"] = str(self.tmp / "nope")
+        self.assertEqual(self.metrics.bridge_costs(0), [])
+        self.assertNotIn("主会话", self.metrics.stats(self.con, 7))

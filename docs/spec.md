@@ -299,6 +299,9 @@ ticket report --status ready|blocked|failed|dropped|waiting \
 
 - **调整（2026-11-09）配置两处不一致**：第一份周报没发出去，发件箱里静默重试了 51 次，报 `99992361 open_id cross app`。根因：`TICKETD_OWNER` 在 `~/.claude/settings.json` 的环境变量里是对的（Claude Code 会话、主会话里的 `ticket` 命令都读它，所以派单一直正常），在 `~/.ticketd/config.env` 里却是迁移带来的旧应用下的 open_id；守护进程由 launchd 启动，只读 `config.env`。前一晚的测试私信是从 Claude Code 会话里塞进发件箱的，用的是环境变量里的值，没测到守护进程自己的路径。修复：① 99992361 算永久失败，立即标 dead；② 私信主用户本身失败时，告警写明多半是 `config.env` 里的 `TICKETD_OWNER` 不对；③ 新命令 `ticket doctor`：列出当前环境和 `config.env` 不一致的 `TICKETD_*`、只在环境里有而守护进程看不到的项、`config.env` 里有没有有效的主用户、守护进程心跳。
 
+- **调整（2026-11-09）守护进程视角**：系统私信放进发件箱时收件人记成占位 `@owner`，发件箱发送时才按**发送进程**（守护进程）的 `TICKETD_OWNER` 解析并写回；没有有效主用户时标 dead 并告警。`ticket doctor --dm` 放一条测试私信、等守护进程发出后报告结果——不管从哪个会话发起，测的都是守护进程的真实路径。`ticket doctor` 另外把本仓库的 `workspace/CLAUDE.md.tmpl` 渲染一遍，和 bridge 工作目录（`TICKETD_WORKSPACE`，没配时尽力读 bridge 配置里的默认工作目录）的 `CLAUDE.md` 比对，不一致时提示用 `setup-workspace.sh --force` 同步。`setup-workspace.sh` 新建 `CLAUDE.local.md` 时不再拷示例文件（示例里的「（例）」句子会被主会话当成真规则），只写一句说明。
+- **调整（2026-11-09）主会话成本**：`ticket stats` 和每周概况加一行主会话（bridge 会话）的当前累计成本，按 bridge 日志里每轮的 `usage` 事件（`costUsd` 是会话累计值，取每个聊天最近一次；私聊 / 群聊 N，不写聊天 id）；任一 ≥ `TICKETD_COST_HINT_USD` 时建议在那个聊天里发 `/new`。日志是上游格式，只读，读不到就不显示这一行。起因：复盘里同一个主会话累计到 $35。
+
 ## 8. 容错
 
 | 情况 | 处理 |

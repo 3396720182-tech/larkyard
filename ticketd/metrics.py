@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import time
 from pathlib import Path
@@ -186,11 +187,59 @@ def stats(con, days: float = 7, now: Optional[float] = None) -> str:
     ev = [e for e in ev if e["kind"] not in ("run_requested", "run_approved")]
     if ev:
         lines.append("事件：" + "，".join("%s %d" % (EVENT_LABELS.get(e["kind"], e["kind"]), e["n"]) for e in ev))
+    bridge = bridge_costs(since)
+    if bridge:
+        line = "主会话当前累计：" + "，".join("%s %s" % (label, _usd(c)) for label, c in bridge)
+        if hint and any(c >= hint for _, c in bridge):
+            line += "。主会话每条消息都按整段历史计费，在那个聊天里发 /new 重开就好（工单不受影响）"
+        lines.append(line)
     dead = q("SELECT COUNT(*) n FROM outbox WHERE status='dead' AND created_at>=?", since)[0]["n"]
     alerts = _alerts_since(since)
     lines.append("投递：%s；本机告警 %d 条%s" % ("全部送达" if not dead else "%d 条没送达" % dead, alerts,
                                          "（详见 ~/.ticketd/logs/alerts.log）" if alerts else ""))
     return "\n".join(lines)
+
+
+def bridge_costs(since: float) -> List[tuple]:
+    """主会话（bridge 里做判断和派单的会话）当前的累计成本：[(私聊 / 群聊 N, 美元)]，按 bridge 日志里每轮的 usage 事件
+    （costUsd 是会话累计值，取每个聊天最近一次）。日志是上游的格式：只读，读不到或读不懂就返回空，不影响别的统计。"""
+    try:
+        home = os.environ.get("LARK_CHANNEL_HOME") or os.path.expanduser("~/.lark-channel")
+        cfg = json.loads(Path(home, "config.json").read_text(encoding="utf-8"))
+        logs = Path(home, "profiles", cfg["activeProfile"], "logs")
+        day = time.strftime("%Y%m%d", time.localtime(since))
+        files = sorted(p for p in logs.glob("bridge-*.jsonl") if p.stem.split("-")[-1] >= day)
+    except Exception:
+        return []
+    kinds, last = {}, {}
+    for p in files:
+        try:
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if '"usage"' not in line and '"enter"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            chat = d.get("chatId")
+            if not chat:
+                continue
+            if d.get("event") == "enter":
+                kinds[chat] = d.get("chatType")
+            elif d.get("event") == "usage" and isinstance(d.get("costUsd"), (int, float)):
+                last[chat] = float(d["costUsd"])
+    out, groups = [], 0
+    for chat, cost in sorted(last.items(), key=lambda x: -x[1]):
+        if kinds.get(chat) == "p2p":
+            label = "私聊"
+        else:
+            groups += 1
+            label = "群聊 %d" % groups
+        out.append((label, cost))
+    return out
 
 
 def _response_minutes(con, since: float) -> List[float]:

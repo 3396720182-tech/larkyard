@@ -181,6 +181,7 @@ Everything lives in `~/.ticketd/config.env` (environment variables of the same n
 | `TICKETD_WORKER_PATH` | empty | Directories appended to the PATH of workers and out-of-sandbox scripts (colon-separated). The service's PATH is shorter than a login shell's; tools in `/opt/homebrew/bin` or Docker.app go here |
 | `TICKETD_WORKER_ENV` | empty | Allowlist of variable names (comma-separated) whose values, taken from `config.env` or the service environment, are passed to workers and out-of-sandbox scripts, e.g. `NPM_CONFIG_REGISTRY` |
 | `TICKETD_RUN_TIMEOUT` | `1800` | Longest run for an approved out-of-sandbox script (seconds); stopped when exceeded |
+| `TICKETD_WORKSPACE` | empty | The bridge workspace; `ticket doctor` checks whether its CLAUDE.md lags behind the template. Empty reads the bridge's default workspace from its config |
 | `TICKETD_DIGEST` | `mon 10:00` | When to send the weekly summary (`ticket stats`) to the owner as a direct message; empty turns it off |
 | `TICKETD_COST_HINT_USD` | `30` | Once a session's cumulative cost reaches this (USD), suggest a fresh session or a new ticket; `0` turns it off |
 | `TICKETD_STALL_INTERRUPT` | `1800` | Stall handling: after this many seconds without an action, if the current command's processes are not using CPU, end that command (the worker gets a tool error and carries on); `0` turns it off |
@@ -205,7 +206,7 @@ Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (
 /usr/bin/python3 -m unittest discover -s tests       # all unit tests, with fake claude / codex / lark-cli; never touches Feishu
 /usr/bin/python3 scripts/validate_cards.py --dump    # print every card variant; without --dump it validates them via Feishu cardkit (sends nothing)
 /usr/bin/python3 scripts/selftest.py                # end-to-end self-check with real claude (haiku) and the real sandbox, never touches Feishu; run it after upgrading Claude Code
-bin/ticket doctor                                   # config check: the daemon only reads config.env; lists TICKETD_* values that differ from your environment
+bin/ticket doctor [--dm]                            # config check: environment vs what the daemon sees, bridge conventions vs the template; --dm makes the daemon send a real test DM
 ```
 
 - Six orphan-sweep tests inspect real processes (`ps` on macOS, `/proc` on Linux); they fail inside sandboxes that forbid it (e.g. when run by a Larkyard worker).

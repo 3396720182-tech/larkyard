@@ -2,6 +2,8 @@
 
 ## 0.2.0 — 未发布
 
+- 系统私信的收件人改由守护进程发送时按它自己的配置决定；`ticket doctor --dm` 让守护进程真发一条测试私信并报告结果。`ticket doctor` 还会检查 bridge 工作目录里的主会话约定是否落后于模板（新配置项 `TICKETD_WORKSPACE`）。`setup-workspace.sh` 不再把示例文件拷成 `CLAUDE.local.md`。
+- `ticket stats` 和每周概况显示主会话的当前累计成本，超过阈值时建议在那个聊天里发 `/new`。
 - 修复：私信主用户时遇到「open_id 不属于本应用」（99992361）会静默重试一整天；现在立即放弃并写明多半是 `config.env` 里的 `TICKETD_OWNER` 不对。新命令 `ticket doctor` 检查当前环境和守护进程看到的配置是否一致（守护进程只读 `config.env`）。
 - 端到端自检 `scripts/selftest.py`：用真实的 claude 和沙箱检查沙箱语义、普通工单、沙箱外执行、卡住处置四条路径，不发飞书消息。升级 Claude Code 之后先跑它。
 - 长会话成本提示：一张单的会话累计成本超过 `TICKETD_COST_HINT_USD`（默认 $30）时，结果卡上提示后续追问每轮都按整段上下文计费，建议换目标就开新单、或换新会话重来。worker 遇到把工单带向另一个目标的追问会报「不属于本单」。

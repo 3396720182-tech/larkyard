@@ -188,6 +188,7 @@ sudo loginctl enable-linger "$USER"
 | `TICKETD_WORKER_PATH` | 空 | 追加到 worker 和沙箱外执行脚本 PATH 里的目录（冒号分隔）。服务的 PATH 比登录 shell 短，装在 `/opt/homebrew/bin`、Docker.app 里的工具要加在这里 |
 | `TICKETD_WORKER_ENV` | 空 | 变量名白名单（逗号分隔），值从 `config.env` 或服务环境里取，传给 worker 和沙箱外执行的脚本，如 `NPM_CONFIG_REGISTRY` |
 | `TICKETD_RUN_TIMEOUT` | `1800` | 沙箱外执行（用户批准的 worker 脚本）最长多少秒，超时中止 |
+| `TICKETD_WORKSPACE` | 空 | bridge 的工作目录，`ticket doctor` 检查里面的主会话约定是否落后于模板；不填就读 bridge 配置里的默认工作目录 |
 | `TICKETD_DIGEST` | `mon 10:00` | 每周运行概况（`ticket stats`）私信给主用户的时刻；空为不发 |
 | `TICKETD_COST_HINT_USD` | `30` | 会话累计成本到这个数（美元）就提示换新会话或开新单；`0` 为不提示 |
 | `TICKETD_STALL_INTERRUPT` | `1800` | 卡住处置：没有动作满这么多秒、且这次命令的进程没在消耗 CPU，就结束这条命令（worker 收到报错接着做）；`0` 为关 |
@@ -212,7 +213,7 @@ sudo loginctl enable-linger "$USER"
 /usr/bin/python3 -m unittest discover -s tests       # 全部单测，用假的 claude / codex / lark-cli，不碰飞书
 /usr/bin/python3 scripts/validate_cards.py --dump    # 打印所有卡片变体；不带 --dump 会调飞书 cardkit 校验（不发消息）
 /usr/bin/python3 scripts/selftest.py                # 端到端自检：真实 claude（haiku）+ 真实沙箱，不碰飞书；升级 Claude Code 后先跑
-bin/ticket doctor                                   # 配置自检：守护进程只读 config.env，和你环境变量里的 TICKETD_* 不一致时会列出来
+bin/ticket doctor [--dm]                            # 配置自检：和守护进程看到的配置是否一致、主会话约定是否落后于模板；--dm 让守护进程真发一条测试私信
 ```
 
 - 有 6 个孤儿进程清理的用例要查看真实进程（macOS 用 `ps`，Linux 读 `/proc`），在禁止这样做的沙箱里（比如由 Larkyard worker 来跑）会失败，属环境限制。
