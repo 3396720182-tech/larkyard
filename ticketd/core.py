@@ -359,9 +359,7 @@ def add_report(con: sqlite3.Connection, ticket_id: str, status: str, summary: st
             card = templates.result_card(
                 ticket_id, t["title"], t["workdir"], status, summary, arts, ask,
                 phases(con, ticket_id, started or now), now - started if started else None, run=run)
-            # 开了自动压缩时不提示「会话很长、换新会话」：上下文会自动压下来，会话累计成本只增不减，提示会一直挂着
-            hint = (None if config.compact_tokens() else
-                    templates.cost_hint(ticket_id, t["session_cost"] or 0, config.cost_hint_usd()))
+            hint = _cost_hint(con, t)
             if hint and status != "dropped":
                 card["body"]["elements"].insert(len(card["body"]["elements"]) - 1, templates.note(hint))
                 msg += "\n" + hint
@@ -457,6 +455,21 @@ def restart(con: sqlite3.Connection, ticket_id: str) -> None:
         touch(con, ticket_id, session_id=str(uuid.uuid4()), session_started=0, state="idle",
               retries=0, retry_at=0, outage_since=None, session_cost=0)
         add_input(con, ticket_id, "fresh", text)
+
+
+def _cost_hint(con: sqlite3.Connection, t) -> Optional[str]:
+    """结果卡上的成本提示。两个量不混用：会话累计成本只增不减（反映花了多少），上下文规模才决定下一轮多贵。
+    - 没开自动压缩：按会话累计成本提示（原来的行为）。
+    - 开了自动压缩：只有最近一次压缩失败时提示——开着不等于成功了，失败时会话还是长的。"""
+    if not config.compact_tokens():
+        return templates.cost_hint(t["id"], t["session_cost"] or 0, config.cost_hint_usd())
+    last = con.execute("SELECT kind FROM events WHERE ticket_id=? AND kind IN ('compact','compact_failed')"
+                       " ORDER BY id DESC LIMIT 1", (t["id"],)).fetchone()
+    if not last or last["kind"] != "compact_failed":
+        return None
+    ctx = con.execute("SELECT ctx_tokens FROM rounds WHERE ticket_id=? AND ctx_tokens>0 AND outcome NOT IN"
+                      " ('compact','compact_failed') ORDER BY id DESC LIMIT 1", (t["id"],)).fetchone()
+    return templates.compact_failed_hint(t["id"], ctx["ctx_tokens"] if ctx else 0)
 
 
 def pending_run(con: sqlite3.Connection, ticket_id: str) -> Optional[sqlite3.Row]:

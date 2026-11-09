@@ -30,8 +30,13 @@ def report(*args):
 emit({"type": "system", "subtype": "init", "session_id": sid})
 if argv and argv[-1].startswith("/compact"):
     # 会话压缩（ticketd 在上下文很大时先跑这一轮）：不读任务卡、不汇报
-    if os.environ.get("FAKE_COMPACT_FAIL"):
-        emit({"type": "result", "subtype": "success", "is_error": True, "result": "API Error: 400 compaction failed"})
+    once = Path(".compact_failed_once")
+    if os.environ.get("FAKE_COMPACT_FAIL") and not (os.environ.get("FAKE_COMPACT_FAIL_ONCE") and once.exists()):
+        once.write_text("1")
+        msg = os.environ["FAKE_COMPACT_FAIL"]
+        if msg == "1":
+            msg = "API Error: 400 compaction failed"
+        emit({"type": "result", "subtype": "success", "is_error": True, "result": msg})
         sys.exit(1)
     emit({"type": "system", "subtype": "compact_boundary"})
     emit({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 10,

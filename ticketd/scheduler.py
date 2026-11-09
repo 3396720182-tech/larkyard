@@ -696,17 +696,19 @@ class Scheduler:
                 pass
         self.log(rp.workdir, "沙箱外执行 R%d 结束：退出码 %s，用时 %.0fs" % (rp.run_id, code, took))
 
-    def _schedule_retry(self, r: Running, t, delay: float, **fields) -> None:
+    def _schedule_retry(self, r: Running, t, delay: float, add_input: bool = True, **fields) -> None:
         tid = r.ticket_id
         with db.tx(self.con):
-            if t["session_started"]:
+            if not add_input:
+                pass  # 压缩轮：输入还没投递，原样留着
+            elif t["session_started"]:
                 core.add_input(self.con, tid, "retry", RETRY_TEXT)
             else:
                 self.con.executemany("UPDATE inputs SET status='pending' WHERE id=?", [(i,) for i in r.input_ids])
             core.touch_if(self.con, tid, ("running",), state="idle", pid=None, retries=t["retries"] + 1,
                           retry_at=db.now() + delay, **fields)
 
-    def _outage(self, r: Running, t, reason: str, detail: str, account: bool) -> None:
+    def _outage(self, r: Running, t, reason: str, detail: str, account: bool, add_input: bool = True) -> None:
         tid = r.ticket_id
         now = db.now()
         since = t["outage_since"] or now
@@ -723,7 +725,7 @@ class Scheduler:
                 else:
                     core.add_report(self.con, tid, "waiting",
                                     "%s，这一轮没做完，恢复后会自动接着做（%s）：%s" % (reason, plan, detail))
-            self._schedule_retry(r, t, every, outage_since=since)
+            self._schedule_retry(r, t, every, add_input=add_input, outage_since=since)
             self.log(r.workdir, "%s，故障等待中，%.0fs 后自动重试" % (reason, every))
             return
         if account:
@@ -795,14 +797,39 @@ class Scheduler:
                 pass
 
     def _settle_compact(self, r: Running) -> None:
-        """压缩轮结束：不看汇报、不消耗输入。成功失败都清掉 ctx_tokens，下一个 tick 照常投递输入续做（失败了也不再反复压）。"""
+        """压缩轮结束：不看汇报、不消耗输入。
+        - 成功：ctx_tokens 清零，下一个 tick 投递这一轮的输入。
+        - 临时故障（网络、429、5xx）/ 账户级故障（余额、认证）：保留 ctx_tokens（下次仍先压缩），按普通轮次的规则退避重试或进入
+          故障等待，不拿着几十万 token 的上下文去续做——那一轮多半也会失败，就算成功也是在烧钱。
+        - 其他（确定性）失败：清零后照常续做，不卡工单；结果卡上会提示会话没能压缩（core.add_report）。"""
         tid = r.ticket_id
-        ok = r.compacted and not worker.result_error_text(r.result)
-        core.touch(self.con, tid, pid=None, ctx_tokens=0, bg_wait=None)
+        err = worker.result_error_text(r.result)
+        if r.compacted and not err:
+            core.touch(self.con, tid, pid=None, ctx_tokens=0, bg_wait=None)
+            core.touch_if(self.con, tid, ("running",), state="idle")
+            metrics.record(self.con, tid, "compact")
+            self.log(r.workdir, "会话压缩完成，接着投递这一轮的输入")
+            return
+        core.touch(self.con, tid, pid=None, bg_wait=None)
+        t = core.get(self.con, tid)
+        stderr_text = _read_from(Path(r.workdir) / ".stderr.log", r.stderr_offset)
+        acct = worker.account_error(err, r.last_text, stderr_text)
+        transient = not acct and worker.is_transient(r.proc.returncode, r.result, stderr_text)
+        detail = worker._short(err or r.last_text or stderr_text or "没有看到 compact_boundary", 200)
+        if t["state"] == "running" and (acct or transient):
+            metrics.record(self.con, tid, "compact_failed", "稍后重试压缩：" + detail)
+            delays = config.retry_delays()
+            if transient and t["retries"] < len(delays):
+                self._schedule_retry(r, t, delays[t["retries"]], add_input=False)
+                self.log(r.workdir, "会话压缩遇到临时故障，%.0fs 后重试压缩（不拿大上下文硬续做）" % delays[t["retries"]])
+            else:
+                self._outage(r, t, "模型接口%s" % acct if acct else "网络或模型接口故障", detail, bool(acct),
+                             add_input=False)
+            return
+        core.touch(self.con, tid, ctx_tokens=0)
         core.touch_if(self.con, tid, ("running",), state="idle")
-        metrics.record(self.con, tid, "compact" if ok else "compact_failed",
-                       "" if ok else (worker.result_error_text(r.result) or "没有看到 compact_boundary"))
-        self.log(r.workdir, "会话压缩%s，接着投递这一轮的输入" % ("完成" if ok else "没有成功（照常续做）"))
+        metrics.record(self.con, tid, "compact_failed", detail)
+        self.log(r.workdir, "会话压缩没有成功（%s），照常续做" % detail)
 
     def _settle(self, r: Running) -> None:
         tid = r.ticket_id

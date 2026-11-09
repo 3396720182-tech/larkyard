@@ -400,6 +400,35 @@ class CompactTest(TicketdTestCase):
         os.environ["TICKETD_COMPACT_TOKENS"] = "150000"
         self.assertFalse(Scheduler(self.con)._needs_compact(t))
 
+    def test_transient_compaction_failure_retries_compaction_not_the_round(self):  # 审查 A
+        os.environ["FAKE_CTX"] = "200000"
+        tid = self.new_ticket()
+        self.wait(lambda: self.idle(tid), self.sched)
+        os.environ.update({"FAKE_COMPACT_FAIL": "API Error: 529 overloaded", "FAKE_COMPACT_FAIL_ONCE": "1"})
+        os.environ["FAKE_CTX"] = "30000"
+        self.core.send_followup(self.con, tid, "om_2", "再改一下 [[fake:ready]]")
+        self.wait(lambda: len(self.outcomes(tid)) == 4 and self.idle(tid), self.sched)
+        self.assertEqual(self.outcomes(tid), ["ready", "compact_failed", "compact", "ready"])  # 压缩成功前不续做
+        calls = self.argv_log(tid)
+        self.assertTrue(calls[1]["argv"][-1].startswith("/compact") and calls[2]["argv"][-1].startswith("/compact"))
+        self.assertNotIn("上一轮因网络", calls[3]["card"])  # 压缩轮的重试不往真正的输入里塞「上一轮中断」
+        self.assertIn("再改一下", calls[3]["card"])
+
+    def test_balance_during_compaction_waits_instead_of_running_big_context(self):  # 审查 A
+        os.environ.update({"TICKETD_OUTAGE_RETRY_HOURS": "24", "TICKETD_OUTAGE_RETRY_EVERY": "3600"})
+        os.environ["FAKE_CTX"] = "200000"
+        tid = self.new_ticket()
+        self.wait(lambda: self.idle(tid), self.sched)
+        os.environ["FAKE_COMPACT_FAIL"] = "Failed to authenticate. API Error: 403 insufficient balance"
+        self.core.send_followup(self.con, tid, "om_2", "再改一下 [[fake:ready]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None and self.idle(tid), self.sched)
+        t = self.core.get(self.con, tid)
+        self.assertEqual(t["ctx_tokens"], 200110)  # 保留：恢复后先压缩，再续做
+        self.assertEqual(self.outcomes(tid), ["ready", "compact_failed"])
+        self.assertEqual(self.core.last_report(self.con, tid)["status"], "waiting")
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM inputs WHERE ticket_id=? AND status='pending'",
+                                          (tid,)).fetchone()[0], 1)  # 追问还没投递
+
     def test_failed_compaction_still_runs_the_round(self):
         os.environ["FAKE_CTX"] = "200000"
         tid = self.new_ticket()
@@ -409,4 +438,7 @@ class CompactTest(TicketdTestCase):
         self.wait(lambda: len(self.outcomes(tid)) == 3 and self.idle(tid), self.sched)
         self.assertEqual(self.outcomes(tid), ["ready", "compact_failed", "ready"])
         self.assertEqual(self.core.last_report(self.con, tid)["status"], "ready")
+        # 审查 B：开着自动压缩、但压缩失败了：结果卡上要说会话仍然很长
+        card = self.con.execute("SELECT card_json FROM outbox ORDER BY id DESC LIMIT 1").fetchone()[0]
+        self.assertIn("没能自动压缩", card)
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE kind='compact_failed'").fetchone()[0], 1)

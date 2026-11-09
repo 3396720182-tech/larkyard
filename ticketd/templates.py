@@ -325,6 +325,13 @@ def cost_hint(ticket_id: str, session_cost: float, threshold: float) -> Optional
             "同一件事要接着做，可以说「换新会话重来 %s」（工单目录和历次追问会带上）" % (session_cost, ticket_id))
 
 
+def compact_failed_hint(ticket_id: str, ctx_tokens: int) -> str:
+    """开着自动压缩、但这张单最近一次压缩没成功：会话还是长的，下一轮仍按大上下文计费。"""
+    size = "（上一轮约 %d 万 token）" % (ctx_tokens // 10000) if ctx_tokens else ""
+    return ("💰 这张单的会话没能自动压缩，仍然很长%s，之后每次追问都按整段上下文计费。"
+            "换了目标就开新单；同一件事要接着做，可以说「换新会话重来 %s」" % (size, ticket_id))
+
+
 def result_card(ticket_id: str, title: str, workdir: Optional[str], status: str, summary: str,
                 artifacts: List[str], ask: Optional[str], phases: List[str],
                 elapsed: Optional[float], run: Optional[dict] = None) -> dict:
