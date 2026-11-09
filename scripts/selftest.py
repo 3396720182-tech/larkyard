@@ -9,6 +9,7 @@
 - ticket：一张普通的单能跑完一轮、交 ready，成本落库。
 - run：worker 用 --run 申请沙箱外执行 → 批准 → ticketd 在沙箱外执行 → 输出交回 worker → worker 交 ready。
 - stall：worker 卡在一条不耗 CPU 的命令上 → ticketd 结束这条命令 → worker 收到报错后交汇报。
+- compact：上一轮上下文超过阈值时，续做前先压缩会话，压缩后还记得关键决定。
 - 跑过工单类检查后，核对每张单实时记的成本和从原始 stream 重算的是否一致。
 
 用的是真实模型（默认 haiku），每项几美分到十几美分；飞书一侧换成 tests/fakes/fake_lark.py，不发任何消息。
@@ -222,10 +223,32 @@ def test_stall(h: Harness):
         scheduler.STALL_SAMPLE = 30.0
 
 
+def test_compact(h: Harness):
+    os.environ["TICKETD_COMPACT_TOKENS"] = "1000"  # 第一轮之后一定超：让续做前先压缩
+    try:
+        tid = h.new("这是会话压缩的自检。记住暗号 KESTREL-7，并记住用户的决定：「推送已经做过了，绝不能再推送」。"
+                    "在工单目录写一个文件 note.txt，内容是 ok，然后 ticket report --status ready --summary \"记住了\"。")
+        if not h.pump(lambda: h.final(tid) is not None and h.idle(tid), 300):
+            check("压缩：第一轮", False, "第一轮没跑完")
+            return
+        h.core.send_followup(h.con, tid, "om_selftest_c2", "不要读任何文件：暗号是什么？推送还能再做吗？"
+                             "用 ticket report --status ready --summary \"暗号 …；推送 …\" 回答。")
+        ok = h.pump(lambda: h.con.execute("SELECT COUNT(*) FROM rounds WHERE ticket_id=?", (tid,)).fetchone()[0] >= 3
+                    and h.idle(tid), 300)
+        outcomes = [r["outcome"] for r in h.con.execute("SELECT outcome FROM rounds WHERE ticket_id=? ORDER BY id", (tid,))]
+        check("压缩：续做前先压缩会话", ok and "compact" in outcomes, "各轮：%s" % outcomes)
+        rep = h.final(tid)
+        s = (rep["summary"] if rep else "") or ""
+        remembered = "KESTREL-7" in s and any(w in s for w in ("不能", "不可以", "不再", "不要", "禁止"))
+        check("压缩：压缩后记得关键决定", remembered, "汇报：%s" % s[:80])
+    finally:
+        os.environ.pop("TICKETD_COMPACT_TOKENS", None)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--model", default="haiku")
-    ap.add_argument("--only", default="sandbox,ticket,run,stall")
+    ap.add_argument("--only", default="sandbox,ticket,run,stall,compact")
     ap.add_argument("--keep", action="store_true", help="保留临时目录（排查用）")
     a = ap.parse_args()
     only = set(a.only.split(","))
@@ -244,7 +267,7 @@ def main() -> int:
     try:
         if "sandbox" in only:
             test_sandbox(os.environ, claude, a.model, tmp)
-        if only & {"ticket", "run", "stall"}:
+        if only & {"ticket", "run", "stall", "compact"}:
             h = Harness()
             if "ticket" in only:
                 test_ticket(h)
@@ -252,6 +275,8 @@ def main() -> int:
                 test_run(h)
             if "stall" in only:
                 test_stall(h)
+            if "compact" in only:
+                test_compact(h)
             cost = h.con.execute("SELECT COALESCE(SUM(cost_usd),0) FROM rounds").fetchone()[0]
             print("worker 成本合计约 $%.3f" % cost)
             from ticketd import metrics
