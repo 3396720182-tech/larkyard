@@ -9,6 +9,7 @@
 - ticket：一张普通的单能跑完一轮、交 ready，成本落库。
 - run：worker 用 --run 申请沙箱外执行 → 批准 → ticketd 在沙箱外执行 → 输出交回 worker → worker 交 ready。
 - stall：worker 卡在一条不耗 CPU 的命令上 → ticketd 结束这条命令 → worker 收到报错后交汇报。
+- 跑过工单类检查后，核对每张单实时记的成本和从原始 stream 重算的是否一致。
 
 用的是真实模型（默认 haiku），每项几美分到十几美分；飞书一侧换成 tests/fakes/fake_lark.py，不发任何消息。
 退出码：全部通过 0，有失败 1。
@@ -253,6 +254,10 @@ def main() -> int:
                 test_stall(h)
             cost = h.con.execute("SELECT COALESCE(SUM(cost_usd),0) FROM rounds").fetchone()[0]
             print("worker 成本合计约 $%.3f" % cost)
+            from ticketd import metrics
+            checked, bad = metrics.reconcile_costs(h.con)
+            check("成本：实时记账和原始记录一致", checked > 0 and not bad,
+                  "核对 %d 张单%s" % (checked, "，对不上：%s" % bad if bad else ""))
     finally:
         if h is not None:
             h.close()

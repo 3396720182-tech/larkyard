@@ -87,35 +87,56 @@ def add_round(con, t, cost: float, outcome: str) -> None:
                 (t["id"], t["started_at"] or db.now(), db.now(), cost, outcome))
 
 
+def stream_costs(path: Path) -> Optional[tuple]:
+    """从 .stream.jsonl 重算成本：返回 ([每个 result 事件新增的成本], 最后的会话累计值)；没有文件返回 None。
+    规则和调度器实时记账一样：total_cost_usd 是会话累计值，比上次小说明换了会话。"""
+    if not path.is_file():
+        return None
+    prev, rows = 0.0, []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"result"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                c = ev.get("total_cost_usd") if isinstance(ev, dict) and ev.get("type") == "result" else None
+                if not isinstance(c, (int, float)) or isinstance(c, bool):
+                    continue
+                rows.append(c - prev if c >= prev else c)
+                prev = c
+    except OSError:
+        return None
+    return rows, prev
+
+
+def reconcile_costs(con, tolerance: float = 0.01) -> tuple:
+    """对账：每张不在运行中的单，库里的累计成本和从原始 stream 重算的是否一致。返回 (核对了几张, [(工单号, 库里, 重算)])。
+    重启、异常退出、换会话、重复读事件，任何一处记账出错都会在这里露出来。"""
+    checked, bad = 0, []
+    for t in con.execute("SELECT id, workdir, cost_usd FROM tickets WHERE state<>'running'").fetchall():
+        got = stream_costs(Path(t["workdir"]) / ".stream.jsonl")
+        if got is None:
+            continue
+        checked += 1
+        total = sum(got[0])
+        if abs(total - (t["cost_usd"] or 0)) > tolerance:
+            bad.append((t["id"], t["cost_usd"] or 0, total))
+    return checked, bad
+
+
 def backfill_costs(con) -> int:
     """老工单（成本落库之前跑的）从 .stream.jsonl 补成本：每个 result 事件算一轮，按会话累计值换算成本轮成本。
     只补还没有任何轮次记录的工单，可以重复执行。返回补了几张单。"""
     n = 0
     for t in con.execute("SELECT * FROM tickets WHERE id NOT IN (SELECT DISTINCT ticket_id FROM rounds)").fetchall():
-        p = Path(t["workdir"]) / ".stream.jsonl"
-        if not p.is_file():
+        got = stream_costs(Path(t["workdir"]) / ".stream.jsonl")
+        if not got or not got[0]:
             continue
-        prev, total, rows = 0.0, 0.0, []
-        try:
-            with open(p, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if '"result"' not in line:
-                        continue
-                    try:
-                        ev = json.loads(line)
-                    except ValueError:
-                        continue
-                    c = ev.get("total_cost_usd") if ev.get("type") == "result" else None
-                    if not isinstance(c, (int, float)):
-                        continue
-                    delta = c - prev if c >= prev else c  # 变小了说明换了会话
-                    prev = c
-                    total += delta
-                    rows.append(delta)
-        except OSError:
-            continue
-        if not rows:
-            continue
+        rows, prev = got
+        total = sum(rows)
         with db.tx(con):
             for d in rows:
                 con.execute("INSERT INTO rounds(ticket_id, started_at, ended_at, cost_usd, outcome)"

@@ -48,6 +48,12 @@ class CostTest(TicketdTestCase):
         self.idle(tid)
         self.assertEqual(self.rounds(tid)[-1], (0.7, "ready"))
         self.assertAlmostEqual(self.core.get(self.con, tid)["cost_usd"], 4.7)
+        # 实时记账和从原始 stream 重算的一致（跨了续做和换会话）
+        from ticketd import metrics
+        self.assertEqual(metrics.reconcile_costs(self.con), (1, []))
+        self.con.execute("UPDATE tickets SET cost_usd=9 WHERE id=?", (tid,))  # 人为记错
+        checked, bad = metrics.reconcile_costs(self.con)
+        self.assertEqual(bad[0][0], tid)
 
     def test_failed_round_recorded(self):
         tid = self.new_ticket(request="[[fake:noreport]]")

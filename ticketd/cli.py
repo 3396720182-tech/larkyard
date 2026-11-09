@@ -310,6 +310,12 @@ def cmd_doctor(con, a) -> str:
                                                               "TICKETD_RUN", "TICKETD_PYTHON"):
             lines.append("⚠️ %s：只在当前环境里有，config.env 没有，守护进程看不到" % k)
     lines += _workspace_drift()
+    checked, mismatched = metrics.reconcile_costs(con)
+    if mismatched:
+        lines.append("❌ 成本账目有 %d 张单和原始记录对不上：%s" % (len(mismatched), "，".join(
+            "%s 库里 $%.2f / 重算 $%.2f" % m for m in mismatched[:5])))
+    elif checked:
+        lines.append("✅ 成本账目和原始记录一致（核对了 %d 张单）" % checked)
     owner = config.file_value("TICKETD_OWNER") or ""
     if not owner.startswith("ou_"):
         bad += 1
