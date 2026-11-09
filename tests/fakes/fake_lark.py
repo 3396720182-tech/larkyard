@@ -12,7 +12,9 @@ if fail_file and Path(fail_file).exists():
     if n > 0:
         Path(fail_file).write_text(str(n - 1))
         retryable = os.environ.get("FAKE_LARK_PERMANENT") != "1"
-        if retryable:
+        if os.environ.get("FAKE_LARK_FAIL_JSON"):  # 指定具体的报错（如 99992361 open_id cross app）
+            err = json.loads(os.environ["FAKE_LARK_FAIL_JSON"])
+        elif retryable:
             err = {"type": "network", "retryable": True, "message": "boom"}
         else:
             err = {"type": "validation", "code": 230001, "message": "boom"}

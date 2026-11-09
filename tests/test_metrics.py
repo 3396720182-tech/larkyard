@@ -191,3 +191,47 @@ class CostHintTest(TicketdTestCase):
         self.con.execute("UPDATE tickets SET session_cost=88 WHERE id=?", (tid,))
         self.core.add_report(self.con, tid, "dropped", "不属于本单", ask="另一个目标")
         self.assertNotIn("会话已累计", self.last()["card_json"] or "")
+
+
+class OwnerConfigTest(TicketdTestCase):
+    """2026-11-09 实例：config.env 里的 TICKETD_OWNER 是旧应用的 open_id，Claude Code 环境变量里是对的；
+    派单正常，守护进程的周报私信报 open_id cross app，静默重试了 51 次。"""
+
+    def doctor(self):
+        import contextlib
+        import io
+        from ticketd import cli
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.main(["doctor"])
+        return buf.getvalue()
+
+    def test_doctor_flags_env_and_file_mismatch(self):
+        from ticketd import config
+        config.home().mkdir(parents=True, exist_ok=True)
+        config.config_file().write_text("TICKETD_OWNER=ou_old_app\n", encoding="utf-8")
+        os.environ["TICKETD_OWNER"] = "ou_owner"
+        out = self.doctor()
+        self.assertIn("❌ TICKETD_OWNER：当前环境和 config.env 不一致", out)
+        config.config_file().write_text("TICKETD_OWNER=ou_owner\n", encoding="utf-8")
+        self.assertNotIn("不一致", self.doctor())
+
+    def test_doctor_flags_missing_owner_in_file(self):
+        out = self.doctor()  # 测试环境里 TICKETD_OWNER 只在环境变量里
+        self.assertIn("只在当前环境里有", out)
+        self.assertIn("config.env 里没有有效的 TICKETD_OWNER", out)
+
+    def test_cross_app_dm_fails_fast_with_hint(self):
+        from ticketd import metrics, outbox
+        metrics.send_owner(self.con, "周报")
+        fail = self.tmp / "fail"
+        fail.write_text("5")
+        os.environ.update({"FAKE_LARK_FAIL_FILE": str(fail), "FAKE_LARK_FAIL_JSON": json.dumps(
+            {"type": "api", "code": 99992361, "message": "open_id cross app"})})
+        outbox.flush(self.con)
+        row = self.con.execute("SELECT status, attempts FROM outbox").fetchone()
+        self.assertEqual((row["status"], row["attempts"]), ("dead", 1))  # 不再静默重试一整天
+        alerts = (self.tmp / "home" / "logs" / "alerts.log").read_text(encoding="utf-8")
+        self.assertIn("私信主用户失败", alerts)
+        self.assertIn("ticket doctor", alerts)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)  # 不嵌套通知

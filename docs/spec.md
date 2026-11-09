@@ -297,6 +297,8 @@ ticket report --status ready|blocked|failed|dropped|waiting \
 - **长会话成本提示**：终态汇报（dropped 除外）时，这张单当前会话的累计成本 ≥ `TICKETD_COST_HINT_USD`（默认 30 美元）就在结果卡页脚上方加一行「💰 这张单的会话已累计约 $N，之后每次追问都按整段上下文计费。换了目标就开新单；同一件事要接着做，可以说「换新会话重来 Txxxx」」，文字兜底同样带上。起因：T0005 一张单 $88，后期每次追问 $5～8。worker 提示词同时把「追问把工单带向另一个目标」算作不属于本单（报 dropped，让用户开新单）。
 - **每周概况**：守护进程按 `TICKETD_DIGEST`（默认 `mon 10:00`，空 = 不发）把最近 7 天的 `ticket stats` 私信给主用户。每个时刻只发一次（`kv` 表记 `digest_last`，跨重启不重发）；第一次运行只记下时刻、不补发。
 
+- **调整（2026-11-09）配置两处不一致**：第一份周报没发出去，发件箱里静默重试了 51 次，报 `99992361 open_id cross app`。根因：`TICKETD_OWNER` 在 `~/.claude/settings.json` 的环境变量里是对的（Claude Code 会话、主会话里的 `ticket` 命令都读它，所以派单一直正常），在 `~/.ticketd/config.env` 里却是迁移带来的旧应用下的 open_id；守护进程由 launchd 启动，只读 `config.env`。前一晚的测试私信是从 Claude Code 会话里塞进发件箱的，用的是环境变量里的值，没测到守护进程自己的路径。修复：① 99992361 算永久失败，立即标 dead；② 私信主用户本身失败时，告警写明多半是 `config.env` 里的 `TICKETD_OWNER` 不对；③ 新命令 `ticket doctor`：列出当前环境和 `config.env` 不一致的 `TICKETD_*`、只在环境里有而守护进程看不到的项、`config.env` 里有没有有效的主用户、守护进程心跳。
+
 ## 8. 容错
 
 | 情况 | 处理 |

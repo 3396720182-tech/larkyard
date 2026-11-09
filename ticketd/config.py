@@ -47,6 +47,11 @@ def _file_values() -> dict:
     return values
 
 
+def file_value(name: str):
+    """config.env 里的值（不看环境变量）；没有返回 None。守护进程由 launchd / systemd 启动，只看得到这个。"""
+    return _file_values().get(name)
+
+
 def _env(name: str, default: str) -> str:
     if name in os.environ:
         return os.environ[name]

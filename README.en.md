@@ -205,6 +205,7 @@ Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (
 /usr/bin/python3 -m unittest discover -s tests       # all unit tests, with fake claude / codex / lark-cli; never touches Feishu
 /usr/bin/python3 scripts/validate_cards.py --dump    # print every card variant; without --dump it validates them via Feishu cardkit (sends nothing)
 /usr/bin/python3 scripts/selftest.py                # end-to-end self-check with real claude (haiku) and the real sandbox, never touches Feishu; run it after upgrading Claude Code
+bin/ticket doctor                                   # config check: the daemon only reads config.env; lists TICKETD_* values that differ from your environment
 ```
 
 - Six orphan-sweep tests inspect real processes (`ps` on macOS, `/proc` on Linux); they fail inside sandboxes that forbid it (e.g. when run by a Larkyard worker).

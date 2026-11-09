@@ -13,7 +13,8 @@ from typing import Optional, Tuple
 
 from . import config, core, db, safefs, templates
 
-PERMANENT_CODES = {230001, 230002, 230011, 230025}
+# 99992361 open_id cross app：收件人的 open_id 不属于发消息的这个应用（TICKETD_OWNER 配错），重试不会好
+PERMANENT_CODES = {230001, 230002, 230011, 230025, 99992361}
 
 
 def alert(message: str) -> None:
@@ -894,6 +895,9 @@ def _notify_dead(con, r, info: str) -> None:
     """一条消息彻底没送达：私信主用户（原来只写本机 alerts.log，T0016 的结果丢了没人知道）。系统消息自己没送达就不再嵌套通知。"""
     from . import metrics
     if r["ticket_id"] == metrics.SYSTEM_TICKET:
+        # 私信主用户本身失败了：没法再私信，只能写本机告警，并直接给出最可能的原因
+        alert("私信主用户失败（告警或每周概况没送到）：%s。多半是 ~/.ticketd/config.env 里的 TICKETD_OWNER 不是当前"
+              "飞书应用下你的 open_id——守护进程只读这个文件，不读 Claude Code 的环境变量；用 ticket doctor 检查" % short_error(info))
         return
     what = "结果" if r["report_id"] is not None else "一条消息"
     metrics.notify(con, r["ticket_id"], "delivery_dead",

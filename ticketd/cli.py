@@ -72,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--local-net", action="store_true", help="放开本机网络：连本机端口、在本机监听（只对 Claude 单生效）")
     g.add_argument("--socket", help="放开一个 unix socket 路径（如 /var/run/docker.sock；只对 Claude 单生效）")
     sub.add_parser("ls")
+    sub.add_parser("doctor", help="配置自检：当前环境和守护进程看到的配置是否一致、主用户、心跳")
     st = sub.add_parser("stats", help="最近几天的运行概况（成本、需要你的次数、失败、事件）")
     st.add_argument("--days", type=float, default=7)
     st.add_argument("--backfill", action="store_true", help="先从老工单的 .stream.jsonl 补成本（只补没有记录的单）")
@@ -292,6 +293,39 @@ def _status_lines(con, t) -> list:
     return out
 
 
+def cmd_doctor(con, a) -> str:
+    """守护进程由 launchd / systemd 启动，只读 config.env；ticket 命令在 Claude Code 会话里跑，会先读环境变量
+    （如 ~/.claude/settings.json 的 env）。两边不一致时，派单正常但守护进程的私信、执行会用错的值（2026-11-09 实例：
+    TICKETD_OWNER 在 config.env 里是迁移带来的旧 open_id，周报私信报 open_id cross app）。"""
+    lines, bad = [], 0
+    names = sorted(set(k for k in os.environ if k.startswith("TICKETD_")) | set(
+        k for k in config._file_values() if k.startswith("TICKETD_")))
+    for k in names:
+        env, file = os.environ.get(k), config.file_value(k)
+        if env is not None and file is not None and env != file:
+            bad += 1
+            lines.append("❌ %s：当前环境和 config.env 不一致（守护进程用 config.env 里的）" % k)
+        elif env is not None and file is None and k not in ("TICKETD_HOME", "TICKETD_SPOOL", "TICKETD_TICKET",
+                                                              "TICKETD_RUN", "TICKETD_PYTHON"):
+            lines.append("⚠️ %s：只在当前环境里有，config.env 没有，守护进程看不到" % k)
+    owner = config.file_value("TICKETD_OWNER") or ""
+    if not owner.startswith("ou_"):
+        bad += 1
+        lines.append("❌ config.env 里没有有效的 TICKETD_OWNER（ou_ 开头）：只为主用户派单、私信告警都会失败")
+    try:
+        age = time.time() - config.heartbeat_path().stat().st_mtime
+        if age > 60:
+            bad += 1
+            lines.append("❌ 守护进程心跳 %d 秒前，可能没在运行" % age)
+        else:
+            lines.append("✅ 守护进程在运行（心跳 %d 秒前）" % age)
+    except OSError:
+        bad += 1
+        lines.append("❌ 没有守护进程心跳文件，服务可能没装或没启动")
+    lines.insert(0, "配置自检：%s" % ("没有发现问题" if not bad else "%d 个问题" % bad))
+    return "\n".join(lines)
+
+
 def cmd_stats(con, a) -> str:
     out = []
     if a.backfill:
@@ -330,7 +364,7 @@ def cmd_show(con, a) -> str:
 COMMANDS = {
     "new": cmd_new, "send": cmd_send, "lookup": cmd_lookup, "report": cmd_report,
     "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "restart": cmd_restart, "approve": cmd_approve, "grant": cmd_grant,
-    "ls": cmd_ls, "show": cmd_show, "stats": cmd_stats,
+    "ls": cmd_ls, "show": cmd_show, "stats": cmd_stats, "doctor": cmd_doctor,
 }
 
 

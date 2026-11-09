@@ -212,6 +212,7 @@ sudo loginctl enable-linger "$USER"
 /usr/bin/python3 -m unittest discover -s tests       # 全部单测，用假的 claude / codex / lark-cli，不碰飞书
 /usr/bin/python3 scripts/validate_cards.py --dump    # 打印所有卡片变体；不带 --dump 会调飞书 cardkit 校验（不发消息）
 /usr/bin/python3 scripts/selftest.py                # 端到端自检：真实 claude（haiku）+ 真实沙箱，不碰飞书；升级 Claude Code 后先跑
+bin/ticket doctor                                   # 配置自检：守护进程只读 config.env，和你环境变量里的 TICKETD_* 不一致时会列出来
 ```
 
 - 有 6 个孤儿进程清理的用例要查看真实进程（macOS 用 `ps`，Linux 读 `/proc`），在禁止这样做的沙箱里（比如由 Larkyard worker 来跑）会失败，属环境限制。
