@@ -153,6 +153,30 @@ class Running:
         self.round_cost = 0.0
 
 
+class AdoptedProc:
+    """守护进程重启后重新认领的沙箱外执行：不是本进程的子进程，拿不到 wait 状态，退出码从包装脚本写的文件里读。"""
+
+    def __init__(self, pid: int, exit_path: Path):
+        self.pid = pid
+        self.exit_path = exit_path
+        self.returncode: Optional[int] = None
+
+    def poll(self) -> Optional[int]:
+        if self.returncode is not None:
+            return self.returncode
+        if not procs.is_gone(self.pid):
+            return None
+        try:
+            self.returncode = int(self.exit_path.read_text().strip())
+        except (OSError, ValueError):
+            self.returncode = -1  # 结束了但没留下退出码：被杀掉了
+        return self.returncode
+
+
+# 包装：跑完把退出码写进文件，守护进程重启后重新认领时据此交代结果（$1 脚本快照，$2 退出码文件）
+RUN_WRAPPER = 'bash "$1"; c=$?; echo "$c" > "$2"; exit "$c"'
+
+
 class RunProc:
     """一次正在进行的沙箱外执行（用户批准后由守护进程运行 worker 申请时存下的脚本快照）。"""
 
@@ -194,13 +218,27 @@ class Scheduler:
     # ---------- 生命周期 ----------
     def recover(self) -> None:
         for run in self.con.execute("SELECT * FROM runs WHERE status='running'").fetchall():
-            if run["pid"] and _pid_matches(run["pid"], ["R%d.sh" % run["id"]]):
-                _signal_group(run["pid"], signal.SIGKILL)
+            # 沙箱外执行跑在自己的进程组里，守护进程重启（部署）不杀它：还在跑就接着盯，跑完了就按退出码文件交代结果。
+            # 只有既不在跑、也没留下退出码的（被一起杀掉了，比如 Linux 上 systemd 停服务会杀整个 cgroup）才算结果未知
+            exit_path = config.runs_dir() / ("R%d.exit" % run["id"])
+            alive = bool(run["pid"]) and not procs.is_gone(run["pid"]) and _pid_matches(run["pid"], ["R%d.sh" % run["id"]])
+            if alive or exit_path.exists():
+                t = core.get(self.con, run["ticket_id"])
+                rp = RunProc(AdoptedProc(run["pid"] or 0, exit_path), run["id"], run["ticket_id"], t["workdir"],
+                             Path(t["workdir"]) / ("沙箱外执行-R%d.log" % run["id"]),
+                             config.runs_dir() / ("R%d.sh" % run["id"]))
+                rp.started = time.monotonic() - max(0.0, time.time() - (run["started_at"] or time.time()))
+                self.runs[run["ticket_id"]] = rp
+                self.log(t["workdir"], "服务重启，%s沙箱外执行 R%d" % ("接着盯还在跑的" if alive else "收回已经跑完的",
+                                                              run["id"]))
+                continue
             with db.tx(self.con):
                 self.con.execute("UPDATE runs SET status='interrupted', finished_at=? WHERE id=?",
                                  (db.now(), run["id"]))
                 core.add_input(self.con, run["ticket_id"], "run_result", RUN_INTERRUPTED_TEXT % run["id"])
         for t in self.con.execute("SELECT * FROM tickets WHERE state='running'").fetchall():
+            if t["id"] in self.runs:
+                continue  # 状态是沙箱外执行占着的，不是 worker 被打断
             if t["pid"] and _pid_matches(t["pid"], executors.get(worker.executor_of(t)).pid_markers(t)):
                 _signal_group(t["pid"], signal.SIGKILL)
                 _wait_exited(t["pid"])
@@ -213,9 +251,11 @@ class Scheduler:
         self.con.execute("DELETE FROM locks")
 
     def shutdown(self, wait: float = 10.0) -> None:
-        for rp in self.runs.values():  # 库里仍记为 running，下次启动时按「被打断」交代给 worker
+        for rp in self.runs.values():
+            # 不杀：它在自己的进程组里，守护进程停了也会跑完并写下退出码，重启后由 recover 重新认领
+            # （部署要重启守护进程，原来每次都会把正在推送 / 部署的脚本打断在一半）
             if rp.proc.poll() is None:
-                _signal_group(rp.proc, signal.SIGTERM)
+                self.log(rp.workdir, "服务停止，沙箱外执行 R%d 留着继续跑，重启后接着盯" % rp.run_id)
         self.runs.clear()
         for r in self.running.values():
             if r.proc.poll() is None:
@@ -541,8 +581,14 @@ class Scheduler:
             fout = safefs.open_append(log_path)  # 工单目录对 worker 可写：不跟随链接
             env = worker.user_env(dict(os.environ, TICKETD_TICKET=tid, TICKETD_RUN="R%d" % rid))
             env.pop("TICKETD_SPOOL", None)
-            proc = subprocess.Popen([_bash(), str(script_path)], cwd=workdir, stdin=subprocess.DEVNULL,
-                                    stdout=fout, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+            exit_path = d / ("R%d.exit" % rid)
+            try:
+                exit_path.unlink()
+            except OSError:
+                pass
+            proc = subprocess.Popen([_bash(), "-c", RUN_WRAPPER, "ticketd-run", str(script_path), str(exit_path)],
+                                    cwd=workdir, stdin=subprocess.DEVNULL, stdout=fout, stderr=subprocess.STDOUT,
+                                    env=env, start_new_session=True)
         except Exception as e:
             with db.tx(self.con):
                 self.con.execute("UPDATE runs SET status='done', exit_code=-1, finished_at=? WHERE id=?",
@@ -591,10 +637,11 @@ class Scheduler:
                              (code, db.now(), rp.run_id))
             core.add_input(self.con, tid, "run_result", "\n".join(lines))
             core.touch_if(self.con, tid, ("running",), state="idle", last_action_at=db.now())
-        try:
-            rp.script_path.unlink()
-        except OSError:
-            pass
+        for p in (rp.script_path, rp.script_path.with_suffix(".exit")):
+            try:
+                p.unlink()
+            except OSError:
+                pass
         self.log(rp.workdir, "沙箱外执行 R%d 结束：退出码 %s，用时 %.0fs" % (rp.run_id, code, took))
 
     def _schedule_retry(self, r: Running, t, delay: float, **fields) -> None:

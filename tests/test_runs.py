@@ -195,6 +195,42 @@ class RunExecutionTest(TicketdTestCase):
         self.assertIn("被中止", text)
         self.assertNotEqual(self.run_row()["exit_code"], 0)
 
+    def _restart(self):
+        from ticketd.scheduler import Scheduler
+        self.sched.shutdown()
+        self.sched = Scheduler(self.con)
+        self.sched.recover()
+
+    def test_run_survives_daemon_restart(self):
+        tid = self.request("sleep 3\necho after-restart\n")
+        self.core.approve(self.con, tid)
+        self.wait(lambda: tid in self.sched.runs, self.sched)
+        self._restart()  # 部署时重启守护进程：脚本不能被打断
+        self.assertIn(tid, self.sched.runs)
+        self.assertEqual(self.state(tid), "running")  # 不当成 worker 被打断
+        self.wait(lambda: self.run_row()["status"] == "done", self.sched, timeout=30)
+        run = self.run_row()
+        self.assertEqual(run["exit_code"], 0)
+        self.wait(lambda: self.core.last_report(self.con, tid)["status"] == "ready", self.sched)
+        card = self.argv_log(tid)[-1]["card"]
+        self.assertIn("after-restart", card)
+        self.assertNotIn("服务重启打断", card)
+        self.assertFalse((self.config.runs_dir() / ("R%d.exit" % run["id"])).exists())
+
+    def test_run_finished_while_daemon_down_is_collected(self):
+        tid = self.request("echo quick\nexit 3\n")
+        self.core.approve(self.con, tid)
+        self.wait(lambda: tid in self.sched.runs, self.sched)
+        rid = self.run_row()["id"]
+        exit_file = self.config.runs_dir() / ("R%d.exit" % rid)
+        self.sched.runs.clear()  # 守护进程在脚本跑完之前就没了（不做收尾）
+        self.wait(lambda: exit_file.exists(), timeout=10)
+        self._restart()
+        self.wait(lambda: self.run_row()["status"] == "done", self.sched)
+        self.assertEqual(self.run_row()["exit_code"], 3)
+        text = self.con.execute("SELECT text FROM inputs WHERE kind='run_result' ORDER BY id DESC").fetchone()["text"]
+        self.assertIn("退出码：3", text)
+
     def test_restart_marks_running_run_interrupted(self):
         tid = self.new_ticket()
         self.con.execute("UPDATE tickets SET state='running' WHERE id=?", (tid,))

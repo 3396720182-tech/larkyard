@@ -232,6 +232,7 @@ bin/ticket doctor [--dm]                            # 配置自检：和守护�
 - 依赖 lark-channel-bridge 注入的 `<bridge_context>` 字段（`chatId`、`messageIds`、`senderId`）；bridge 改了格式时，工作区约定里的派单命令需要跟着改。
 - 主会话（bridge 里做判断和派单的那个会话）目前只在 Claude Code 上写过、验证过：工作区约定是 `CLAUDE.md`。bridge 的 Codex 主会话（profile `agentKind: "codex"`）还没验证；能路由给 Codex 的是 worker。
 - 主会话由 bridge 管理，同一个会话一直续用（`--resume`），聊得越久上下文越长：实测一个主会话用了一天多累计约 35 美元，后面每条消息都在为整段历史付费，判断也更容易被旧话题带偏。ticketd 管不到这个会话；隔一段时间（比如一批工作做完）在飞书里发 `/new` 重开即可，工单不受影响（工单号、状态都在 ticketd 里，引用旧消息照常能追问）。
+- 沙箱外执行的脚本在 macOS 上能活过守护进程重启（部署时不会被打断）；Linux 上 systemd 停服务会杀掉整个 cgroup，重启后这次执行按「结果未知」交代给 worker。
 - 沙箱外执行（`ticket report --run` + `ticket approve`）让你批准过的脚本以你的身份在沙箱外运行，把关只靠你看过脚本再说「执行」：卡片上是完整脚本，但脚本调用的工单目录里的其他文件不在审批范围内。脚本在 ticketd 的环境里跑（服务的 PATH 较短、没有登录 shell 的代理设置）。
 - `TICKETD_WORKER_ENV` 里的代理变量（`HTTPS_PROXY` 等）到不了 worker 沙箱里的命令：Claude Code 沙箱一律把它们换成自己的本机代理（实测）。它们只对 claude 进程本身和沙箱外执行的脚本生效；Claude Code 的本机代理会不会经由上游代理出网，没有实测。
 - `ticket grant --local-net` 一次放开本机所有端口（Claude Code 沙箱不能按端口细分），`--socket` 放开的服务（如 docker.sock）实际上能在沙箱外做事，按需逐单给。这两种授权只对 Claude 单生效；在 macOS 上实测过连本机端口、本机 bind、unix socket，Linux 上没实测。无头浏览器（Chrome 渲染、截图）授权了也跑不起来（实测会被沙箱的其他限制拦下），要走沙箱外执行。
