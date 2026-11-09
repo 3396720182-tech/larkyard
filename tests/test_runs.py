@@ -163,7 +163,7 @@ class RunExecutionTest(TicketdTestCase):
         self.assertIn("/opt/ly-test/bin", log)
 
     def test_worker_not_started_while_run_in_progress(self):
-        tid = self.request("sleep 2\necho done\n")
+        tid = self.request("sleep 8\necho done\n")  # 要长于下面的观察期（CI 的 macOS 机器慢）
         self.core.approve(self.con, tid)
         self.wait(lambda: tid in self.sched.runs, self.sched)
         self.assertEqual(self.state(tid), "running")
