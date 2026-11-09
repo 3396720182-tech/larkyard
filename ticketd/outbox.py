@@ -912,8 +912,25 @@ def short_error(info: str) -> str:
     return (info or "")[:80]
 
 
+def _resolve_owner(con, r):
+    """系统消息的收件人占位 @owner：按本进程（守护进程）读到的 TICKETD_OWNER 解析并写回。没配置时标 dead 并告警，返回 None。"""
+    from . import metrics
+    if r["reply_to"] != metrics.OWNER:
+        return r
+    owner = config.owner()
+    if not owner.startswith("ou_"):
+        con.execute("UPDATE outbox SET status='dead', last_error=? WHERE id=?", ("没有配置主用户", r["id"]))
+        alert("私信主用户失败：守护进程读到的 TICKETD_OWNER 无效（它只读 ~/.ticketd/config.env，用 ticket doctor 检查）")
+        return None
+    con.execute("UPDATE outbox SET reply_to=? WHERE id=?", (owner, r["id"]))
+    return con.execute("SELECT * FROM outbox WHERE id=?", (r["id"],)).fetchone()
+
+
 def _flush_row(con, r, sender, card_sender, card_patcher, lane) -> bool:
     """发一行并按结果记账。返回 True = 本轮不要再发其余行（网络/超时、库被占用或写不进去）。"""
+    r = _resolve_owner(con, r)
+    if r is None:
+        return False
     try:
         ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher=card_patcher, lane=lane)
         if not ok and _reply_gone(info) and not r["reply_to"].startswith(("oc_", "ou_")):

@@ -16,6 +16,7 @@ from typing import List, Optional
 from . import config, db, templates
 
 SYSTEM_TICKET = "_ticketd"  # 不属于任何工单的系统消息（告警、周报）在发件箱里用的工单号
+OWNER = "@owner"  # 系统消息的收件人占位：发送时由守护进程按它自己的配置解析（outbox._resolve_owner）
 URGENT = {"delivery_dead": "结果没送达", "media_stuck": "媒体任务卡住"}
 PUSH_EVERY = 3600.0
 EVENT_LABELS = {
@@ -45,14 +46,12 @@ def kv_set(con, key: str, value: str) -> None:
     con.execute("INSERT OR REPLACE INTO kv VALUES(?,?)", (key, value))
 
 
-def send_owner(con, text: str) -> bool:
-    """私信主用户（不进任何群）。没配置主用户时不发。"""
-    owner = config.owner()
-    if not owner.startswith("ou_"):
-        return False
-    con.execute("INSERT INTO outbox(ticket_id, reply_to, text, created_at) VALUES(?,?,?,?)",
-                (SYSTEM_TICKET, owner, text, db.now()))
-    return True
+def send_owner(con, text: str) -> int:
+    """私信主用户（不进任何群），返回发件箱行号。收件人不在这里定：记成占位 @owner，由守护进程发送时按它自己读到的
+    TICKETD_OWNER 解析——ticket 命令在 Claude Code 会话里跑时读的是环境变量，守护进程只读 config.env，两边可能不一样
+    （2026-11-09：从会话里塞的测试私信用了环境变量里的值，没测到守护进程自己的路径）。"""
+    return con.execute("INSERT INTO outbox(ticket_id, reply_to, text, created_at) VALUES(?,?,?,?)",
+                       (SYSTEM_TICKET, OWNER, text, db.now())).lastrowid
 
 
 def notify(con, ticket_id: str, kind: str, text: str) -> None:
@@ -63,7 +62,8 @@ def notify(con, ticket_id: str, kind: str, text: str) -> None:
         last = float(kv_get(con, key) or 0)
         if db.now() - last < PUSH_EVERY:
             return
-        if send_owner(con, "🚨 %s：%s" % (URGENT.get(kind, kind), text)):
+        if config.owner().startswith("ou_"):  # 在守护进程里调用：看的就是守护进程自己的配置
+            send_owner(con, "🚨 %s：%s" % (URGENT.get(kind, kind), text))
             kv_set(con, key, str(db.now()))
     except Exception:
         pass
@@ -245,4 +245,7 @@ def maybe_digest(con, now: Optional[float] = None) -> bool:
     if float(last) >= slot:
         return False
     kv_set(con, "digest_last", str(slot))
-    return send_owner(con, stats(con, 7, now))
+    if not config.owner().startswith("ou_"):
+        return False
+    send_owner(con, stats(con, 7, now))
+    return True

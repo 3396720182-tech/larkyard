@@ -72,7 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--local-net", action="store_true", help="放开本机网络：连本机端口、在本机监听（只对 Claude 单生效）")
     g.add_argument("--socket", help="放开一个 unix socket 路径（如 /var/run/docker.sock；只对 Claude 单生效）")
     sub.add_parser("ls")
-    sub.add_parser("doctor", help="配置自检：当前环境和守护进程看到的配置是否一致、主用户、心跳")
+    dr = sub.add_parser("doctor", help="配置自检：当前环境和守护进程看到的配置是否一致、主用户、心跳")
+    dr.add_argument("--dm", action="store_true", help="让守护进程按它自己的配置真的私信你一条，等它发完报结果")
     st = sub.add_parser("stats", help="最近几天的运行概况（成本、需要你的次数、失败、事件）")
     st.add_argument("--days", type=float, default=7)
     st.add_argument("--backfill", action="store_true", help="先从老工单的 .stream.jsonl 补成本（只补没有记录的单）")
@@ -322,8 +323,27 @@ def cmd_doctor(con, a) -> str:
     except OSError:
         bad += 1
         lines.append("❌ 没有守护进程心跳文件，服务可能没装或没启动")
+    if getattr(a, "dm", False):
+        ok, note = _doctor_dm(con)
+        bad += not ok
+        lines.append(("✅ " if ok else "❌ ") + note)
+    bad = sum(1 for line in lines if line.startswith("❌"))
     lines.insert(0, "配置自检：%s" % ("没有发现问题" if not bad else "%d 个问题" % bad))
     return "\n".join(lines)
+
+
+def _doctor_dm(con, timeout: float = 45.0):
+    """守护进程视角的私信测试：只放一行占位收件人的消息，收件人和发送都由守护进程自己决定。"""
+    rid = metrics.send_owner(con, "🔧 ticket doctor 测试私信：守护进程按它自己的配置发出。收到即可，不用回复。")
+    end = time.time() + timeout
+    while time.time() < end:
+        row = con.execute("SELECT status, last_error FROM outbox WHERE id=?", (rid,)).fetchone()
+        if row["status"] == "sent":
+            return True, "守护进程发出了测试私信（去飞书私聊里确认收到）"
+        if row["status"] == "dead":
+            return False, "测试私信没发出：%s" % (row["last_error"] or "")[:200]
+        time.sleep(1)
+    return False, "%d 秒内守护进程没有发出测试私信（服务没在运行，或发送在重试：看 ~/.ticketd/logs/alerts.log）" % timeout
 
 
 def cmd_stats(con, a) -> str:

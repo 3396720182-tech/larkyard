@@ -77,12 +77,13 @@ class NotifyTest(TicketdTestCase):
         self.assertEqual(self.con.execute("SELECT status FROM outbox WHERE ticket_id=?", (tid,)).fetchone()[0], "dead")
         rows = self.owner_rows()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["reply_to"], "ou_owner")  # 私信主用户，不进群
+        self.assertEqual(rows[0]["reply_to"], self.metrics.OWNER)  # 收件人由守护进程发送时解析
         self.assertIn("结果没送达", rows[0]["text"])
         self.assertIn("ticket show %s" % tid, rows[0]["text"])
         # 私信这条用 --user-id 发出去
         self.outbox.flush(self.con)
         self.assertEqual(self.owner_rows()[0]["status"], "sent")
+        self.assertEqual(self.owner_rows()[0]["reply_to"], "ou_owner")  # 发送时按本进程的配置解析成主用户
         sent = [json.loads(x) for x in (self.tmp / "lark.log").read_text(encoding="utf-8").splitlines()]
         self.assertTrue(any("--user-id" in a and "ou_owner" in a for a in sent))
         # 一小时内同一类只推一次，其余只落库
@@ -214,7 +215,7 @@ class OwnerConfigTest(TicketdTestCase):
         out = self.doctor()
         self.assertIn("❌ TICKETD_OWNER：当前环境和 config.env 不一致", out)
         config.config_file().write_text("TICKETD_OWNER=ou_owner\n", encoding="utf-8")
-        self.assertNotIn("不一致", self.doctor())
+        self.assertNotIn("TICKETD_OWNER：当前环境和 config.env 不一致", self.doctor())
 
     def test_doctor_flags_missing_owner_in_file(self):
         out = self.doctor()  # 测试环境里 TICKETD_OWNER 只在环境变量里
@@ -235,3 +236,23 @@ class OwnerConfigTest(TicketdTestCase):
         self.assertIn("私信主用户失败", alerts)
         self.assertIn("ticket doctor", alerts)
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)  # 不嵌套通知
+
+
+class DaemonViewOwnerTest(TicketdTestCase):
+    """收件人在发送时按发送进程（守护进程）的配置解析，不用放进发件箱那一刻的配置。"""
+
+    def test_owner_resolved_at_send_time(self):
+        from ticketd import metrics, outbox
+        rid = metrics.send_owner(self.con, "测试")
+        os.environ["TICKETD_OWNER"] = "ou_daemon_view"  # 发送时的配置和放进来时不同
+        outbox.flush(self.con)
+        row = self.con.execute("SELECT status, reply_to FROM outbox WHERE id=?", (rid,)).fetchone()
+        self.assertEqual((row["status"], row["reply_to"]), ("sent", "ou_daemon_view"))
+
+    def test_no_owner_at_send_time_dies_with_hint(self):
+        from ticketd import metrics, outbox
+        rid = metrics.send_owner(self.con, "测试")
+        os.environ["TICKETD_OWNER"] = ""
+        outbox.flush(self.con)
+        self.assertEqual(self.con.execute("SELECT status FROM outbox WHERE id=?", (rid,)).fetchone()[0], "dead")
+        self.assertIn("ticket doctor", (self.tmp / "home" / "logs" / "alerts.log").read_text(encoding="utf-8"))
