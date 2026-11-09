@@ -359,7 +359,9 @@ def add_report(con: sqlite3.Connection, ticket_id: str, status: str, summary: st
             card = templates.result_card(
                 ticket_id, t["title"], t["workdir"], status, summary, arts, ask,
                 phases(con, ticket_id, started or now), now - started if started else None, run=run)
-            hint = templates.cost_hint(ticket_id, t["session_cost"] or 0, config.cost_hint_usd())
+            # 开了自动压缩时不提示「会话很长、换新会话」：上下文会自动压下来，会话累计成本只增不减，提示会一直挂着
+            hint = (None if config.compact_tokens() else
+                    templates.cost_hint(ticket_id, t["session_cost"] or 0, config.cost_hint_usd()))
             if hint and status != "dropped":
                 card["body"]["elements"].insert(len(card["body"]["elements"]) - 1, templates.note(hint))
                 msg += "\n" + hint

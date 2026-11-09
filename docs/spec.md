@@ -304,6 +304,16 @@ ticket report --status ready|blocked|failed|dropped|waiting \
 - **调整（2026-11-09）成本对账**：`metrics.reconcile_costs` 从每张不在运行中的单的 `.stream.jsonl` 按同样的规则重算成本，和 `tickets.cost_usd` 比对（误差 1 美分以内）。`ticket doctor` 报对不上的单，`scripts/selftest.py` 在工单类检查之后也核对一遍。重启、异常退出、换会话、重复读事件，任何一处记账出错都会在这里露出来。首次在线上核对 33 张单全部一致。
 - **调整（2026-11-09）主会话成本**：`ticket stats` 和每周概况加一行主会话（bridge 会话）的当前累计成本，按 bridge 日志里每轮的 `usage` 事件（`costUsd` 是会话累计值，取每个聊天最近一次；私聊 / 群聊 N，不写聊天 id）；任一 ≥ `TICKETD_COST_HINT_USD` 时建议在那个聊天里发 `/new`。日志是上游格式，只读，读不到就不显示这一行。起因：复盘里同一个主会话累计到 $35。
 
+### 7.3 自动压缩会话（2026-11-09）
+
+起因：长单的成本几乎全部来自上下文规模。T0005 后半程平均每轮读缓存 1700 万 token、重写 91 万 token，输出可以忽略；一张单 $88，后期每轮 $5～8。主会话那边，9 天 $78.7 里只有 $27 是纯派单 / 转发 / 查询，$49 是主会话自己干活（部署、推送、替 worker 在沙箱外跑），所以没有先做「程序路由入口」，先压 worker 的上下文。
+
+做法：调度器从每个 assistant 事件的 usage（输入 + 缓存读 + 缓存写）记下这一轮的上下文峰值，存进 `rounds.ctx_tokens` 和 `tickets.ctx_tokens`。新一轮开始时，如果是 Claude 单、会话已建立、上一轮峰值 ≥ `TICKETD_COMPACT_TOKENS`（默认 150000，0 = 关），先跑一轮 `claude -p --resume <会话> --model <TICKETD_COMPACT_MODEL，默认 sonnet> "/compact <保留要求>"`：不投递输入、不放行任何工具、不要求汇报；不改 `started_at`（卡片按它分轮），`last_action_at` 从开始压缩算。看到 `compact_boundary` 算成功；成功失败都把 `ctx_tokens` 清零，下一个 tick 照常投递这一轮的输入（压缩失败不卡工单、也不反复压），并记事件 `compact` / `compact_failed`、轮次结果 `compact` / `compact_failed`。压缩的成本照常记账（会话累计值继续往上走）。开了自动压缩时，结果卡上的「会话已很长」成本提示不再显示。
+
+保留要求（`worker.COMPACT_PROMPT`）逐条列出：用户的决定和限制（尤其「不要做 / 不能再做」）、授权和审批（含沙箱外执行的申请和结果）、已经执行过的外部动作及结果、未完成事项和下一步、最初的目标和验收标准、关键文件和函数、工单号和目录、结果.md 里的进度；可以丢掉读过的文件全文、命令原始输出、探索过程。
+
+实测（不动核心代码先做的实验）：haiku 上 9.8 万 → 2.5 万 token，不带保留要求时丢了「已部署、不能再部署」这条决定，带上之后 haiku 和 sonnet 都保住了；T0005 真实会话复制一份（`--fork-session`，原会话不动）用 sonnet 压缩：91 万 → 2.4 万 token，压缩约 $2.04，之后一轮约 $0.07；6 道核对题（目标、用户对参考方案的限制、三个授权目录、860 / 654 / 240 积分、11-03 的编号挑图要求、当前进度）全部答对。用较便宜的模型压缩 Opus 会话没有问题，续做照常用原模型。`scripts/selftest.py` 的 compact 项用真实 claude 验证整条链路：ready → compact → ready，压缩后记得暗号和「不能再推送」。
+
 ## 8. 容错
 
 | 情况 | 处理 |

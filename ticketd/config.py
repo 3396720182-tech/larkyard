@@ -163,6 +163,20 @@ def retry_delays() -> list:
     return [float(x) for x in _env("TICKETD_RETRY_DELAYS", "10,40,160").split(",")]
 
 
+def compact_tokens() -> int:
+    """上一轮的上下文峰值到这么多 token，下一轮开始前先压缩会话（Claude Code 的 /compact）；0 = 不压缩。
+    实测（2026-11-09）：T0005 的真实会话 91 万 → 2.4 万 token，关键决定、授权、预算、进度都保住了。"""
+    try:
+        return max(0, int(_env("TICKETD_COMPACT_TOKENS", "150000")))
+    except ValueError:
+        return 150000
+
+
+def compact_model() -> str:
+    """压缩会话用的模型（空 = 会话本来的模型）。实测 sonnet 压缩 Opus 会话质量没问题、便宜得多，之后续做照常用原模型。"""
+    return _env("TICKETD_COMPACT_MODEL", "sonnet").strip()
+
+
 def run_timeout() -> float:
     """一次沙箱外执行最长多久（秒），超时先 SIGTERM，10 秒后 SIGKILL。"""
     return max(1.0, float(_env("TICKETD_RUN_TIMEOUT", "1800")))

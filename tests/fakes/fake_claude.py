@@ -28,8 +28,21 @@ def report(*args):
 
 
 emit({"type": "system", "subtype": "init", "session_id": sid})
+if argv and argv[-1].startswith("/compact"):
+    # 会话压缩（ticketd 在上下文很大时先跑这一轮）：不读任务卡、不汇报
+    if os.environ.get("FAKE_COMPACT_FAIL"):
+        emit({"type": "result", "subtype": "success", "is_error": True, "result": "API Error: 400 compaction failed"})
+        sys.exit(1)
+    emit({"type": "system", "subtype": "compact_boundary"})
+    emit({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 10,
+          "total_cost_usd": float(os.environ.get("FAKE_COMPACT_COST", "0"))})
+    sys.exit(0)
 if mode == "ready":
-    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "做完了"}]}})
+    msg = {"content": [{"type": "text", "text": "做完了"}]}
+    if os.environ.get("FAKE_CTX"):  # 这一轮的上下文规模（真实 claude 在 assistant 事件的 usage 里报）
+        msg["usage"] = {"input_tokens": 10, "cache_read_input_tokens": int(os.environ["FAKE_CTX"]),
+                        "cache_creation_input_tokens": 100}
+    emit({"type": "assistant", "message": msg})
     report("--status", "ready", "--summary", "已完成测试任务", "--artifact", "结果.md")
 elif mode == "blocked":
     report("--status", "blocked", "--summary", "需要权限", "--ask", "能授权 /x 吗？")

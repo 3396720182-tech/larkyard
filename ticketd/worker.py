@@ -26,6 +26,12 @@ FOLLOWUP = """## 用户追问（消息 {mid}）
 先判断这条是否属于本工单范围：属于就处理；不属于就执行
 `ticket report --status dropped --summary "<一句话>" --ask "<为什么不属于本单>"` 然后结束本轮。"""
 
+# 压缩会话时的保留要求（2026-11-09 实测：不带要求时「已经部署过、不能再部署」这类决定会被丢掉，带上之后保住了）
+COMPACT_PROMPT = ("/compact 压缩时必须逐条原样保留：用户明确做出的决定和限制（尤其是「不要做 / 不能再做」的）、授权和审批（可写目录、"
+                  "沙箱外执行的申请和结果）、已经执行过的外部动作（部署、推送、发消息、花钱的生成）及其结果、未完成的事项和下一步、"
+                  "用户最初的目标和验收标准、关键文件路径和函数名、工单号和工单目录、结果.md 里记的进度。"
+                  "可以丢掉：读过的文件全文、命令的原始输出、探索过程。")
+
 REMINDER = """---
 本轮结束前必须执行一次：
 `ticket report --status <ready|blocked|failed|dropped|waiting> --summary "<一句话，面向用户>" [--artifact <路径或链接>] [--ask "<一个具体问题>"]`"""
@@ -171,6 +177,31 @@ def user_env(env: dict) -> dict:
         have = env.get("PATH", "").split(os.pathsep)
         env["PATH"] = os.pathsep.join(have + [p for p in extra if p not in have])
     return env
+
+
+def build_compact_command(ticket) -> List[str]:
+    """压缩这张单的会话：只跑 /compact，不投递输入、不调用工具（dontAsk 且不给任何放行规则）。"""
+    cmd = [config.claude_bin(), "-p", "--setting-sources", "user", "--resume", ticket["session_id"],
+           "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk"]
+    if config.compact_model():
+        cmd += ["--model", config.compact_model()]
+    return cmd + [COMPACT_PROMPT]
+
+
+def context_tokens(d: dict) -> int:
+    """assistant 事件这一次调用读入的上下文规模（新输入 + 缓存读 + 缓存写）；不是 assistant 事件返回 0。"""
+    if d.get("type") != "assistant":
+        return 0
+    msg = d.get("message")
+    u = msg.get("usage") if isinstance(msg, dict) else None
+    if not isinstance(u, dict):
+        return 0
+    total = 0
+    for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+        v = u.get(k)
+        if isinstance(v, int) and not isinstance(v, bool):
+            total += v
+    return total
 
 
 def worker_env(ticket) -> dict:

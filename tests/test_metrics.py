@@ -175,9 +175,17 @@ class CostHintTest(TicketdTestCase):
         super().setUp()
         from ticketd import core
         self.core = core
+        os.environ["TICKETD_COMPACT_TOKENS"] = "0"  # 提示只在关掉自动压缩时出现
 
     def last(self):
         return self.con.execute("SELECT text, card_json FROM outbox ORDER BY id DESC LIMIT 1").fetchone()
+
+    def test_hint_hidden_when_auto_compaction_on(self):
+        os.environ["TICKETD_COMPACT_TOKENS"] = "150000"
+        tid = self.new_ticket()
+        self.con.execute("UPDATE tickets SET session_cost=88 WHERE id=?", (tid,))
+        self.core.add_report(self.con, tid, "ready", "好了")
+        self.assertNotIn("会话已累计", self.last()["card_json"])
 
     def test_long_session_gets_hint_on_result(self):
         tid = self.new_ticket()
@@ -325,3 +333,80 @@ class BridgeCostTest(TicketdTestCase):
         os.environ["LARK_CHANNEL_HOME"] = str(self.tmp / "nope")
         self.assertEqual(self.metrics.bridge_costs(0), [])
         self.assertNotIn("主会话", self.metrics.stats(self.con, 7))
+
+
+class CompactTest(TicketdTestCase):
+    """上一轮上下文到阈值：下一轮开始前先压缩会话（2026-11-09 实测 T0005 91 万 → 2.4 万 token）。"""
+
+    def setUp(self):
+        super().setUp()
+        from ticketd import core
+        from ticketd.scheduler import Scheduler
+        self.core = core
+        self.sched = Scheduler(self.con)
+        os.environ["TICKETD_COMPACT_TOKENS"] = "150000"
+
+    def tearDown(self):
+        self.sched.shutdown()
+        super().tearDown()
+
+    def argv_log(self, tid):
+        p = Path(self.core.get(self.con, tid)["workdir"]) / ".fake_argv.jsonl"
+        return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()]
+
+    def idle(self, tid):
+        return self.core.get(self.con, tid)["state"] == "idle" and tid not in self.sched.running
+
+    def outcomes(self, tid):
+        return [r["outcome"] for r in self.con.execute("SELECT outcome FROM rounds WHERE ticket_id=? ORDER BY id", (tid,))]
+
+    def test_big_context_compacts_before_next_round(self):
+        os.environ["FAKE_CTX"] = "200000"
+        tid = self.new_ticket()
+        self.wait(lambda: self.idle(tid), self.sched)
+        t = self.core.get(self.con, tid)
+        self.assertEqual(t["ctx_tokens"], 200110)
+        self.assertEqual(self.con.execute("SELECT ctx_tokens FROM rounds WHERE ticket_id=?", (tid,)).fetchone()[0], 200110)
+        os.environ["FAKE_CTX"] = "30000"
+        self.core.send_followup(self.con, tid, "om_2", "再改一下 [[fake:ready]]")
+        self.wait(lambda: len(self.outcomes(tid)) == 3 and self.idle(tid), self.sched)
+        calls = self.argv_log(tid)
+        compact = calls[1]["argv"]
+        self.assertTrue(compact[-1].startswith("/compact "))
+        self.assertIn("不能再做", compact[-1])  # 带着保留要求
+        self.assertEqual(compact[compact.index("--resume") + 1], t["session_id"])
+        self.assertEqual(compact[compact.index("--model") + 1], "sonnet")
+        self.assertEqual(calls[1]["card"], "")  # 压缩轮不投递任何输入
+        self.assertIn("再改一下", calls[2]["card"])  # 追问在压缩之后照常投递
+        self.assertEqual(self.outcomes(tid), ["ready", "compact", "ready"])
+        self.assertEqual(self.core.get(self.con, tid)["ctx_tokens"], 30110)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE kind='compact'").fetchone()[0], 1)
+
+    def test_small_context_or_off_or_codex_does_not_compact(self):
+        os.environ["FAKE_CTX"] = "50000"
+        tid = self.new_ticket()
+        self.wait(lambda: self.idle(tid), self.sched)
+        self.core.send_followup(self.con, tid, "om_2", "再改一下 [[fake:ready]]")
+        self.wait(lambda: len(self.outcomes(tid)) == 2 and self.idle(tid), self.sched)
+        self.assertNotIn("compact", self.outcomes(tid))
+        self.con.execute("UPDATE tickets SET ctx_tokens=900000 WHERE id=?", (tid,))
+        os.environ["TICKETD_COMPACT_TOKENS"] = "0"
+        self.core.send_followup(self.con, tid, "om_3", "又改 [[fake:ready]]")
+        self.wait(lambda: len(self.outcomes(tid)) == 3 and self.idle(tid), self.sched)
+        self.assertNotIn("compact", self.outcomes(tid))
+        from ticketd.scheduler import Scheduler
+        t = dict(self.core.get(self.con, tid))
+        t.update(executor="codex", ctx_tokens=900000)
+        os.environ["TICKETD_COMPACT_TOKENS"] = "150000"
+        self.assertFalse(Scheduler(self.con)._needs_compact(t))
+
+    def test_failed_compaction_still_runs_the_round(self):
+        os.environ["FAKE_CTX"] = "200000"
+        tid = self.new_ticket()
+        self.wait(lambda: self.idle(tid), self.sched)
+        os.environ["FAKE_COMPACT_FAIL"] = "1"
+        self.core.send_followup(self.con, tid, "om_2", "再改一下 [[fake:ready]]")
+        self.wait(lambda: len(self.outcomes(tid)) == 3 and self.idle(tid), self.sched)
+        self.assertEqual(self.outcomes(tid), ["ready", "compact_failed", "ready"])
+        self.assertEqual(self.core.last_report(self.con, tid)["status"], "ready")
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE kind='compact_failed'").fetchone()[0], 1)

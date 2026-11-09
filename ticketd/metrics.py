@@ -24,7 +24,7 @@ EVENT_LABELS = {
     "stall_flag": "疑似卡住", "stall_interrupt": "卡住后中断命令", "stall_abort": "卡住后中止一轮",
     "outage_start": "进入故障等待", "api_error": "模型接口报错", "run_requested": "申请沙箱外执行",
     "run_approved": "批准沙箱外执行", "delivery_dead": "结果没送达", "media_stuck": "媒体任务卡住",
-    "card_giveup": "状态卡放弃",
+    "card_giveup": "状态卡放弃", "compact": "压缩会话", "compact_failed": "压缩会话失败",
 }
 
 
@@ -82,9 +82,9 @@ def round_outcome(con, t) -> str:
     return t["state"]
 
 
-def add_round(con, t, cost: float, outcome: str) -> None:
-    con.execute("INSERT INTO rounds(ticket_id, started_at, ended_at, cost_usd, outcome) VALUES(?,?,?,?,?)",
-                (t["id"], t["started_at"] or db.now(), db.now(), cost, outcome))
+def add_round(con, t, cost: float, outcome: str, ctx_tokens: int = 0) -> None:
+    con.execute("INSERT INTO rounds(ticket_id, started_at, ended_at, cost_usd, outcome, ctx_tokens) VALUES(?,?,?,?,?,?)",
+                (t["id"], t["started_at"] or db.now(), db.now(), cost, outcome, ctx_tokens))
 
 
 def stream_costs(path: Path) -> Optional[tuple]:
@@ -178,7 +178,7 @@ def stats(con, days: float = 7, now: Optional[float] = None) -> str:
              " GROUP BY outcome ORDER BY n DESC", since)
     if outs:
         names = dict(templates.LABELS, retry="🔁 临时故障重试", stopped="⏹️ 被停止", held="⏸️ 被暂停",
-                     idle="空闲", running="运行中")
+                     idle="空闲", running="运行中", compact="🗜️ 压缩会话", compact_failed="压缩会话失败")
         lines.append("每轮结果：" + "，".join("%s %d" % (names.get(o["outcome"], o["outcome"]), o["n"]) for o in outs))
     top = q("SELECT r.ticket_id, SUM(r.cost_usd) c, t.title FROM rounds r JOIN tickets t ON t.id=r.ticket_id"
             " WHERE r.ended_at>=? GROUP BY r.ticket_id ORDER BY c DESC LIMIT 3", since)

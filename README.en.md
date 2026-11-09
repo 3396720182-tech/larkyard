@@ -180,6 +180,8 @@ Everything lives in `~/.ticketd/config.env` (environment variables of the same n
 | `TICKETD_TURN_TIMEOUT` | `7200` | Per-turn timeout (seconds) |
 | `TICKETD_WORKER_PATH` | empty | Directories appended to the PATH of workers and out-of-sandbox scripts (colon-separated). The service's PATH is shorter than a login shell's; tools in `/opt/homebrew/bin` or Docker.app go here |
 | `TICKETD_WORKER_ENV` | empty | Allowlist of variable names (comma-separated) whose values, taken from `config.env` or the service environment, are passed to workers and out-of-sandbox scripts, e.g. `NPM_CONFIG_REGISTRY` |
+| `TICKETD_COMPACT_TOKENS` | `150000` | When the previous round's peak context reaches this many tokens, compact the session before the next round (Claude tickets); `0` turns it off |
+| `TICKETD_COMPACT_MODEL` | `sonnet` | Model used for compaction; empty uses the session's own model |
 | `TICKETD_RUN_TIMEOUT` | `1800` | Longest run for an approved out-of-sandbox script (seconds); stopped when exceeded |
 | `TICKETD_WORKSPACE` | empty | The bridge workspace; `ticket doctor` checks whether its CLAUDE.md lags behind the template. Empty reads the bridge's default workspace from its config |
 | `TICKETD_DIGEST` | `mon 10:00` | When to send the weekly summary (`ticket stats`) to the owner as a direct message; empty turns it off |

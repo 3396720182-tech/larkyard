@@ -151,6 +151,9 @@ class Running:
         self.stall_aborted = False
         self.cost_seen = 0.0                       # 已经记进库的会话累计成本（Claude 的 total_cost_usd 按会话累计）
         self.round_cost = 0.0
+        self.ctx_max = 0                           # 这一轮的上下文峰值（token）
+        self.compact = False                       # 这是一轮会话压缩（不投递输入、不要求汇报）
+        self.compacted = False                     # 看到了 compact_boundary
 
 
 class AdoptedProc:
@@ -304,8 +307,54 @@ class Scheduler:
                 except Exception as e:
                     self.log(t["workdir"], "启动出错：%r" % e)
 
+    def _needs_compact(self, t) -> bool:
+        limit = config.compact_tokens()
+        return bool(limit and t["session_started"] and worker.executor_of(t) == "claude"
+                    and (t["ctx_tokens"] or 0) >= limit)
+
+    def _start_compact(self, t) -> bool:
+        """上一轮的上下文已经很大：先压缩会话，再投递这一轮的输入（下一个 tick 照常开轮）。
+        长单每一轮的成本几乎全来自上下文规模（T0005 后半程每轮读 1700 万 token 缓存），压缩后从 2 万多 token 起步。
+        不改 started_at（状态卡、结果卡按它分轮）；last_action_at 从现在算，免得一开始就被当成卡住。"""
+        tid = t["id"]
+        workdir = Path(t["workdir"])
+        with db.tx(self.con):
+            if core.get(self.con, tid)["state"] not in ("queued", "idle", "failed"):
+                return False
+            mark = self.con.execute("SELECT COALESCE(MAX(id),0) FROM reports WHERE ticket_id=?", (tid,)).fetchone()[0]
+            core.touch(self.con, tid, state="running", last_action_at=db.now(), stall_alerted=0,
+                       last_step="压缩会话（上一轮上下文约 %d 万 token）" % ((t["ctx_tokens"] or 0) // 10000))
+        fds: List[int] = []
+        try:
+            fout = safefs.open_append(workdir / ".stream.jsonl")
+            fds.append(fout)
+            ferr = safefs.open_append(workdir / ".stderr.log")
+            fds.append(ferr)
+            so, eo = os.fstat(fout).st_size, os.fstat(ferr).st_size
+            proc = subprocess.Popen(worker.build_compact_command(t), cwd=str(workdir), stdin=subprocess.DEVNULL,
+                                    stdout=fout, stderr=ferr, env=worker.worker_env(t), start_new_session=True)
+        except Exception as e:
+            # 压缩起不来就不压了，照常续做（ctx_tokens 清零，不会每个 tick 都再试）
+            core.touch(self.con, tid, ctx_tokens=0)
+            core.touch_if(self.con, tid, ("running",), state="idle")
+            metrics.record(self.con, tid, "compact_failed", repr(e))
+            self.log(str(workdir), "压缩会话没能启动，照常续做：%r" % e)
+            return False
+        finally:
+            for fd in fds:
+                os.close(fd)
+        core.touch(self.con, tid, pid=proc.pid)
+        r = Running(proc, tid, str(workdir), [], mark, so, eo, "claude", t["session_id"])
+        r.compact = True
+        r.cost_seen = float(t["session_cost"] or 0)
+        self.running[tid] = r
+        self.log(str(workdir), "上一轮上下文约 %d 万 token，先压缩会话再接着做" % ((t["ctx_tokens"] or 0) // 10000))
+        return True
+
     def start(self, t) -> bool:
         tid = t["id"]
+        if self._needs_compact(t):
+            return self._start_compact(t)
         gp = core.grants(self.con, tid)
         workdir = Path(t["workdir"])
         with db.tx(self.con):
@@ -372,6 +421,9 @@ class Scheduler:
         if step:
             r.last_step = step
             r.activity_dirty = True
+        r.ctx_max = max(r.ctx_max, worker.context_tokens(ev))
+        if ev.get("type") == "system" and ev.get("subtype") == "compact_boundary":
+            r.compacted = True
         bg = worker.bg_task_event(ev)
         if bg is not None:
             if bg[0] == "start":
@@ -726,7 +778,13 @@ class Scheduler:
         try:
             self._settle(r)
             t = core.get(self.con, tid)
-            metrics.add_round(self.con, t, r.round_cost, metrics.round_outcome(self.con, t))
+            if r.compact:
+                outcome = "compact" if r.compacted else "compact_failed"
+            else:
+                outcome = metrics.round_outcome(self.con, t)
+                if r.ctx_max:
+                    core.touch(self.con, tid, ctx_tokens=r.ctx_max)
+            metrics.add_round(self.con, t, r.round_cost, outcome, r.ctx_max)
         except Exception as e:  # 收割出错也不能让工单卡在 running、锁不释放
             self.con.execute("DELETE FROM locks WHERE ticket_id=?", (tid,))
             core.touch_if(self.con, tid, ("running",), state="failed", pid=None)
@@ -736,8 +794,21 @@ class Scheduler:
             except Exception:
                 pass
 
+    def _settle_compact(self, r: Running) -> None:
+        """压缩轮结束：不看汇报、不消耗输入。成功失败都清掉 ctx_tokens，下一个 tick 照常投递输入续做（失败了也不再反复压）。"""
+        tid = r.ticket_id
+        ok = r.compacted and not worker.result_error_text(r.result)
+        core.touch(self.con, tid, pid=None, ctx_tokens=0, bg_wait=None)
+        core.touch_if(self.con, tid, ("running",), state="idle")
+        metrics.record(self.con, tid, "compact" if ok else "compact_failed",
+                       "" if ok else (worker.result_error_text(r.result) or "没有看到 compact_boundary"))
+        self.log(r.workdir, "会话压缩%s，接着投递这一轮的输入" % ("完成" if ok else "没有成功（照常续做）"))
+
     def _settle(self, r: Running) -> None:
         tid = r.ticket_id
+        if r.compact:
+            self._settle_compact(r)
+            return
         self.con.execute("DELETE FROM locks WHERE ticket_id=?", (tid,))
         core.touch(self.con, tid, pid=None, bg_wait=None)  # 进程已退出；下面的状态迁移即使因停止/暂停而落空，pid 也要清掉
         t = core.get(self.con, tid)

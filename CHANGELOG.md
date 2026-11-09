@@ -2,6 +2,7 @@
 
 ## 0.2.0 — 未发布
 
+- 自动压缩会话：长单的上一轮上下文超过 `TICKETD_COMPACT_TOKENS`（默认 15 万 token）时，下一轮开始前先用 Claude Code 的 `/compact`（默认 sonnet）压缩会话，并要求保留决定、授权、外部动作和进度。实测 T0005 的真实会话 91 万 → 2.4 万 token，关键信息全部保住。每轮的上下文规模记进轮次表。新配置项 `TICKETD_COMPACT_TOKENS`、`TICKETD_COMPACT_MODEL`。
 - 沙箱外执行的脚本不再被守护进程重启打断（macOS）：停服务时留着继续跑，重启后重新认领，跑完的按退出码照常交回 worker。
 - 成本对账：`ticket doctor` 和端到端自检会核对每张单实时记的成本和从原始记录重算的是否一致。
 - 系统私信的收件人改由守护进程发送时按它自己的配置决定；`ticket doctor --dm` 让守护进程真发一条测试私信并报告结果。`ticket doctor` 还会检查 bridge 工作目录里的主会话约定是否落后于模板（新配置项 `TICKETD_WORKSPACE`）。`setup-workspace.sh` 不再把示例文件拷成 `CLAUDE.local.md`。

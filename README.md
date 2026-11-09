@@ -187,6 +187,8 @@ sudo loginctl enable-linger "$USER"
 | `TICKETD_TURN_TIMEOUT` | `7200` | 单轮超时（秒） |
 | `TICKETD_WORKER_PATH` | 空 | 追加到 worker 和沙箱外执行脚本 PATH 里的目录（冒号分隔）。服务的 PATH 比登录 shell 短，装在 `/opt/homebrew/bin`、Docker.app 里的工具要加在这里 |
 | `TICKETD_WORKER_ENV` | 空 | 变量名白名单（逗号分隔），值从 `config.env` 或服务环境里取，传给 worker 和沙箱外执行的脚本，如 `NPM_CONFIG_REGISTRY` |
+| `TICKETD_COMPACT_TOKENS` | `150000` | 上一轮的上下文峰值到这么多 token，下一轮开始前先压缩会话（Claude 单）；`0` 为不压缩 |
+| `TICKETD_COMPACT_MODEL` | `sonnet` | 压缩会话用的模型；空为会话本来的模型 |
 | `TICKETD_RUN_TIMEOUT` | `1800` | 沙箱外执行（用户批准的 worker 脚本）最长多少秒，超时中止 |
 | `TICKETD_WORKSPACE` | 空 | bridge 的工作目录，`ticket doctor` 检查里面的主会话约定是否落后于模板；不填就读 bridge 配置里的默认工作目录 |
 | `TICKETD_DIGEST` | `mon 10:00` | 每周运行概况（`ticket stats`）私信给主用户的时刻；空为不发 |
