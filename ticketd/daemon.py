@@ -9,7 +9,7 @@ import time
 import traceback
 from typing import Optional
 
-from . import card, config, db, metrics, outbox, telemetry
+from . import card, config, db, metrics, outbox, telemetry, update
 from .scheduler import Scheduler
 
 ALERT_INTERVAL = 600.0
@@ -284,7 +284,9 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGINT, handle)
     throttle = _ErrorThrottle()
     media = MediaLane()
+    updater = update.Updater(con)  # 没配置更新源时不发请求；切回后的私信、试用期确认在这里
     print("ticketd started", flush=True)
+    code = 0
     while not stop["flag"]:
         media.ensure()
         _guarded(throttle, "tick", sched.tick)
@@ -294,9 +296,20 @@ def main(argv=None) -> int:
         _guarded(throttle, "digest", lambda: metrics.maybe_digest(con))
         _guarded(throttle, "telemetry", lambda: telemetry.maybe_send(con))  # 默认关闭；开启后每天一份，发送在单独线程
         _beat()
+        restart = {"go": False}
+
+        def _upd():
+            # 自检只看调度本身有没有在报错：飞书不通、发件箱报错这类旧版本一样会有的问题不算（不然一次断网就会误切回）
+            restart["go"] = updater.tick(sched, media, healthy="tick" not in throttle.state)
+        _guarded(throttle, "update", _upd)
+        if restart["go"]:
+            # 已切换版本：按停机流程退出，launchd（KeepAlive）/ systemd（Restart=always）经启动器拉起新版本
+            print("ticketd restarting for update", flush=True)
+            code = update.EXIT_RESTART
+            break
         time.sleep(next_sleep(throttle.streak()))
     media.stop()
     sched.shutdown()
     con.close()
     print("ticketd stopped", flush=True)
-    return 0
+    return code

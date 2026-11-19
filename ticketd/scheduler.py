@@ -215,6 +215,7 @@ class Scheduler:
         self.con = con
         self.running: Dict[str, Running] = {}
         self.runs: Dict[str, RunProc] = {}
+        self.update_hold = False  # 自动更新正在安装（ticketd/update.py）：不启动新 worker 和沙箱外脚本，已有的照常盯
 
     # ---------- 日志 ----------
     def log(self, workdir: str, line: str) -> None:
@@ -297,6 +298,8 @@ class Scheduler:
                 rp = self.runs.get(tid)
                 if rp is not None:
                     self.log(rp.workdir, "监视沙箱外执行出错：%r" % e)
+        if self.update_hold:
+            return
         try:
             self._launch_runs()
         except Exception:

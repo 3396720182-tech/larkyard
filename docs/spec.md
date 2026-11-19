@@ -381,3 +381,43 @@ cp <工作区>/CLAUDE.md.bak-<时间> <工作区>/CLAUDE.md
 ```
 
 `~/.ticketd/` 和工单目录保留，不删。
+
+**调整（2026-11-20，T0042，自动更新）**：多了一种「受管安装」。执行过 `ticket update adopt` 的安装，代码在 `~/.ticketd/app/versions/<版本>/`，服务经版本目录外的启动器 `~/.ticketd/app/launcher.py` 运行 `~/.ticketd/app/current/bin/ticketd`，bridge 工作区 `CLAUDE.md` 里的 ticket 路径是 `~/.ticketd/app/current/bin/ticket`。它的回滚有三层：自动（新版本试用期内自检不过，启动器切回上一个版本）、`ticket update rollback`（空闲时切回本机上一个版本）、`ticket update adopt --undo`（退回就地运行，服务和工作区都改回原克隆）。守护进程和命令都起不来时手工把 `current` 链接改回旧版本目录再重启服务（README「自动更新」一节）。没有执行 `adopt` 的安装，上线和回滚和上面完全一样。
+
+## 11. 自动更新（2026-11-20，T0042）
+
+行为以 `openspec/changes/add-signed-self-update/specs/release-signing/spec.md`（发版和签名）和 `specs/self-update/spec.md`（客户端）为准，设计取舍见同目录的 `design.md`。这里记实现上的约定。
+
+**默认关闭**：`TICKETD_UPDATE_URL` 空（仓库里没有默认值）时，守护进程只做两件不发请求的事：读 `update-state.json` 发切回后的私信、确认试用期。启用要同时满足：配了 `file://` 或 `https://` 更新源、`~/.ticketd/update/` 下有 `main.allowed_signers` 和 `backup.allowed_signers`、当前运行的代码就是 `~/.ticketd/app/current` 指向的版本目录、`ssh-keygen -Y verify` 能验过内置的一份探测签名。
+
+**格式**（`ticketd/updsig.py`，发版工具和客户端共用）：清单是 `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)` 的 UTF-8 字节，签名针对这份字节，客户端解析后重新序列化必须逐字节相同。签名是 `ssh-keygen -Y sign -n larkyard-release` 的 SSHSIG（`.sig` 文件）。
+
+| 字段 | release / rollback | pause | rekey |
+|---|---|---|---|
+| `format`（1）、`product`（`larkyard`）、`kind`、`seq`（正整数）、`signed_at`（UTC，`YYYY-MM-DDTHH:MM:SSZ`） | ✓ | ✓ | ✓ |
+| `version`、`package`（`larkyard-<版本>.tar.gz`）、`sha256`、`size`、`channel`、`min_from`、`commit`、`notes` | ✓ | | |
+| `expires_at` | 仅 rollback（≤ 签名后 7 天） | | |
+| `not_before`、`not_after`（窗口 7 天） | | ✓ | |
+| `new_main_key`、`old_main_key`（`ssh-ed25519 <base64>`） | | | ✓ |
+
+**更新源布局**：`channels/<通道>/manifest.json(.sig)`、`pause.json(.sig)`、`rekey.json(.sig)`、`packages/larkyard-<版本>.tar.gz`。文件不存在（`file://` 找不到、HTTPS 404）算「没有发布」，别的失败记「检查失败」。清单最大 64KB，包最大 200MB。
+
+**检查顺序**（`ticketd/update.py` 的 `check`）：换钥清单（只用 `backup.allowed_signers` 的 `larkyard-rekey` 身份验）→ 暂停标记（主公钥验，窗口内才生效，无效当不存在）→ 本机通道清单：主公钥验签 → 格式和产品名 → 通道 → 序号（`< update.max_seq` 或等于但内容不同都是「旧清单」；等于且就是上次接受的那份不算重放）→ rollback 查 `expires_at`、release 拒绝降级 → 已是这个版本 → `min_from` → 已拉黑 → 下载包、边下边核对大小和 SHA-256 → 记为待安装、`update.max_seq` 提到这份清单的序号。
+
+**序号只增不减**，例外只有换钥：换钥清单（序号大于上一次处理过的换钥清单、`old_main_key` 正是本机当前信任的主公钥）验过后，主公钥换成新的，`update.max_seq` 设为换钥清单的序号、丢弃待安装的包。理由：旧主公钥签的东西从此全部验不过，不存在重放；主私钥泄露期间攻击者可能签出序号极大的清单把 `max_seq` 推上去，不重置的话发布者之后签的清单都会被当成旧清单。`ticket update trust` 换了主公钥时同理清零。
+
+**事件**：`events.kind='update'`，`code` 是 `update.CODES` 里的枚举（检查失败、验签失败、校验失败、通道不符、旧清单、拒绝降级、回滚已过期、已下载、已安装、已确认、更新失败已回滚、换钥、换钥清单无效……）。同一种同一原因一天只记一条。`update` 列在 `metrics.DETAIL_KINDS` 里：不进 `ticket stats` 的事件行，匿名统计不读（统计字段不变）。状态在 `kv`：`update.max_seq`、`update.accepted`（上次接受的清单摘要）、`update.pending`、`update.blocked`、`update.hold_until`、`update.pause`、`update.rollback_request`、`update.last_check_at` / `last_ok_at` / `last_error`、`update.channel_signed_at`、`update.rekey_seq`。
+
+**安装和切换**：守护进程主循环每轮调用 `Updater.tick`。检查在后台线程里做（不拖主循环）。有待安装、没有本地暂停 / 更新源暂停、空闲（调度器没有运行中的 worker 和压缩、没有 `approved` / `running` 的沙箱外执行、媒体通道没有在跑的任务、`tickets` 没有 `running`）时：调度器置 `update_hold`（这之后不启动新 worker 和沙箱外脚本）→ 再核对一次包的 SHA-256 → 解包到 `versions/.<版本>.tmp-<pid>`（只解普通文件和目录，拒绝绝对路径、`..`、链接、设备文件和不在 `larkyard-<版本>/` 下的成员；检查 `bin/ticketd`、`ticketd/launcher.py` 存在、`__version__` 一致）→ rename 成 `versions/<版本>` → 写 `update-state.json = {status: probation, from, to, deadline, starts: 0, token}` → `current` 原子切换（相对链接，`rename`）→ 守护进程按正常停机流程退出，退出码 75。launchd（`KeepAlive`）/ systemd（`Restart=always`）重新拉起，经启动器跑新版本。没有用 D7 设想的 `launchctl kickstart` / `systemctl restart`：退出由服务管理器拉起两个平台行为一致，也不需要守护进程知道自己的服务名。
+
+**启动器**（`ticketd/launcher.py`，`adopt` 时拷到 `~/.ticketd/app/launcher.py`）：只导入 `json os signal sys time`。每次被拉起：状态是 `probation` 就 `starts` 加一；已过 `deadline` 或 `starts >= 3` 就把 `current` 切回 `from`、记 `rolled_back`（`from` 目录不在了记 `rollback_failed`，接着跑新版本）；然后 `exec /bin/sh current/bin/ticketd`。试用期内另 fork 一个看门狗（脱离标准输入输出），到 `deadline` + 30 秒还是同一个 `token` 的试用期，就 SIGTERM 守护进程、60 秒后 SIGKILL，服务管理器重新拉起时启动器按超时切回。`deadline` = 切换时刻 + max(试用期 − 120 秒, 试用期 / 2)，保证「看门狗动手 + 最长停机 + 拉起节流」都落在试用期之内。试用期下限 180 秒。
+
+**自检和确认**：新版本守护进程转满 min(60 秒, 试用期 / 3)、主循环没有在报错、数据库可读写、心跳新鲜、当前运行的就是 `current` 指向的版本，就把状态改为 `confirmed`（记 `previous`），再做启动器两步更新的第二步（新版本里的 `launcher.py` 能编译、内容不同才原子替换）、清理旧版本目录（保留最近 3 个和当前、上一个）。只看新版本自己会弄坏的东西；`config.env` 的问题（如没填 `TICKETD_OWNER`）旧版本一样有，不算自检失败。
+
+**切回之后**：旧版本守护进程启动时看到 `rolled_back` / `rollback_failed` 且没私信过，就私信主用户一次（「更新到 X 失败（原因），已回到 Y」）、记事件、把 X 加进 `update.blocked`。`ticket update rollback` 记一个请求，守护进程空闲时切回本机上一个更低的版本（不进试用期），把切走的版本拉黑。
+
+**受管安装**：`ticket update adopt`（空闲时、工作树干净）把克隆里被跟踪的文件拷进 `versions/<当前版本>/`，拷启动器，`current` 指向它，用 `TICKETD_APP=~/.ticketd/app` 跑那个版本目录里的 `scripts/install.sh`：plist 的 `ProgramArguments` / unit 的 `ExecStart` 换成「解释器 + 启动器」，PATH 里的 `bin` 换成 `current/bin`；不设 `TICKETD_APP` 时生成的文件逐字节不变（`tests/fixtures/service/*.golden` 由改动前的脚本生成）。bridge 工作区 `CLAUDE.md` 里的 `<克隆>/bin/ticket` 改为 `~/.ticketd/app/current/bin/ticket`（改前备份），`setup-workspace.sh` 在受管安装里运行时也写 `current` 路径，`ticket doctor` 的主会话约定检查按 `current` 路径比对。`adopt --undo` 用原克隆的 `install.sh` 重装服务、把工作区路径改回、删掉 `current` 和启动器（版本目录留着）。
+
+**worker**：在 worker 环境里（有 `TICKETD_TICKET` 或 `TICKETD_SPOOL`）`ticket update trust | hold | resume | rollback | adopt` 一律拒绝；`status`、`check` 可以。信任公钥文件在 `~/.ticketd/update/`，不在 worker 沙箱的可写范围里。
+
+**没做的**（后续变更）：控制台、入网、心跳上报、按心跳对比版本来发现冻结攻击（这一期只在 `ticket doctor` 里对超过 `TICKETD_UPDATE_STALE_DAYS` 天没换过的清单标黄）。

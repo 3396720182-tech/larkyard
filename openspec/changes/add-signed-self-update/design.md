@@ -38,7 +38,7 @@
 ### D4. 更新源没有私钥：推进、回滚、暂停都是「发布预签文件」（对抗审查 B2、B3）
 更新源以后是控制台，控制台被攻破是主要威胁，所以它不能有任何签名能力。三个通道的清单在发版时一起签；回滚清单、换钥清单只在发布者本机签；暂停标记按 7 天窗口预签 12 周。备选方案「推进时在本机对新通道重签」也安全，但每次推进都要发布者回到自己电脑上，选预签。代价：控制台上的「一键暂停」依赖还有没过期的预签标记，控制台在剩不到 2 周时提醒发布者补签。
 
-重放：每份清单带发布者本机递增的 `seq`，客户端记已接受过的最大序号（`kv` 的 `update.max_seq`，只增不减），比它小或相等的清单一律当作旧清单。回滚清单靠「新序号 + `expires_at`」才能装回旧版本，过期后重放无效。冻结（一直给你看旧清单）这一期只做提示：本机通道当前清单的签名时间早于 `TICKETD_UPDATE_STALE_DAYS`（默认 30）天时，`ticket doctor` 标黄。
+重放：每份清单带发布者本机递增的 `seq`，客户端记已接受过的最大序号（`kv` 的 `update.max_seq`，只增不减，唯一的例外是换钥，见下），比它小的、或相等但内容不同的清单一律当作旧清单（相等且就是上次接受的那份，是更新源没换清单，不算重放）。回滚清单靠「新序号 + `expires_at`」才能装回旧版本，过期后重放无效。冻结（一直给你看旧清单）这一期只做提示：本机通道当前清单的签名时间早于 `TICKETD_UPDATE_STALE_DAYS`（默认 30）天时，`ticket doctor` 标黄。
 
 ### D5. 空闲判定复用现有状态
 空闲 = 调度器没有运行中的 worker（`tickets.state='running'`）、`runs` 没有 `running`、发件箱没有处理中的媒体上传、没有压缩中的会话。判断和安装都在守护进程主循环里做，安装期间调度器不启动新 worker（短暂持有一个「安装中」标记），所以不存在「判定空闲后刚好派出一张单」的竞态。
@@ -46,10 +46,12 @@
 ### D6. 自检和回滚：版本目录外的启动器（对抗审查 B4）
 原方案让 `bin/ticketd` 兼任启动器，但它在版本目录里：新版本的 `bin/ticketd` 或它导入的模块有语法错误时，永远走不到回滚分支，服务每 10 秒重启一次、无限循环。所以启动器放在 `~/.ticketd/app/launcher.py`：只用标准库、不导入 `ticketd` 包，状态放独立的 `~/.ticketd/app/update-state.json`（不读数据库，免得依赖新版本的表结构）。
 
-流程：切换前写 `update-state.json = {from, to, deadline, starts: 0}`。启动器每次被 launchd / systemd 拉起时先读它：`starts` 加一；已过 `deadline` 且未确认、或期限内 `starts >= 3`，就把 `current` 改回 `from`、写「已回滚」，再 `exec` 旧版本。新版本守护进程自检通过后把状态改为「已确认」。启动器本身更新分两步：版本包里带新启动器，新版本确认之后才替换 `launcher.py`（原子 rename），替换失败保留旧的。
+流程：切换前写 `update-state.json = {from, to, deadline, starts: 0}`。启动器每次被 launchd / systemd 拉起时先读它：`starts` 加一；已过 `deadline` 且未确认、或期限内 `starts >= 3`，就把 `current` 改回 `from`、写「已回滚」，再 `exec` 旧版本。新版本守护进程自检通过后把状态改为「已确认」。**调整（实现时，T0042）**：只靠「过了 deadline 的下一次启动」回滚，覆盖不了「新版本活着但从不确认」（主循环卡死、自检一直不过）——它不退出，启动器就不会被再次拉起。所以试用期内启动器在 `exec` 之前 fork 一个看门狗：到 deadline + 30 秒还在同一个试用期，就结束守护进程（SIGTERM，60 秒后 SIGKILL），服务管理器重新拉起时启动器按超时切回。deadline 取切换时刻 + max(试用期 − 120 秒, 试用期 / 2)，让「看门狗动手 + 最长停机 + 拉起节流」都落在试用期之内。启动器本身更新分两步：版本包里带新启动器，新版本确认之后才替换 `launcher.py`（原子 rename），替换失败保留旧的。
 
 ### D7. 重启服务的方式
-macOS：`launchctl kickstart -k gui/<uid>/<label>`；Linux：`systemctl --user restart <label>`。放在 `host.py` 旁新增的平台分支里，两个平台都 mock 测试。由守护进程自己发起重启，重启前按 §8 的停机流程结束（此时已是空闲，没有 worker 要停）。Linux 上 `KillMode=mixed` 会杀 cgroup 里剩下的进程，因为空闲判定包含「没有沙箱外脚本」，不会误杀。
+原方案：macOS `launchctl kickstart -k gui/<uid>/<label>`，Linux `systemctl --user restart <label>`，放在 `host.py` 旁的平台分支里。
+
+**调整（实现时，T0042）**：改为守护进程切换 `current` 后按 §8 的停机流程自己退出（退出码 75），由服务管理器拉起：launchd 的 plist 本来就是 `KeepAlive=true`，systemd unit 是 `Restart=always`，两边行为一致，不需要平台分支，也不需要守护进程知道自己的服务名（`TICKETD_LABEL` 只在安装时有）。代价是 launchd 的 `ThrottleInterval`（10 秒）会让重启慢最多 10 秒。`kickstart -k` 还有个问题：它由守护进程自己调用，会在 `launchctl` 返回之前就把调用者杀掉。Linux 上 `KillMode=mixed` 只在停服务时起作用，自己退出不会杀 cgroup 里别的进程；空闲判定也包含「没有沙箱外脚本」。
 
 ### D8. 配置项
 `TICKETD_UPDATE_URL`（空 = 关闭）、`TICKETD_UPDATE_CHANNEL`（默认 `stable`）、`TICKETD_UPDATE_EVERY`（3600）、`TICKETD_UPDATE_PROBATION`（600）、`TICKETD_UPDATE_STALE_DAYS`（30）。信任的公钥放 `~/.ticketd/update/main.allowed_signers`、`backup.allowed_signers`（权限 600，归用户）。抖动为 0 到间隔 1/6 的均匀随机数。全部加进 `config.py`，worker 环境不能改（沿用 `TICKETD_TICKET` / `TICKETD_SPOOL` 判断，和 `ticket telemetry on/off` 一样）。
@@ -60,7 +62,7 @@ macOS：`launchctl kickstart -k gui/<uid>/<label>`；Linux：`systemctl --user r
 - [`ssh-keygen` 版本差异] → 启动时探测 `-Y verify` 是否可用，不可用就拒绝启用；CI 两个平台都跑一次真实签名和验签。
 - [新版本带了不兼容的数据库迁移，回滚后旧代码读不了] → 发版约定只加列 / 加表（`docs/spec.md` 写明），发版工具检查 `db.py` 相对上一个 tag 是否出现 `DROP` / `RENAME` 并警告。
 - [冻结攻击] → 只做到「过期提示」，彻底解决要等控制台的心跳能对比版本（后续变更）。
-- [主私钥泄露] → 攻击者能签普通清单，但签不了换钥清单（要备份私钥），抢不走信任；发布者发布暂停标记，再用备份私钥换钥（对抗审查 S11）。泄露期间攻击者签的清单序号可能很大，换钥后旧主公钥签的东西全部失效，不影响。
+- [主私钥泄露] → 攻击者能签普通清单，但签不了换钥清单（要备份私钥），抢不走信任；发布者发布暂停标记，再用备份私钥换钥（对抗审查 S11）。泄露期间攻击者签的清单序号可能很大：**调整（实现时，T0042）**原来写「不影响」，其实会——`max_seq` 被推到极大后，发布者之后签的清单全被当成旧清单。所以换钥时把 `max_seq` 重置为换钥清单的序号（旧主公钥签的东西已全部验不过，重置不会放进重放）。换钥清单另带 `old_main_key`，只在它正是本机当前信任的主公钥时才生效，防止更新源重放一份更早的换钥清单。
 - [两把私钥都丢了] → 只能在每台机器上手工 `ticket update trust` 换公钥，README 写明。
 - [预签暂停标记被提前发布] → 控制台被攻破时可以发布暂停标记让大家停更新，这是可以接受的（最坏是停更，不是装坏版本）。
 

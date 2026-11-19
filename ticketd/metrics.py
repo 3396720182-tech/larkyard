@@ -28,7 +28,8 @@ EVENT_LABELS = {
 }
 
 # 只为细分统计记的事件（模型接口错误归类、飞书错误码、投递方式、媒体上传）：数量多，不进 ticket stats 的「事件」一行
-DETAIL_KINDS = ("model_error", "lark_error", "delivery", "media")
+# update（自动更新的事件）也在这里：它有自己的 `ticket update status`，匿名统计不读它（统计字段不变）
+DETAIL_KINDS = ("model_error", "lark_error", "delivery", "media", "update")
 
 
 # ---------- 落库 ----------

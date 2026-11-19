@@ -80,6 +80,15 @@ def build_parser() -> argparse.ArgumentParser:
     tm = sub.add_parser("telemetry", help="匿名使用统计（默认关闭）：status / show / on / off，见 docs/telemetry.md")
     tm.add_argument("action", nargs="?", default="status", choices=("status", "show", "on", "off"))
     tm.add_argument("--sent", action="store_true", help="和 show 一起用：看已经发过的报告")
+    up = sub.add_parser("update", help="自动更新（默认关闭）：status / check / trust / hold / resume / rollback / adopt")
+    up.add_argument("action", nargs="?", default="status",
+                    choices=("status", "check", "trust", "hold", "resume", "rollback", "adopt"))
+    up.add_argument("--main", help="trust：主公钥（文件或内容）")
+    up.add_argument("--backup", help="trust：离线备份公钥（文件或内容）")
+    up.add_argument("--fingerprint", help="trust：主公钥的 SHA256 指纹（发布者在更新源以外给你）")
+    up.add_argument("--backup-fingerprint", help="trust：备份公钥的 SHA256 指纹")
+    up.add_argument("--days", type=int, help="hold：暂停几天（1～7，默认 7）")
+    up.add_argument("--undo", action="store_true", help="adopt：退回原来的就地运行")
     return p
 
 
@@ -338,6 +347,11 @@ def cmd_doctor(con, a) -> str:
         bad += not ok
         lines.append(("✅ " if ok else "❌ ") + note)
     try:
+        from . import update
+        lines.append(update.doctor_line(con))
+    except Exception as e:
+        lines.append("⚠️ 自动更新状态读不出来：%r" % (e,))
+    try:
         from . import telemetry
         lines.append("ℹ️ " + telemetry.status_lines(con)[0])
     except Exception as e:
@@ -368,7 +382,10 @@ def _workspace_drift() -> list:
         return ["⚠️ 找不到 bridge 的工作目录，没检查主会话约定（可以在 config.env 里写 TICKETD_WORKSPACE=<目录>）"]
     live = Path(ws) / "CLAUDE.md"
     try:
-        want = (config.REPO / "workspace" / "CLAUDE.md.tmpl").read_text(encoding="utf-8").replace("@LARKYARD@", str(config.REPO))
+        from . import update
+        # 受管安装：主会话用的是 ~/.ticketd/app/current/bin/ticket（跟着版本走），不是某个版本目录
+        root = update.current_link() if update.is_managed() else config.REPO
+        want = (config.REPO / "workspace" / "CLAUDE.md.tmpl").read_text(encoding="utf-8").replace("@LARKYARD@", str(root))
         have = live.read_text(encoding="utf-8")
     except OSError as e:
         return ["❌ 读不了主会话约定（%s）：%s" % (live, e)]
@@ -397,6 +414,14 @@ def cmd_telemetry(con, a) -> str:
     try:
         return telemetry.command(con, a.action, sent=a.sent)
     except PermissionError as e:
+        raise core.TicketError(str(e))
+
+
+def cmd_update(con, a) -> str:
+    from . import update
+    try:
+        return update.command(con, a, workspace=_bridge_workspace())
+    except (PermissionError, update.UpdateError) as e:
         raise core.TicketError(str(e))
 
 
@@ -449,7 +474,7 @@ COMMANDS = {
     "new": cmd_new, "send": cmd_send, "lookup": cmd_lookup, "report": cmd_report,
     "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "restart": cmd_restart, "approve": cmd_approve, "grant": cmd_grant,
     "ls": cmd_ls, "show": cmd_show, "stats": cmd_stats, "doctor": cmd_doctor,
-    "telemetry": cmd_telemetry,
+    "telemetry": cmd_telemetry, "update": cmd_update,
 }
 
 

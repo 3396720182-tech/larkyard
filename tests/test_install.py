@@ -235,6 +235,75 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertFalse(plist.exists())
 
+    # ---------- 受管安装（TICKETD_APP，由 ticket update adopt 设置） ----------
+    def golden(self, name):
+        text = (REPO / "tests" / "fixtures" / "service" / name).read_text(encoding="utf-8")
+        return text.replace("@REPO@", str(REPO)).replace("@FAKEBIN@", str(self.fakebin)).replace("@HOME@", str(self.home))
+
+    def test_unmanaged_output_byte_identical_to_before(self):
+        """没有 TICKETD_APP 时，生成的 plist / unit 和加受管安装之前的 install.sh 逐字节相同（基准由旧脚本生成）。"""
+        del self.env["TICKETD_PYTHON"]
+        p = self.run_script("install.sh", "--print", os_name="Darwin")
+        self.assertEqual(p.stdout, self.golden("darwin.golden"))
+        p = self.run_script("install.sh", "--print", os_name="Darwin", TICKETD_PYTHON="/opt/py3")
+        self.assertEqual(p.stdout, self.golden("darwin-py.golden"))
+        p = self.run_script("install.sh", "--print", os_name="Linux", TICKETD_PYTHON="/opt/py3")
+        self.assertEqual(p.stdout, self.golden("linux.golden"))
+
+    def managed_app(self):
+        app = self.tmp / "home" / ".ticketd" / "app"
+        app.mkdir(parents=True)
+        (app / "launcher.py").write_text("# launcher\n")
+        return app
+
+    def test_managed_darwin_runs_launcher_outside_versions(self):
+        app = self.managed_app()
+        p = self.run_script("install.sh", "--print", os_name="Darwin", TICKETD_APP=str(app), TICKETD_PYTHON="/opt/py3")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        plist = plistlib.loads(p.stdout.encode("utf-8"))
+        self.assertEqual(plist["ProgramArguments"], ["/opt/py3", "%s/launcher.py" % app])
+        self.assertTrue(plist["EnvironmentVariables"]["PATH"].startswith("%s/current/bin:" % app))
+        self.assertNotIn(str(REPO), p.stdout)
+        self.assertTrue(plist["KeepAlive"])  # 守护进程为切换版本退出后会被重新拉起
+
+    def test_managed_linux_runs_launcher_outside_versions(self):
+        app = self.managed_app()
+        p = self.run_script("install.sh", "--print", TICKETD_APP=str(app), TICKETD_PYTHON="/opt/py3")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        keys, env = self.unit(p.stdout)
+        self.assertEqual(keys["ExecStart"], '"/opt/py3" "%s/launcher.py"' % app)
+        self.assertEqual(keys["Restart"], "always")
+        self.assertTrue(env["PATH"].startswith("%s/current/bin:" % app))
+        self.assertNotIn(str(REPO), p.stdout)
+
+    def test_managed_requires_launcher(self):
+        p = self.run_script("install.sh", "--print", TICKETD_APP=str(self.tmp / "nope"))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("launcher.py", p.stderr)
+        p = self.run_script("install.sh", "--print", TICKETD_APP="relative/app")
+        self.assertNotEqual(p.returncode, 0)
+
+    def test_setup_workspace_uses_current_link_when_managed(self):
+        app = self.tmp / "app"
+        vd = app / "versions" / "0.3.0"
+        (vd / "scripts").mkdir(parents=True)
+        (vd / "workspace").mkdir()
+        for f in ("scripts/setup-workspace.sh", "workspace/CLAUDE.md.tmpl"):
+            (vd / f).write_bytes((REPO / f).read_bytes())
+        os.symlink("versions/0.3.0", str(app / "current"))
+        ws = self.tmp / "ws"
+        ws.mkdir()
+        p = subprocess.run([SH, str(vd / "scripts" / "setup-workspace.sh"), str(ws)], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        text = (ws / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("%s/current/bin/ticket" % app, text)
+        self.assertNotIn(str(vd), text)
+        # 不是受管安装：照旧写仓库路径
+        ws2 = self.tmp / "ws2"
+        ws2.mkdir()
+        subprocess.run([SH, str(REPO / "scripts" / "setup-workspace.sh"), str(ws2)], capture_output=True, text=True)
+        self.assertIn("%s/bin/ticket" % REPO, (ws2 / "CLAUDE.md").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

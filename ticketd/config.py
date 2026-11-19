@@ -260,5 +260,40 @@ def worker_env_value(name: str):
     return _file_values().get(name)
 
 
+def update_url() -> str:
+    """自动更新的更新源（file:// 或 https://，静态文件布局见 docs/spec.md §11）。空 = 关闭；仓库里没有默认地址。"""
+    return _env("TICKETD_UPDATE_URL", "").strip()
+
+
+def update_channel() -> str:
+    """本机跟哪个通道：canary / early / stable。"""
+    ch = _env("TICKETD_UPDATE_CHANNEL", "stable").strip()
+    return ch if ch in ("canary", "early", "stable") else "stable"
+
+
+def update_every() -> int:
+    """多久检查一次新版本（秒，下限 600）；每次另加 0 到 1/6 间隔的随机抖动。"""
+    try:
+        return max(600, int(_env("TICKETD_UPDATE_EVERY", "3600")))
+    except ValueError:
+        return 3600
+
+
+def update_probation() -> int:
+    """新版本的试用期（秒）：这之内没通过自检就由启动器切回上一个版本。"""
+    try:
+        return max(180, int(_env("TICKETD_UPDATE_PROBATION", "600")))
+    except ValueError:
+        return 600
+
+
+def update_stale_days() -> float:
+    """本机通道当前清单的签名时间早于这么多天，ticket doctor 标黄（可能被冻结在旧清单上）。"""
+    try:
+        return max(1.0, float(_env("TICKETD_UPDATE_STALE_DAYS", "30")))
+    except ValueError:
+        return 30.0
+
+
 def bin_dir() -> Path:
     return REPO / "bin"

@@ -1,0 +1,29 @@
+# 由 scripts/install.sh 生成，重新安装会覆盖；要改就改仓库里的 systemd/ticketd.service.in 再装一次。
+[Unit]
+Description=Larkyard ticketd (dev.larkyard.ticketd)
+
+[Service]
+Type=simple
+ExecStart="@REPO@/bin/ticketd"
+WorkingDirectory=@HOME@/.ticketd
+Restart=always
+RestartSec=10
+# 停服务时先只给 ticketd 发 SIGTERM，让它自己按顺序停掉 worker；ticketd 退出后（或 45 秒还没退出），
+# cgroup 里剩下的进程（含 worker 留下的后台进程）统一 SIGKILL
+KillMode=mixed
+TimeoutStopSec=45
+Environment="HOME=@HOME@"
+Environment="PATH=@REPO@/bin:@FAKEBIN@:@FAKEBIN@:@FAKEBIN@:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+Environment="LANG=C.UTF-8"
+Environment="TICKETD_HOME=@HOME@/.ticketd"
+Environment="TICKETD_PYTHON=/opt/py3"
+Environment="LARK_CHANNEL=1"
+Environment="LARK_CHANNEL_HOME=@HOME@/.lark-channel"
+Environment="LARK_CHANNEL_PROFILE=claude"
+Environment="LARK_CHANNEL_CONFIG=@HOME@/.lark-channel/profiles/claude/lark-cli-source/config.json"
+Environment="LARKSUITE_CLI_CONFIG_DIR=@HOME@/.lark-channel/profiles/claude/lark-cli"
+StandardOutput=append:@HOME@/.ticketd/logs/daemon.out.log
+StandardError=append:@HOME@/.ticketd/logs/daemon.err.log
+
+[Install]
+WantedBy=default.target

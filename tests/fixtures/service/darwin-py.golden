@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.larkyard.ticketd</string>
+  <key>ProgramArguments</key><array><string>@REPO@/bin/ticketd</string></array>
+  <key>WorkingDirectory</key><string>@HOME@/.ticketd</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ExitTimeOut</key><integer>45</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>@HOME@</string>
+    <key>PATH</key><string>@REPO@/bin:@FAKEBIN@:@FAKEBIN@:@FAKEBIN@:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>LANG</key><string>zh_CN.UTF-8</string>
+    <key>TICKETD_HOME</key><string>@HOME@/.ticketd</string>
+    <key>TICKETD_PYTHON</key><string>/opt/py3</string>
+    <key>LARK_CHANNEL</key><string>1</string>
+    <key>LARK_CHANNEL_HOME</key><string>@HOME@/.lark-channel</string>
+    <key>LARK_CHANNEL_PROFILE</key><string>claude</string>
+    <key>LARK_CHANNEL_CONFIG</key><string>@HOME@/.lark-channel/profiles/claude/lark-cli-source/config.json</string>
+    <key>LARKSUITE_CLI_CONFIG_DIR</key><string>@HOME@/.lark-channel/profiles/claude/lark-cli</string>
+  </dict>
+  <key>StandardOutPath</key><string>@HOME@/.ticketd/logs/daemon.out.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/.ticketd/logs/daemon.err.log</string>
+</dict>
+</plist>

@@ -208,8 +208,39 @@ sudo loginctl enable-linger "$USER"
 | `TICKETD_VIDEO_FOLDER` | 空 | 结果里的视频传到你云空间的哪个文件夹（文件夹 token）；空为云空间根目录 |
 | `TICKETD_MEDIA_WORKERS` | `2` | 媒体通道最多同时准备几张结果卡（图片/视频上传、稿子导入、视频消息）；不同工单并行，同一工单仍按顺序 |
 | `TICKETD_MEDIA_VIDEO_WORKERS` | `1` | 其中最多几个在传视频（限制带宽、内存和飞书限流），不超过上一项 |
+| `TICKETD_UPDATE_URL` | 空（关闭） | 自动更新的更新源（`file://` 目录或 `https://` 静态地址）。仓库里没有默认地址；还要信任公钥、转成受管安装才启用，见下面「自动更新」 |
+| `TICKETD_UPDATE_CHANNEL` | `stable` | 跟哪个通道：`canary` / `early` / `stable` |
+| `TICKETD_UPDATE_EVERY` | `3600` | 多久检查一次新版本（秒，下限 600），每次另加 0～1/6 间隔的随机抖动 |
+| `TICKETD_UPDATE_PROBATION` | `600` | 新版本的试用期（秒）：这之内没通过自检，启动器自动切回上一个版本 |
+| `TICKETD_UPDATE_STALE_DAYS` | `30` | 本机通道当前清单的签名时间早于这么多天，`ticket doctor` 标黄（可能被冻结在旧清单上） |
 
 安装时的变量：`TICKETD_HOME`（默认 `~/.ticketd`）、`TICKETD_LABEL`（默认 `dev.larkyard.ticketd`，Linux 上是 systemd 服务名）、`LARK_CHANNEL_HOME`、`LARK_CHANNEL_PROFILE`、`TICKETD_PYTHON`（Python 解释器，默认 `/usr/bin/python3`；`bin/ticket`、`bin/ticketd` 也认它；Linux 上总是写进服务环境，macOS 上显式指定时写进 plist）。
+
+## 自动更新（默认关闭）
+
+不配置就什么都不做：不发请求，服务模板和工作区都不动。启用后，守护进程每小时检查一次更新源，只安装发布者签过名的版本，空闲时（没有 worker、没有沙箱外脚本、没有在传的媒体）安装，新版本 10 分钟内自检不过就自动切回上一个版本并私信你。规格见 `docs/spec.md` §11。
+
+启用（三步，都在你自己的终端里做；worker 做不了）：
+
+```bash
+# 1. 信任发布者的两把公钥。指纹必须由发布者在更新源以外的渠道给你（当面、电话、另一个聊天），命令会核对，不一致就拒绝
+bin/ticket update trust --main main.pub --fingerprint SHA256:... --backup backup.pub --backup-fingerprint SHA256:...
+# 2. 转成受管安装：版本放在 ~/.ticketd/app/versions/<版本>/，服务改为经版本目录外的启动器运行 ~/.ticketd/app/current，
+#    bridge 工作区 CLAUDE.md 里的 ticket 路径一并改为 ~/.ticketd/app/current/bin/ticket（改前备份）
+bin/ticket update adopt
+# 3. 在 ~/.ticketd/config.env 里写更新源
+TICKETD_UPDATE_URL=https://updates.example.com/larkyard
+```
+
+日常：`ticket update status`（版本、通道、上次检查、待装版本、暂停到何时、最近的更新事件）、`ticket update check`（马上查一次）、`ticket update hold [--days N]`（暂停安装，最长 7 天，到期自动恢复）、`ticket update resume`、`ticket update rollback`（空闲时切回本机上一个版本，之后不再自动装回刚才那个版本）。
+
+手工退回：
+- 退回原来的就地运行：`~/.ticketd/app/current/bin/ticket update adopt --undo`（服务改回原克隆、工作区的 ticket 路径改回，原克隆要还在原来的位置），再删掉 `TICKETD_UPDATE_URL`。
+- 守护进程起不来、命令也用不了时：`ln -sfn versions/<旧版本> ~/.ticketd/app/current`，然后 `launchctl kickstart -k gui/$(id -u)/dev.larkyard.ticketd`（Linux：`systemctl --user restart dev.larkyard.ticketd`）。
+
+发布者：`scripts/release.py` 在你自己的电脑上从 git tag 打包、一次签齐 canary / early / stable 三份清单（`ssh-keygen -Y sign`，只接受 Ed25519），另能签回滚清单（最长 7 天有效）、按 7 天窗口预签 12 周暂停标记、用离线备份私钥签换钥清单；`release.py publish` 把签好的文件放到更新源。更新源上没有私钥。
+- 主私钥泄露：先发布当前窗口的暂停标记，再用离线备份私钥 `release.py rekey` 签一份换钥清单并发布；客户端换成新主公钥，旧主私钥签的东西全部失效。
+- 两把私钥都丢了：只能在每台机器上重新 `ticket update trust` 新公钥（按新指纹）。
 
 ## 开发
 

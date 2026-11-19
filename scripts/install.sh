@@ -3,8 +3,17 @@
 # 用法：scripts/install.sh [--print]   --print 只把生成的 plist / unit 打到标准输出，不安装、不改任何文件。
 # 可选环境变量：TICKETD_LABEL（服务名）、TICKETD_HOME（数据目录）、LARK_CHANNEL_HOME / LARK_CHANNEL_PROFILE（bridge 的 profile）、
 #   TICKETD_PYTHON（Python 3.9+ 解释器，默认 /usr/bin/python3；Linux 上会写进服务环境）
+#   TICKETD_APP（受管安装的目录，如 ~/.ticketd/app；由 `ticket update adopt` 设置）：服务改为经版本目录外的启动器
+#     $TICKETD_APP/launcher.py 运行 $TICKETD_APP/current/bin/ticketd，PATH 里的 bin 也指向 current。不设时生成的文件和以前逐字节相同
 set -eu
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+APP="${TICKETD_APP:-}"
+BINROOT="$REPO"
+if [ -n "$APP" ]; then
+  case "$APP" in /*) ;; *) echo "install: TICKETD_APP 要写绝对路径" >&2; exit 1;; esac
+  [ -f "$APP/launcher.py" ] || { echo "install: $APP/launcher.py 不存在（受管安装由 ticket update adopt 建立）" >&2; exit 1; }
+  BINROOT="$APP/current"
+fi
 OS="$(uname -s)"
 case "$OS" in Darwin|Linux) ;; *) echo "install: 不支持 $OS（只支持 macOS 和 Linux / WSL2）" >&2; exit 1;; esac
 LABEL="${TICKETD_LABEL:-dev.larkyard.ticketd}"
@@ -21,20 +30,20 @@ CODEX_DIR=""  # 可选：装了 codex 就把它所在目录也放进 PATH（Code
 if command -v codex >/dev/null 2>&1; then CODEX_DIR="$(dirname "$(command -v codex)"):"; fi
 echo "node=$NODE_DIR lark-cli=$LARK_DIR claude=$CLAUDE_DIR codex=${CODEX_DIR%:}" >&2
 if [ "$OS" = Darwin ]; then
-  P="$REPO/bin:$LARK_DIR:$NODE_DIR:$CLAUDE_DIR:$CODEX_DIR/usr/bin:/bin:/usr/sbin:/sbin"
+  P="$BINROOT/bin:$LARK_DIR:$NODE_DIR:$CLAUDE_DIR:$CODEX_DIR/usr/bin:/bin:/usr/sbin:/sbin"
   TEMPLATE="$REPO/launchd/ticketd.plist.in"
   SERVICE_FILE="$HOME/Library/LaunchAgents/$LABEL.plist"
 else
   # bwrap、socat（沙箱要用）在 /usr/bin；/usr/local/bin 放手动装的工具
-  P="$REPO/bin:$LARK_DIR:$NODE_DIR:$CLAUDE_DIR:$CODEX_DIR/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  P="$BINROOT/bin:$LARK_DIR:$NODE_DIR:$CLAUDE_DIR:$CODEX_DIR/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   TEMPLATE="$REPO/systemd/ticketd.service.in"
   SERVICE_FILE=""  # 要问过 systemd 用户实例才知道放哪（见下面）
 fi
 case "$LABEL" in *[!A-Za-z0-9._-]*|'') echo "install: TICKETD_LABEL 只能含字母、数字和 . _ -" >&2; exit 1;; esac
-case "$REPO$HOME$P$LC_HOME$LC_PROFILE$TICKETD_HOME$PY" in *'&'*|*'|'*|*'<'*|*'>'*) echo "install: unsupported character (& | < >) in paths" >&2; exit 1;; esac
+case "$REPO$APP$HOME$P$LC_HOME$LC_PROFILE$TICKETD_HOME$PY" in *'&'*|*'|'*|*'<'*|*'>'*) echo "install: unsupported character (& | < >) in paths" >&2; exit 1;; esac
 if [ "$OS" = Linux ]; then
   # systemd 的 unit 文件里 % 是占位符、$ 会被展开、空白会拆开 append: 路径，不值得逐个转义
-  case "$REPO$HOME$P$LC_HOME$LC_PROFILE$TICKETD_HOME$PY" in
+  case "$REPO$APP$HOME$P$LC_HOME$LC_PROFILE$TICKETD_HOME$PY" in
     *[[:space:]]*|*'%'*|*'$'*|*'"'*|*'\'*) echo "install: Linux 上路径里不能有空白或 % \$ \" \\ 字符" >&2; exit 1;;
   esac
   case "$(uname -r)" in
@@ -46,11 +55,20 @@ if [ "$OS" = Linux ]; then
       done;;
   esac
 fi
+managed() {
+  # 受管安装：入口换成「解释器 + 版本目录外的启动器」；没设 TICKETD_APP 时原样输出
+  if [ -n "$APP" ]; then
+    sed -e "s|<string>@REPO@/bin/ticketd</string>|<string>$PY</string><string>$APP/launcher.py</string>|" \
+        -e "s|^ExecStart=\"@REPO@/bin/ticketd\"\$|ExecStart=\"$PY\" \"$APP/launcher.py\"|" "$TEMPLATE"
+  else
+    cat "$TEMPLATE"
+  fi
+}
 render() {
-  sed -e "s|@LABEL@|$LABEL|g" -e "s|@REPO@|$REPO|g" -e "s|@HOME@|$HOME|g" -e "s|@PATH@|$P|g" \
+  managed | sed -e "s|@LABEL@|$LABEL|g" -e "s|@REPO@|$REPO|g" -e "s|@HOME@|$HOME|g" -e "s|@PATH@|$P|g" \
       -e "s|@TICKETD_HOME@|$TICKETD_HOME|g" -e "s|@LC_HOME@|$LC_HOME|g" -e "s|@LC_PROFILE@|$LC_PROFILE|g" \
       -e "s|@PYTHON@|$PY|g" \
-      "$TEMPLATE" | if [ "$OS" = Darwin ] && [ -n "${TICKETD_PYTHON:-}" ]; then
+      | if [ "$OS" = Darwin ] && [ -n "${TICKETD_PYTHON:-}" ]; then
     # 显式指定了解释器才写进 plist，没指定时 plist 和以前一模一样
     sed -e "s|^\(    <key>TICKETD_HOME</key>.*\)$|\1\\
     <key>TICKETD_PYTHON</key><string>$PY</string>|"
