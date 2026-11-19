@@ -21,8 +21,14 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
+
+try:
+    import fcntl
+except ImportError:  # 非 POSIX 平台；ticketd 只支持 macOS / Linux / WSL，这里只为了能导入
+    fcntl = None
 
 from . import __version__, config, db, host
 
@@ -110,17 +116,36 @@ def turn_on(con, now: Optional[float] = None) -> str:
     return install_id(con)
 
 
+@contextmanager
+def _send_lock():
+    """「检查同意 → 发请求」「检查同意 → 写待发报告」和关闭共用的跨进程锁（flock，按打开的文件算，
+    同一进程里的不同线程也互斥）。发送方拿着锁核对、发请求、搬文件；关闭要等它放锁才删同意记录。
+    所以 `ticket telemetry off` 返回之后，不会再有请求发出，也不会再写出待发报告。
+    持锁最长约一次 POST 的超时（POST_TIMEOUT，10 秒）。"""
+    path = config.home() / "telemetry.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(str(path), "a")
+    try:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        f.close()  # 关闭文件即放锁
+
+
 def turn_off(con) -> int:
-    """关闭：删除匿名 ID、同意记录和没发出的报告（已发副本留在本机）。返回删了几份待发报告。"""
-    with db.tx(con):
-        con.execute("DELETE FROM kv WHERE key LIKE 'telemetry\\_%' ESCAPE '\\'")
-    n = 0
-    for p in _pending_dir().glob("*.json"):
-        try:
-            p.unlink()
-            n += 1
-        except OSError:
-            pass
+    """关闭：删除匿名 ID、同意记录和没发出的报告（已发副本留在本机）。返回删了几份待发报告。
+    正在发送的请求会先发完（最多等一次 POST 的超时），返回之后不会再发。"""
+    with _send_lock():
+        with db.tx(con):
+            con.execute("DELETE FROM kv WHERE key LIKE 'telemetry\\_%' ESCAPE '\\'")
+        n = 0
+        for p in _pending_dir().glob("*.json"):
+            try:
+                p.unlink()
+                n += 1
+            except OSError:
+                pass
     return n
 
 
@@ -520,7 +545,8 @@ def _unlink(p: Path) -> None:
 def send_pending(target: str, poster=None, current=None) -> dict:
     """把 pending/ 里的报告按日期依次发出。遇到需要重试的失败就停。返回写进 last.json 的结果。
     current：返回「现在有效的 install_id」的函数（关闭了返回 None）。每发一份前都问一次：
-    报告里的 ID 不是现在的 ID（中途关闭过、或关了又开换了 ID），这份是上一轮授权留下的，删掉不发。"""
+    报告里的 ID 不是现在的 ID（中途关闭过、或关了又开换了 ID），这份是上一轮授权留下的，删掉不发。
+    核对和发请求在同一段 _send_lock 里：关闭要等这段结束，核对通过后不会被关闭插进来。"""
     poster = poster or _post
     result = {"at": time.time(), "sent": [], "result": "nothing"}
     for p in sorted(_pending_dir().glob("*.json")):
@@ -531,24 +557,27 @@ def send_pending(target: str, poster=None, current=None) -> dict:
             _drop(p, "校验没通过，已丢弃：%s" % e)
             result.update(result="invalid", day=p.stem)
             continue
-        if current is not None:
-            now_id = current()
-            if now_id is None:
-                result.update(result="stopped")  # 已经关闭：turn_off 会删掉待发报告，这里不再发
-                break
-            if rep.get("install_id") != now_id:
-                _unlink(p)
-                continue
         body = json.dumps(rep, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        res, status = poster(target, body)
-        result.update(day=p.stem, result=res, http=status)
-        if res == "ok":
-            _sent_dir().mkdir(parents=True, exist_ok=True)
-            os.replace(str(p), str(_sent_dir() / p.name))
-            result["sent"].append(p.stem)
-        elif res == "rejected":
-            _drop(p, "后端拒收（HTTP %s），已丢弃" % status)
-        else:
+        with _send_lock():
+            if current is not None:
+                now_id = current()
+                if now_id is None:
+                    result.update(result="stopped")  # 已经关闭：turn_off 会删掉待发报告，这里不再发
+                    break
+                if rep.get("install_id") != now_id:
+                    _unlink(p)
+                    continue
+            if not p.exists():  # 等锁期间被关闭删掉了
+                continue
+            res, status = poster(target, body)
+            result.update(day=p.stem, result=res, http=status)
+            if res == "ok":
+                _sent_dir().mkdir(parents=True, exist_ok=True)
+                os.replace(str(p), str(_sent_dir() / p.name))
+                result["sent"].append(p.stem)
+            elif res == "rejected":
+                _drop(p, "后端拒收（HTTP %s），已丢弃" % status)
+        if res not in ("ok", "rejected"):
             break
     _prune_sent()
     _write_json(_last_path(), result)
@@ -622,11 +651,10 @@ def generate_missing(con, now: float) -> list:
         except Invalid as e:
             _drop(path, "生成后校验没通过，没有发送：%s" % e)
         else:
-            _write_json(path, rep)
-            # 写入和 off 之间还有一个窗口：写完再核对一次。off 在这之后发生的话，它自己会删 pending/
-            if _active_id(con) != iid:
-                _unlink(path)
-                break
+            with _send_lock():  # 核对和写入在同一段锁里：off 要么在前（这里看到已关闭），要么在后（它删掉这份）
+                if _active_id(con) != iid:
+                    break
+                _write_json(path, rep)
             made.append(day)
         _kv_set(con, "telemetry_built", day)
     return made

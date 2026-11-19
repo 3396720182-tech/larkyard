@@ -361,6 +361,89 @@ class SendTest(TelemetryTestCase):
         self.assertEqual({c[1]["install_id"] for c in self.calls}, {self.tm.install_id(self.con)})
         self.assertNotIn(old_id, json.dumps(self.calls))
 
+    def test_off_between_last_check_and_post_waits_and_nothing_sent_after(self):
+        """外部复查复现的竞态：发送线程停在「最后一次同意检查」和「发请求」之间时执行 off。
+        要求：off 返回之后不再有任何请求发出（off 要等正在进行的那次发完）。"""
+        import threading
+        from ticketd import db
+        real = self.tm._active_id
+        log = []  # (事件, 时间)
+        off_thread = []
+
+        def off():
+            other = db.connect()  # 用户在另一个进程里执行 ticket telemetry off
+            self.tm.turn_off(other)
+            other.close()
+            log.append(("off_returned", time.monotonic()))
+
+        def active_id(con):
+            iid = real(con)
+            # 两份报告（11-17、11-18）都已生成，说明现在是发送阶段里那次「发请求前的最后检查」
+            if iid is not None and not off_thread and self.tm._pending_dir().exists() \
+                    and len(list(self.tm._pending_dir().glob("*.json"))) == 2 \
+                    and threading.current_thread().name == "ticketd-telemetry":
+                t = threading.Thread(target=off)
+                off_thread.append(t)
+                t.start()
+                time.sleep(0.5)  # 停在检查之后、发请求之前，给 off 足够时间（它应该被锁挡住）
+                log.append(("off_blocked", not any(e == "off_returned" for e, _ in log)))
+            return iid
+
+        def poster(target, body):
+            log.append(("post", time.monotonic()))
+            self.calls.append((target, json.loads(body)))
+            return ("ok", 204)
+
+        self.tm._active_id = active_id
+        try:
+            self.tm._kv_set(self.con, self.tm.K_DUE, "2026-11-19|0")
+            self.assertTrue(self.tm.maybe_send(self.con, now=ts("2026-11-19", 1), poster=poster, wait=True))
+        finally:
+            self.tm._active_id = real
+        off_thread[0].join(10)
+        self.assertIn(("off_blocked", True), log)
+        posts = [t for e, t in log if e == "post"]
+        off_at = [t for e, t in log if e == "off_returned"]
+        self.assertEqual(len(off_at), 1)
+        self.assertTrue(all(t < off_at[0] for t in posts), log)  # off 返回之后没有请求
+        self.assertGreaterEqual(len(posts), 1)  # 卡在检查之后的那一份照常发出（off 等它）
+        self.assertIsNone(self.tm.install_id(self.con))
+        self.assertEqual(list(self.tm._pending_dir().glob("*.json")), [])
+
+    def test_off_waits_for_inflight_post(self):
+        """请求已经在途时 off 会等它结束才返回；返回后 pending/ 里剩下的不再发。"""
+        import threading
+        from ticketd import db
+        gate, entered = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)  # 断言失败时也放行后台线程，免得它占着 _thread 影响后面的用例
+        order = []
+
+        def poster(target, body):
+            order.append("post_start")
+            entered.set()
+            gate.wait(10)
+            order.append("post_end")
+            return ("ok", 204)
+
+        self.tm._kv_set(self.con, self.tm.K_DUE, "2026-11-19|0")
+        self.assertTrue(self.tm.maybe_send(self.con, now=ts("2026-11-19", 1), poster=poster))
+        self.assertTrue(entered.wait(10))
+
+        def off():
+            other = db.connect()
+            self.tm.turn_off(other)
+            other.close()
+            order.append("off_returned")
+
+        t = threading.Thread(target=off)
+        t.start()
+        time.sleep(0.5)
+        self.assertNotIn("off_returned", order)  # 在途请求没结束，off 还在等
+        gate.set()
+        t.join(10)
+        self.tm._thread.join(10)
+        self.assertEqual(order, ["post_start", "post_end", "off_returned"])  # 两份报告只发出 1 份
+
     def test_pending_with_stale_id_is_not_sent(self):
         """pending/ 里已经有上一轮授权生成的报告（比如关闭时删除失败）：重新开启后不发。"""
         stale = self.tm.build(self.con, "2026-11-18", "11111111-1111-4111-8111-111111111111")

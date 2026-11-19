@@ -64,7 +64,7 @@ export async function handleReport(request, env, now = Date.now()) {
 //   而是再把机器最少的桶并进来，直到 other 够 MIN_BUCKET 台。这样公开的每个分布都加得回原来的总量，
 //   用总量或兄弟分布相减只能得到 other，而 other 至少有 MIN_BUCKET 台机器。整个分布都凑不够就整个不列。
 // - 活跃机器少于 MIN_MACHINES 台：只公开 TOTALS_ONLY 里的总量（分布照样做桶级保护），不公开头部字段。
-// - 活跃机器少于 MIN_BUCKET 台：连总量也不公开，只给机器数和报告数。
+// - 活跃机器少于 MIN_BUCKET 台：只公开 machines 和 reports 两个总数。
 const HEADER_ENUMS = ["version", "os", "arch", "python", "claude_code", "codex"];
 const TOTALS_ONLY = ["tickets_new", "rounds", "round_outcomes", "model_errors", "lark_errors"];
 const SUMS = ["tickets_new", "rounds"];
@@ -149,7 +149,7 @@ export function summarize(rows, fromDay, toDay, generatedAt) {
     reports: rows.length,
   };
   if (machines.size < MIN_BUCKET) {
-    out.note = `活跃机器少于 ${MIN_BUCKET} 台，不公开任何数字`;
+    out.note = `活跃机器少于 ${MIN_BUCKET} 台，只公开机器数和报告数`;
     return out;
   }
   const totals = {};
