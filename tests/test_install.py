@@ -186,7 +186,16 @@ class InstallTest(unittest.TestCase):
     def test_linux_warns_missing_sandbox_tools(self):
         (self.fakebin / "bwrap").unlink()
         (self.fakebin / "socat").unlink()
-        p = self.run_script("install.sh")
+        # 机器上可能真装了 bwrap / socat（GitHub 的 Ubuntu runner 自带 /usr/bin/bwrap）：
+        # PATH 里不放 /usr/bin、/bin，改放一份除这两个以外的系统命令的软链接
+        sysbin = self.tmp / "sysbin"
+        sysbin.mkdir()
+        for d in ("/usr/bin", "/bin"):
+            for name in os.listdir(d):
+                link = sysbin / name
+                if name not in ("bwrap", "socat") and not os.path.lexists(link):
+                    link.symlink_to(os.path.join(d, name))
+        p = self.run_script("install.sh", PATH="%s:%s" % (self.fakebin, sysbin))
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("没有 bwrap", p.stderr)
         self.assertIn("没有 socat", p.stderr)
