@@ -105,19 +105,62 @@ function uuid(i) {
 
 test("汇总：机器少时只公开总量，不含 install_id", async () => {
   const e = env();
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 6; i++) {
     await handleReport(post(report({ install_id: uuid(i), day: "2026-11-17" })), e, NOW);
   }
   const s = await buildSummary(e, NOW);
-  assert.equal(s.machines, 3);
+  assert.equal(s.machines, 6);
   assert.ok(s.note);
   assert.equal(s.machines_by, undefined);
   assert.deepEqual(Object.keys(s.totals).sort(), ["lark_errors", "model_errors", "round_outcomes", "rounds", "tickets_new"]);
-  assert.equal(s.totals.rounds, 27);
+  assert.equal(s.totals.rounds, 54);
   assert.ok(!JSON.stringify(s).includes("00000000-0000-4000"));
   const res = await worker.fetch(new Request("https://x.workers.dev/v1/summary"), e);
   assert.equal(res.status, 200);
-  assert.equal((await res.json()).machines, 3);
+  assert.equal((await res.json()).machines, 6);
+});
+
+test("汇总：不到 5 台机器时连总量也不公开", () => {
+  const rows = [0, 1, 2].map((i) => ({ install_id: uuid(i), day: "2026-11-17", body: JSON.stringify(report({ install_id: uuid(i) })) }));
+  const s = summarize(rows, "2026-11-12", "2026-11-18", "t");
+  assert.equal(s.machines, 3);
+  assert.equal(s.totals, undefined);
+});
+
+test("汇总：分布按每个桶的贡献机器数做小样本保护", () => {
+  // 外部复查的场景：20 台里只有 1 台贡献了 >400k 上下文桶，不能单独公开 >400k: 1
+  const rows = [];
+  for (let i = 0; i < MIN_MACHINES; i++) {
+    const over = {};
+    if (i === 0) {
+      over.ctx_tokens = { "50-150k": 7, ">400k": 1 };
+      over.round_outcomes = { ready: 5, failed: 1 };
+      over.media = { video: { fail: 1, seconds: { ">120": 1 }, size_mb: { ">100": 1 } } };
+      over.tickets_by_executor = { codex: 1 };
+    }
+    rows.push({ install_id: uuid(i), day: "2026-11-17", body: JSON.stringify(report({ install_id: uuid(i), ...over })) });
+  }
+  // 少于 20 台：只有总量，但总量里的分布也要做桶级保护
+  const few = summarize(rows.slice(0, MIN_MACHINES - 1), "a", "b", "t");
+  assert.equal(few.totals.round_outcomes.failed, undefined);
+  assert.equal(few.totals.ctx_tokens, undefined);
+  const s = summarize(rows, "2026-11-12", "2026-11-18", "t");
+  const dump = JSON.stringify(s);
+  assert.equal(s.totals.ctx_tokens[">400k"], undefined);
+  assert.equal(s.totals.ctx_tokens.other, undefined); // 并进 other 后 other 也只有 1 台，不列
+  assert.equal(s.totals.ctx_tokens["50-150k"], 7 * MIN_MACHINES);
+  assert.equal(s.totals.round_outcomes.failed, undefined);
+  assert.equal(s.totals.media.video, undefined);
+  assert.equal(s.totals.tickets_by_executor.codex, undefined);
+  assert.ok(!dump.includes(">400k"));
+  assert.ok(!dump.includes(">120"));
+  // 同一个桶有 5 台机器贡献就公开
+  for (let i = 1; i < 5; i++) {
+    const r = JSON.parse(rows[i].body);
+    r.ctx_tokens = { ">400k": 1 };
+    rows[i].body = JSON.stringify(r);
+  }
+  assert.equal(summarize(rows, "a", "b", "t").totals.ctx_tokens[">400k"], 5);
 });
 
 test("汇总：机器够多时公开分布，少于 5 台的取值合并进 other", () => {

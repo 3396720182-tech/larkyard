@@ -609,9 +609,49 @@ def _expire_pending(now: float) -> None:
                 pass
 
 
+def _db_file(con) -> Optional[str]:
+    try:
+        for row in con.execute("PRAGMA database_list"):
+            if row[1] == "main" and row[2]:
+                return row[2]
+    except Exception:
+        pass
+    return None
+
+
+def _run_once(con, now: float, poster=None) -> None:
+    """后台线程里做的事：生成报告（会跑 claude/codex --version，最多各 5 秒）、清过期、按节流规则发送。
+    用的是这个线程自己的数据库连接。"""
+    today = _day(now)
+    if not enabled(con):  # 主循环起线程之后用户刚好执行了 off
+        return
+    generate_missing(con, now)
+    _expire_pending(now)
+    if not any(_pending_dir().glob("*.json")):
+        _kv_set(con, K_NEXT, str(_day_bounds(today)[1]))  # 今天没有要发的了
+        return
+    target = url()
+    if not target:
+        _kv_set(con, K_NEXT, str(now + RETRY_EVERY))
+        return
+    day, _, n = (_kv(con, K_TRIES) or "").partition("|")
+    tries = int(n) if day == today and n.isdigit() else 0
+    if tries >= MAX_TRIES_PER_DAY:
+        _kv_set(con, K_NEXT, str(_day_bounds(today)[1]))
+        return
+    if not enabled(con):
+        return
+    _kv_set(con, K_TRIES, "%s|%d" % (today, tries + 1))
+    _kv_set(con, K_NEXT, str(now + RETRY_EVERY))
+    send_pending(target, poster)
+    if not any(_pending_dir().glob("*.json")):
+        _kv_set(con, K_NEXT, str(_day_bounds(today)[1]))  # 都发完了，明天再来
+
+
 def maybe_send(con, now: Optional[float] = None, poster=None, wait: bool = False) -> bool:
-    """守护进程主循环每轮调用。开启了、到点了，就生成昨天（及最近 7 天漏掉的）报告并在后台线程里发送。
-    返回这次是否启动了发送。永远不在主循环里做网络请求（wait=True 只给测试用）。"""
+    """守护进程主循环每轮调用。主循环里只读几个 kv（开没开、到没到点、上次试过没有）；
+    到点了就起一个后台线程，生成昨天（及最近 7 天漏掉的）报告并发送。生成要探 claude/codex 版本，
+    发送要走网络，都不在主循环里做。返回这次是否起了后台线程（wait=True 只给测试用）。"""
     global _thread
     if not enabled(con) or _truthy(os.environ.get("CI")):
         return False
@@ -625,36 +665,32 @@ def maybe_send(con, now: Optional[float] = None, poster=None, wait: bool = False
         nxt = 0.0
     if now < nxt:
         return False
+    path = _db_file(con)
+    if not path:
+        return False
     with _lock:
         if _thread is not None and _thread.is_alive():
             return False
-    generate_missing(con, now)
-    _expire_pending(now)
-    if not any(_pending_dir().glob("*.json")):
-        _kv_set(con, K_NEXT, str(_day_bounds(today)[1]))  # 今天没有要发的了
-        return False
-    target = url()
-    if not target:
-        _kv_set(con, K_NEXT, str(now + RETRY_EVERY))
-        return False
-    day, _, n = (_kv(con, K_TRIES) or "").partition("|")
-    tries = int(n) if day == today and n.isdigit() else 0
-    if tries >= MAX_TRIES_PER_DAY:
-        _kv_set(con, K_NEXT, str(_day_bounds(today)[1]))
-        return False
-    _kv_set(con, K_TRIES, "%s|%d" % (today, tries + 1))
-    _kv_set(con, K_NEXT, str(now + RETRY_EVERY))
 
-    def run():
-        try:
-            send_pending(target, poster)
-        except Exception as e:  # 发送失败不告警、不私信，只在 status 里显示
+        def run():
+            tcon = None
             try:
-                _write_json(_last_path(), {"at": time.time(), "result": "error", "error": type(e).__name__})
-            except Exception:
-                pass
+                tcon = db.connect(Path(path))  # sqlite 连接不能跨线程用：在本线程里建
+                _run_once(tcon, now, poster)
+            except Exception as e:  # 失败不告警、不私信，只在 status 里显示
+                try:
+                    _write_json(_last_path(), {"at": time.time(), "result": "error", "error": type(e).__name__})
+                except Exception:
+                    pass
+                if tcon is not None:
+                    try:  # 别让同一个错误每轮都起一个线程
+                        _kv_set(tcon, K_NEXT, str(now + RETRY_EVERY))
+                    except Exception:
+                        pass
+            finally:
+                if tcon is not None:
+                    tcon.close()
 
-    with _lock:
         _thread = threading.Thread(target=run, name="ticketd-telemetry", daemon=True)
         _thread.start()
         th = _thread

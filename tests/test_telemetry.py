@@ -258,11 +258,9 @@ class SendTest(TelemetryTestCase):
         self.assertTrue(self.send(now))
         self.assertEqual(len(self.calls), 1)  # 第一份失败就停，不连着打
         self.assertFalse(self.send(now + 60))  # 30 分钟内不再试
-        n = 1
         for i in range(1, 10):
-            if self.send(now + i * self.tm.RETRY_EVERY + 1):
-                n += 1
-        self.assertEqual(n, self.tm.MAX_TRIES_PER_DAY)
+            self.send(now + i * self.tm.RETRY_EVERY + 1)
+        self.assertEqual(len(self.calls), self.tm.MAX_TRIES_PER_DAY)
         self.assertEqual(len(list(self.tm._pending_dir().glob("*.json"))), 2)
 
     def test_rejected_report_is_dropped(self):
@@ -300,9 +298,25 @@ class SendTest(TelemetryTestCase):
     def test_no_url_only_generates_locally(self):
         del os.environ["TICKETD_TELEMETRY_URL"]
         self.tm._kv_set(self.con, self.tm.K_DUE, "2026-11-19|0")
-        self.assertFalse(self.send(ts("2026-11-19", 1)))
+        self.send(ts("2026-11-19", 1))
         self.assertEqual(self.calls, [])
         self.assertEqual(len(list(self.tm._pending_dir().glob("*.json"))), 2)
+
+    def test_slow_version_probe_does_not_block_caller(self):
+        """生成报告要跑 claude --version（超时 5 秒）：放在后台线程里，主循环这一拍立刻返回。地址为空时也一样。"""
+        del os.environ["TICKETD_TELEMETRY_URL"]
+        slow = self.tmp / "slow-claude"
+        slow.write_text("#!/bin/sh\nsleep 3\necho 2.1.0\n")
+        slow.chmod(0o755)
+        os.environ["TICKETD_CLAUDE"] = str(slow)
+        self.tm._kv_set(self.con, self.tm.K_DUE, "2026-11-19|0")
+        t0 = time.monotonic()
+        self.assertTrue(self.tm.maybe_send(self.con, now=ts("2026-11-19", 1), poster=self.poster))
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertFalse(self.tm.maybe_send(self.con, now=ts("2026-11-19", 1)))  # 上一个还在跑，不叠线程
+        self.tm._thread.join(30)
+        rep = json.loads((self.tm._pending_dir() / "2026-11-18.json").read_text())
+        self.assertEqual(rep["claude_code"], "2.1")
 
     def test_jitter_is_within_six_hours_and_stable(self):
         self.con.execute("DELETE FROM kv WHERE key=?", (self.tm.K_DUE,))

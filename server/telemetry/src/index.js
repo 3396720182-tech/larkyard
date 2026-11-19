@@ -2,13 +2,13 @@
 //
 // POST /v1/report   收一份每日报告：严格校验（多一个键整份拒收）、按 (install_id, day) 去重写入。
 //                   不读、不存请求的 IP 和 User-Agent；限流用 Cloudflare 的 Rate Limiting 绑定（只在边缘计数，不落库）。
-// GET  /v1/summary  最近一次的全体汇总（公开）：只有分布，不含 install_id；小样本按 docs/telemetry.md 的规则合并或不公开。
+// GET  /v1/summary  最近一次的全体汇总（公开）：只有分布，不含 install_id；每个桶按贡献机器数做小样本保护（见 summarize）。
 // 定时任务（每天）：删掉 365 天前的报告；每周一生成一份全体汇总。
 import { Invalid, schema, validate } from "./validate.js";
 
 export const RETENTION_DAYS = 365;
 export const SUMMARY_WINDOW_DAYS = 7;
-export const MIN_BUCKET = 5;      // 单个取值少于这么多台机器，合并进 other
+export const MIN_BUCKET = 5;      // 某个桶 / 取值的贡献机器少于这么多台，合并进 other
 export const MIN_MACHINES = 20;   // 活跃机器少于这么多台，只公开总量
 const MAX_AGE_DAYS = 8;           // 客户端最多补发 7 天前的报告
 
@@ -57,53 +57,73 @@ export async function handleReport(request, env, now = Date.now()) {
 }
 
 // ---------- 汇总 ----------
+// 小样本保护（docs/telemetry.md「公开汇总」）：
+// - 每个分布的每个桶都按「有多少台机器贡献过」判断，少于 MIN_BUCKET 台的并进 other；other 自己还不够就不列。
+//   版本、系统这类头部字段一台机器只算一次，计数类字段（轮次结果、上下文桶、媒体耗时……）按贡献机器数判断。
+// - 活跃机器少于 MIN_MACHINES 台：只公开 TOTALS_ONLY 里的总量（分布照样做桶级保护），不公开头部字段。
+// - 活跃机器少于 MIN_BUCKET 台：连总量也不公开，只给机器数和报告数。
 const HEADER_ENUMS = ["version", "os", "arch", "python", "claude_code", "codex"];
-// 机器少的时候只公开这些总量（不公开版本、系统这类能认出个人的分布）
 const TOTALS_ONLY = ["tickets_new", "rounds", "round_outcomes", "model_errors", "lark_errors"];
+const SUMS = ["tickets_new", "rounds"];
 
-function addCounts(into, counts) {
-  for (const [k, n] of Object.entries(counts || {})) into[k] = (into[k] || 0) + n;
+function addBucket(dist, key, n, iid) {
+  const b = (dist[key] = dist[key] || { n: 0, machines: new Set() });
+  b.n += n;
+  b.machines.add(iid);
 }
 
-function mergeSmall(machinesByValue) {
-  // 取值 → 机器数；少于 MIN_BUCKET 台的并进 other
-  const out = {};
-  for (const [v, n] of Object.entries(machinesByValue)) {
-    const key = n < MIN_BUCKET ? "other" : v || "none";
-    out[key] = (out[key] || 0) + n;
+function mergeSmall(dist) {
+  // dist：桶 → { n, machines }。返回 桶 → n，贡献机器少于 MIN_BUCKET 台的桶并进 other
+  const kept = {};
+  let other = null;
+  for (const [k, b] of Object.entries(dist)) {
+    if (b.machines.size >= MIN_BUCKET && k !== "other") kept[k] = b.n;
+    else {
+      other = other || { n: 0, machines: new Set() };
+      other.n += b.n;
+      for (const m of b.machines) other.machines.add(m);
+    }
   }
-  if (out.other !== undefined && out.other < MIN_BUCKET) {
-    // 合并后 other 自己还太小：只说「其他」有多少不再细分也可能认出人，直接不列
-    delete out.other;
-  }
-  return out;
+  if (other && other.machines.size >= MIN_BUCKET) kept.other = other.n;
+  return kept;
+}
+
+function sumSmall(machinesWithAny, n) {
+  // 总量也按贡献机器数判断：只有不到 MIN_BUCKET 台机器有过这类数据时不公开
+  return machinesWithAny.size >= MIN_BUCKET ? n : undefined;
 }
 
 export function summarize(rows, fromDay, toDay, generatedAt) {
   const machines = new Set(rows.map((r) => r.install_id));
-  const totals = {};
-  const header = Object.fromEntries(HEADER_ENUMS.map((k) => [k, {}]));
+  const sums = {}; // 字段 → { n, machines }
+  const dists = {}; // 字段 → 桶 → { n, machines }
+  const media = {}; // 媒体种类 → { ok/fail: 分布, seconds: 分布, size_mb: 分布 }
   const latest = new Map(); // install_id → 窗口里最后一份报告（头部字段按机器算，不按天算）
   for (const r of rows) {
     const rep = JSON.parse(r.body);
+    const iid = r.install_id;
     for (const [k, v] of Object.entries(rep)) {
-      if (k === "tickets_new" || k === "rounds") totals[k] = (totals[k] || 0) + v;
-      else if (k === "media") {
-        totals.media = totals.media || {};
+      if (SUMS.includes(k)) {
+        if (v > 0) {
+          const s = (sums[k] = sums[k] || { n: 0, machines: new Set() });
+          s.n += v;
+          s.machines.add(iid);
+        }
+      } else if (k === "media") {
         for (const [kind, m] of Object.entries(v)) {
-          const t = (totals.media[kind] = totals.media[kind] || {});
+          const t = (media[kind] = media[kind] || { result: {}, seconds: {}, size_mb: {} });
           for (const [mk, mv] of Object.entries(m)) {
-            if (typeof mv === "number") t[mk] = (t[mk] || 0) + mv;
-            else addCounts((t[mk] = t[mk] || {}), mv);
+            if (typeof mv === "number") { if (mv > 0) addBucket(t.result, mk, mv, iid); }
+            else for (const [bk, bn] of Object.entries(mv)) if (bn > 0) addBucket(t[mk], bk, bn, iid);
           }
         }
-      } else if (schema.fields[k] && schema.fields[k].type === "counts") addCounts((totals[k] = totals[k] || {}), v);
+      } else if (schema.fields[k] && schema.fields[k].type === "counts") {
+        const d = (dists[k] = dists[k] || {});
+        for (const [bk, bn] of Object.entries(v)) if (bn > 0) addBucket(d, bk, bn, iid);
+      }
     }
-    const prev = latest.get(r.install_id);
-    if (!prev || prev.day < rep.day) latest.set(r.install_id, rep);
-  }
-  for (const rep of latest.values()) {
-    for (const k of HEADER_ENUMS) header[k][rep[k] ?? ""] = (header[k][rep[k] ?? ""] || 0) + 1;
+    const prev = latest.get(iid);
+    if (!prev || prev.day < rep.day) latest.set(iid, rep);
   }
   const out = {
     window: { from: fromDay, to: toDay },
@@ -111,12 +131,40 @@ export function summarize(rows, fromDay, toDay, generatedAt) {
     machines: machines.size,
     reports: rows.length,
   };
+  if (machines.size < MIN_BUCKET) {
+    out.note = `活跃机器少于 ${MIN_BUCKET} 台，不公开任何数字`;
+    return out;
+  }
+  const totals = {};
+  for (const [k, s] of Object.entries(sums)) {
+    const n = sumSmall(s.machines, s.n);
+    if (n !== undefined) totals[k] = n;
+  }
+  for (const [k, d] of Object.entries(dists)) {
+    const m = mergeSmall(d);
+    if (Object.keys(m).length) totals[k] = m;
+  }
+  const mediaOut = {};
+  for (const [kind, t] of Object.entries(media)) {
+    const o = { ...mergeSmall(t.result) };
+    delete o.other; // ok/fail 只有两个桶，并进 other 没有意义
+    for (const mk of ["seconds", "size_mb"]) {
+      const m = mergeSmall(t[mk]);
+      if (Object.keys(m).length) o[mk] = m;
+    }
+    if (Object.keys(o).length) mediaOut[kind] = o;
+  }
+  if (Object.keys(mediaOut).length) totals.media = mediaOut;
   if (machines.size < MIN_MACHINES) {
     out.note = `活跃机器少于 ${MIN_MACHINES} 台，只公开总量`;
     out.totals = Object.fromEntries(TOTALS_ONLY.filter((k) => k in totals).map((k) => [k, totals[k]]));
     return out;
   }
   out.totals = totals;
+  const header = Object.fromEntries(HEADER_ENUMS.map((k) => [k, {}]));
+  for (const [iid, rep] of latest) {
+    for (const k of HEADER_ENUMS) addBucket(header[k], rep[k] || "none", 1, iid);
+  }
   out.machines_by = Object.fromEntries(HEADER_ENUMS.map((k) => [k, mergeSmall(header[k])]));
   return out;
 }
