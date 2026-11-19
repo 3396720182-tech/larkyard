@@ -8,12 +8,13 @@
 
 update-state.json（ticketd/update.py 写，这里读和改）：
   {"status": "probation", "from": "0.3.0", "to": "0.3.1", "deadline": <epoch>, "window": <秒>, "starts": 0, "token": "..."}
-  每次启动 starts 加一。看门狗记了 timed_out、或 starts 到 MAX_STARTS，就把 current 改回 from，status 记成
-  rolled_back，再 exec 旧版本。墙钟已过 deadline 但不是看门狗动的手（试用期里关机了），重新给一个完整试用期，
-  只给一次；第二次再过期就按超时切回。新版本守护进程自检通过后把 status 改成 confirmed。
+  每次启动 starts 加一（守护进程按停机信号正常退出时记 clean_exit，那次不算）。看门狗记了 timed_out、或 starts 到 MAX_STARTS，就把 current 改回 from，status 记成
+  rolled_back，再 exec 旧版本。墙钟已过 deadline、不是看门狗动的手、而且中间重新开过机（试用期里关机了），
+  重新给一个完整试用期，只给一次；没重启过就按超时切回；第二次再过期就按超时切回。新版本守护进程自检通过后把 status 改成 confirmed。
 试用期内另起一个看门狗进程，按单调时钟（睡眠不计时）等到试用期满 + 宽限还没确认（守护进程活着但卡死、
 自检一直不过），就记下 timed_out 并结束守护进程，服务管理器重新拉起时这里按超时切回。
 """
+import fcntl
 import json
 import os
 import signal
@@ -38,6 +39,49 @@ def read_state(app):
         return st if isinstance(st, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+class locked:
+    """update-state.json 的读改写都在这把锁里做（启动器、看门狗、守护进程的确认 / 安装各在不同进程里）。
+    flock 按打开的文件计：同一进程里不要嵌套。"""
+
+    def __init__(self, app):
+        self.path = os.path.join(app, STATE + ".lock")
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+
+
+def boot_time():
+    """这次开机的时刻（墙钟 − 含睡眠的开机时长）。拿不到返回 None。用来分辨「试用期里关机重启过」和
+    「新版本自己退出了」：前者才值得再给一次试用期。"""
+    clk = getattr(time, "CLOCK_BOOTTIME", None) if sys.platform.startswith("linux") else \
+        getattr(time, "CLOCK_MONOTONIC", None)  # macOS 的 CLOCK_MONOTONIC 含睡眠时间
+    if clk is None:
+        return None
+    try:
+        return time.time() - time.clock_gettime(clk)
+    except OSError:
+        return None
+
+
+BOOT_SLACK = 120.0  # 两次算出的开机时刻差这么多以上才算重启过（墙钟校时会让它小幅漂移）
+
+
+def rebooted(st):
+    try:
+        then, now = float(st.get("boot")), boot_time()
+    except (TypeError, ValueError):
+        return False
+    return now is not None and abs(now - then) > BOOT_SLACK
 
 
 def write_state(app, st):
@@ -68,6 +112,8 @@ def switch(app, version):
         raise ValueError("bad version %r" % (version,))
     if not os.path.isdir(version_dir(app, version)):
         raise FileNotFoundError(version_dir(app, version))
+    if not os.path.exists(os.path.join(version_dir(app, version), "bin", "ticketd")):
+        raise FileNotFoundError(os.path.join(version_dir(app, version), "bin", "ticketd"))
     cur = os.path.join(app, "current")
     tmp = "%s.tmp-%d" % (cur, os.getpid())
     try:
@@ -80,14 +126,22 @@ def switch(app, version):
 
 def decide(app, now=None):
     """读状态、计启动次数，需要时切回。返回（可能已更新的）状态。启动器里任何异常都不能挡住启动当前版本。"""
+    with locked(app):
+        return _decide(app, now)
+
+
+def _decide(app, now=None):
     now = time.time() if now is None else now
     st = read_state(app)
     if st.get("status") != "probation":
         return st
-    try:
-        st["starts"] = int(st.get("starts") or 0) + 1
-    except (TypeError, ValueError):
-        st["starts"] = MAX_STARTS
+    if st.pop("clean_exit", None):
+        pass  # 上次是守护进程收到停机信号后正常退出的（用户重启服务、关机）：不算一次崩溃
+    else:
+        try:
+            st["starts"] = int(st.get("starts") or 0) + 1
+        except (TypeError, ValueError):
+            st["starts"] = MAX_STARTS
     why = None
     try:
         deadline = float(st.get("deadline") or 0)
@@ -99,10 +153,10 @@ def decide(app, now=None):
     elif st["starts"] >= MAX_STARTS:
         why = "crash"
     elif now > deadline:
-        if window > 0 and not st.get("extended"):
-            # 过了 deadline 但不是看门狗动的手：多半是试用期里关机 / 重启了（睡眠不会走到这里，看门狗按单调时钟计时）。
-            # 不算新版本的错，重新给一个完整的试用期，只给一次
-            st.update(deadline=now + window, extended=True)
+        if window > 0 and not st.get("extended") and rebooted(st):
+            # 过了 deadline、看门狗没动手，而且中间重新开过机：试用期里关机了，不算新版本的错，
+            # 重新给一个完整的试用期，只给一次。没重启过（新版本在 deadline 和看门狗之间自己退出）照常按超时切回
+            st.update(deadline=now + window, extended=True, boot=boot_time())
         else:
             why = "timeout"
     if why:
@@ -140,11 +194,15 @@ def watch(app, pid, token, remaining, clock=time.monotonic, sleep=time.sleep, ki
         if clock() >= end_at:
             break
         sleep(WATCHDOG_POLL)
-    st["timed_out"] = True
-    try:
-        write_state(app, st)
-    except OSError:
-        pass
+    with locked(app):
+        st = read_state(app)  # 锁里重读：守护进程可能刚刚确认了
+        if st.get("status") != "probation" or st.get("token") != token:
+            return False
+        st["timed_out"] = True
+        try:
+            write_state(app, st)
+        except OSError:
+            pass
     try:
         kill(pid, signal.SIGTERM)
     except OSError:

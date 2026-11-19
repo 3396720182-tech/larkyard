@@ -311,5 +311,7 @@ def main(argv=None) -> int:
     media.stop()
     sched.shutdown()
     con.close()
+    if code == 0:
+        update.mark_clean_exit()  # 收到停机信号正常退出：试用期里不算一次崩溃
     print("ticketd stopped", flush=True)
     return code

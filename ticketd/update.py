@@ -95,6 +95,42 @@ def write_state(st: dict) -> None:
     launcher.write_state(str(app_dir()), st)
 
 
+def state_lock():
+    app_dir().mkdir(parents=True, exist_ok=True)
+    return launcher.locked(str(app_dir()))
+
+
+def _atomic_copy(data: bytes, dst: Path, mode: int = 0o644) -> None:
+    """写临时文件、fsync、rename、fsync 目录：启动器断电后读到半个文件，服务就起不来、也切不回。"""
+    tmp = dst.with_name("%s.tmp-%d" % (dst.name, os.getpid()))
+    with open(str(tmp), "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(str(tmp), mode)
+    os.replace(str(tmp), str(dst))
+    try:
+        dfd = os.open(str(dst.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def mark_clean_exit() -> None:
+    """守护进程收到停机信号、正常退出：试用期里这次退出不算崩溃（用户重启服务或电脑）。"""
+    try:
+        with state_lock():
+            st = read_state()
+            if st.get("status") == "probation":
+                st["clean_exit"] = True
+                write_state(st)
+    except OSError:
+        pass
+
+
 CARRY = ("adopted_from", "label", "workspace_md", "service_env")  # 受管安装的来历：每次重写状态都要带上（--undo 要用）
 
 
@@ -623,10 +659,7 @@ def install_launcher(src_root: Path) -> bool:
         compile(new, str(src), "exec")  # 新启动器本身有语法错误就不换
         if dst.is_file() and dst.read_bytes() == new:
             return False
-        tmp = dst.with_name("launcher.py.tmp-%d" % os.getpid())
-        tmp.write_bytes(new)
-        os.chmod(str(tmp), 0o644)
-        os.replace(str(tmp), str(dst))
+        _atomic_copy(new, dst)
         return True
     except (OSError, SyntaxError, ValueError):
         return False
@@ -685,13 +718,15 @@ def confirm(con, version: Optional[str] = None, now: Optional[float] = None) -> 
     """自检通过：记已确认、启动器两步更新的第二步、清理旧版本。"""
     now = time.time() if now is None else now
     version = version or __version__
-    st = read_state()
-    if st.get("status") != "probation" or st.get("to") != version:
-        return False
-    st.update(status="confirmed", version=version, previous=st.get("from"), confirmed_at=now)
-    for k in ("from", "to", "deadline", "starts", "token", "window", "timed_out", "extended"):
-        st.pop(k, None)
-    write_state(st)
+    with state_lock():  # 和看门狗互斥：它在锁里重读，看到已确认就不动手
+        st = read_state()
+        if st.get("status") != "probation" or st.get("to") != version or st.get("timed_out"):
+            return False
+        st.update(status="confirmed", version=version, previous=st.get("from"), confirmed_at=now)
+        for k in ("from", "to", "deadline", "starts", "token", "window", "timed_out", "extended", "boot",
+                  "clean_exit"):
+            st.pop(k, None)
+        write_state(st)
     metrics.kv_set(con, "update.installed_at", str(st.get("switched_at") or now))
     pend = kv_json(con, "update.pending")
     if pend and pend.get("version") == version:
@@ -834,12 +869,18 @@ class Updater:
                 sched.update_hold = False
             event(self.con, "install_failed", "切回 %s 失败：%r" % (version, e), dedupe=False)
             return False
-        st = {"status": "confirmed", "version": version, "previous": cur, "switched_at": self.clock(), "manual": True}
-        st.update(carried(read_state()))
-        write_state(st)
-        block_version(self.con, cur)  # 不再自动装回它，直到出现更高的版本
-        event(self.con, "manual_rollback", "%s → %s" % (cur, version), dedupe=False)
+        # current 已经切走：后面哪一步出错都要按新的 current 重启（不然守护进程挂着 update_hold 继续跑旧代码）
         self.restart = True
+        try:
+            st = {"status": "confirmed", "version": version, "previous": cur, "switched_at": self.clock(),
+                  "manual": True}
+            with state_lock():
+                st.update(carried(read_state()))
+                write_state(st)
+            block_version(self.con, cur)  # 不再自动装回它，直到出现更高的版本
+            event(self.con, "manual_rollback", "%s → %s" % (cur, version), dedupe=False)
+        except Exception as e:
+            print("update: 手工切回后记录状态失败：%r" % (e,), flush=True)
         return True
 
 
@@ -871,15 +912,16 @@ def install(con, pend: dict, now: Optional[float] = None) -> str:
         before = read_state()
         deadline = confirm_deadline(start)
         st = {"status": "probation", "from": cur, "to": version, "starts": 0, "switched_at": start,
-              "deadline": deadline, "window": deadline - start,
+              "deadline": deadline, "window": deadline - start, "boot": launcher.boot_time(),
               "token": hashlib.sha256(os.urandom(16)).hexdigest()[:16]}
         st.update(carried(before))
-        write_state(st)
-        try:
-            launcher.switch(str(app_dir()), version)
-        except BaseException:
-            write_state(before)
-            raise
+        with state_lock():
+            write_state(st)
+            try:
+                launcher.switch(str(app_dir()), version)
+            except BaseException:
+                write_state(before)
+                raise
     except UpdateError as e:
         event(con, "install_failed", "%s：%s" % (version, e), dedupe=False)
         raise
@@ -1016,8 +1058,7 @@ def adopt(workspace: str = "", repo: Optional[Path] = None, run_install=_install
     finally:
         if tmp.exists():
             shutil.rmtree(str(tmp), ignore_errors=True)
-    shutil.copyfile(str(vd / "ticketd" / "launcher.py"), str(app / "launcher.py.tmp"))
-    os.replace(str(app / "launcher.py.tmp"), str(app / "launcher.py"))
+    _atomic_copy((vd / "ticketd" / "launcher.py").read_bytes(), app / "launcher.py")
     launcher.switch(str(app), version)
     st = {"status": "confirmed", "version": version, "adopted_from": str(repo), "adopted_at": time.time(),
           "label": label, "service_env": svc_env}

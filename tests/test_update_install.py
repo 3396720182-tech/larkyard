@@ -176,7 +176,7 @@ class LauncherTest(ManagedBase):
     def test_launcher_imports_nothing_from_version_dirs(self):
         src = (REPO / "ticketd" / "launcher.py").read_text(encoding="utf-8")
         imports = {l.split()[1].split(".")[0] for l in src.splitlines() if l.startswith(("import ", "from "))}
-        self.assertEqual(imports, {"json", "os", "signal", "sys", "time"})
+        self.assertEqual(imports, {"fcntl", "json", "os", "signal", "sys", "time"})
         self.assertNotIn("ticketd", imports)
 
     def test_crash_three_starts_rolls_back(self):
@@ -219,12 +219,12 @@ class LauncherTest(ManagedBase):
         self.assertEqual(self.run_launcher().stdout.strip(), "ran-0.3.0")
         self.assertEqual(update.read_state()["reason"], "timeout")
 
-    def test_deadline_passed_without_watchdog_extends_once(self):
-        """墙钟过了 deadline 但看门狗没动手（试用期里关机了）：重新给一次完整试用期，第二次再过期才切回。"""
+    def test_deadline_passed_after_reboot_extends_once(self):
+        """墙钟过了 deadline、看门狗没动手、中间重新开过机（试用期里关机了）：重新给一次完整试用期，第二次再过期才切回。"""
         make_version(self.app, "0.3.1")
         self.probation(deadline=time.time() - 1)
         st = update.read_state()
-        st["window"] = 480
+        st.update(window=480, boot=launcher.boot_time() - 3600)  # 一小时前那次开机时切换的
         update.write_state(st)
         self.assertEqual(self.run_launcher().stdout.strip(), "ran-0.3.1")
         st = update.read_state()
@@ -234,6 +234,28 @@ class LauncherTest(ManagedBase):
         update.write_state(st)
         self.assertEqual(self.run_launcher().stdout.strip(), "ran-0.3.0")
         self.assertEqual(update.read_state()["reason"], "timeout")
+
+    def test_exit_between_deadline_and_watchdog_rolls_back(self):
+        """没重启过：新版本在 deadline 之后、看门狗动手之前自己退出，按超时切回，不再给试用期（审查第 2 轮 B1）。"""
+        make_version(self.app, "0.3.1")
+        self.probation(deadline=time.time() - 1)
+        st = update.read_state()
+        st.update(window=480, boot=launcher.boot_time())
+        update.write_state(st)
+        self.assertEqual(self.run_launcher().stdout.strip(), "ran-0.3.0")
+        self.assertEqual(update.read_state()["reason"], "timeout")
+
+    def test_clean_exit_is_not_counted_as_crash(self):
+        """试用期里用户重启服务两次（守护进程正常退出）：不算崩溃，不切回。"""
+        make_version(self.app, "0.3.1")
+        self.probation(starts=2)
+        update.mark_clean_exit()
+        self.assertEqual(self.run_launcher().stdout.strip(), "ran-0.3.1")
+        st = update.read_state()
+        self.assertEqual((st["status"], st["starts"]), ("probation", 2))
+        self.assertNotIn("clean_exit", st)
+        self.run_launcher()  # 这次没有正常退出标记：第 3 次，按崩溃切回
+        self.assertEqual(update.read_state()["reason"], "crash")
 
     def test_watchdog_timed_out_rolls_back_even_before_deadline(self):
         make_version(self.app, "0.3.1")
@@ -297,6 +319,36 @@ class WatchdogTest(ManagedBase):
             did = launcher.watch(str(self.app), 1, "t1", 100.0, clock=lambda: now[0], sleep=sleep,
                                  kill=lambda *a: self.fail("不该结束已确认的守护进程"))
         self.assertFalse(did)
+
+    def test_watchdog_rechecks_under_lock_before_marking(self):
+        """看门狗读到试用期之后、写 timed_out 之前守护进程确认了：锁里重读，不把 confirmed 盖回去、不杀（B3）。"""
+        self.probation(deadline=0.0)
+        now = [0.0]
+        real_locked = launcher.locked
+
+        fired = []
+
+        class confirm_then_lock(real_locked):
+            def __enter__(s):
+                if not fired:  # 只在看门狗第一次拿锁之前插进一次确认（confirm 自己也拿这把锁）
+                    fired.append(1)
+                    update.confirm(self.con, version="0.3.1")
+                return super().__enter__()
+        with mock.patch.object(launcher, "_alive", lambda pid: True), \
+                mock.patch.object(launcher, "locked", confirm_then_lock):
+            did = launcher.watch(str(self.app), 1, "t1", 0.0, clock=lambda: now[0],
+                                 sleep=lambda s: now.__setitem__(0, now[0] + s),
+                                 kill=lambda *a: self.fail("不该结束已确认的守护进程"))
+        self.assertFalse(did)
+        self.assertEqual(update.read_state()["status"], "confirmed")
+
+    def test_confirm_refused_after_watchdog_timed_out(self):
+        make_version(self.app, "0.3.1")
+        self.probation()
+        st = update.read_state()
+        st["timed_out"] = True
+        update.write_state(st)
+        self.assertFalse(update.confirm(self.con, version="0.3.1"))
 
     def test_sigkill_when_sigterm_ignored(self):
         self.probation(deadline=0.0)
@@ -475,6 +527,22 @@ class IdleTest(ManagedBase):
         with mock.patch.object(update, "install", side_effect=update.UpdateError("x")):
             self.assertFalse(self.updater().tick(s, None))
         self.assertFalse(s.update_hold)
+
+
+class ManualRollbackFailureTest(ManagedBase):
+    def test_restart_even_if_recording_fails(self):
+        """current 已切走、记状态时出错：照样请求重启，不留下 update_hold（B2）。"""
+        make_version(self.app, "0.3.1")
+        launcher.switch(str(self.app), "0.3.1")
+
+        class S:
+            update_hold = False
+        s = S()
+        up = update.Updater(self.con)
+        with mock.patch.object(update, "block_version", side_effect=OSError("db locked")):
+            self.assertTrue(up._manual_rollback("0.3.0", s))
+        self.assertTrue(up.restart)
+        self.assertEqual(update.current_version(), "0.3.0")
 
 
 class ManualRollbackTest(ManagedBase):
