@@ -184,6 +184,7 @@ def doc_links(con, ticket_id: str, workdir: str, artifacts: List[str],
         prev = con.execute("SELECT url FROM doc_targets WHERE ticket_id=? AND path=?",
                            (ticket_id, str(p))).fetchone()
         url = None
+        start = time.monotonic()
         if prev and p.suffix.lower() in OVERWRITABLE:
             try:
                 _overwrite(p, prev["url"])
@@ -200,9 +201,12 @@ def doc_links(con, ticket_id: str, workdir: str, artifacts: List[str],
                 outbox.alert("%s 稿子导入云文档失败（%s）：%s" % (ticket_id, p.name, e))
                 con.execute("INSERT OR REPLACE INTO doc_failures VALUES(?,?,?,?,?)",
                             (str(p), st.st_mtime, st.st_size, reason_text(str(e)), db.now()))
+                if not outbox._is_transient(str(e)):
+                    outbox._metric(con, ticket_id, "media", "doc:fail", time.monotonic() - start, st.st_size)
                 continue
             con.execute("INSERT OR REPLACE INTO doc_targets VALUES(?,?,?,?)", (ticket_id, str(p), url, db.now()))
         con.execute("INSERT OR REPLACE INTO published VALUES(?,?,?,?,?)",
                     (str(p), st.st_mtime, st.st_size, url, db.now()))
+        outbox._metric(con, ticket_id, "media", "doc:ok", time.monotonic() - start, st.st_size)
         links.append((p.name, url))
     return links

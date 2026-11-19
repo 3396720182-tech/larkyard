@@ -345,6 +345,34 @@ def account_error(*texts: str) -> Optional[str]:
     return None
 
 
+RATE_LIMIT_RE = re.compile(r"\b(?:api error|error|status|http)\b[^\n]{0,20}?\b429\b|rate[ _-]?limit")
+SERVER_RE = re.compile(r"\b(?:api error|error|status|http)\b[^\n]{0,20}?\b5\d\d\b")
+NETWORK_MARKERS = ("econnreset", "econnrefused", "etimedout", "socket hang up", "connection error", "fetch failed",
+                   "network error", "enotfound", "eai_again", "getaddrinfo", "can't reach the api server",
+                   "enetunreach", "ehostunreach", "stream disconnected", "error sending request", "timed out", "timeout")
+
+
+def error_code(*texts: str, result_event: Optional[dict] = None) -> str:
+    """模型接口错误归类，只返回写死的枚举值（匿名统计用，绝不带出原文）：
+    balance / auth / rate_limit / overloaded / network / server_5xx / client_4xx / other。"""
+    acct = account_error(*texts)
+    if acct:
+        return "balance" if acct == "余额不足" else "auth"
+    st = result_event.get("api_error_status") if isinstance(result_event, dict) else None
+    low = "\n".join(t for t in texts if t).lower()
+    if st == 429 or RATE_LIMIT_RE.search(low):
+        return "rate_limit"
+    if st == 529 or "overloaded" in low:
+        return "overloaded"
+    if any(m in low for m in NETWORK_MARKERS):
+        return "network"
+    if (isinstance(st, int) and st >= 500) or SERVER_RE.search(low):
+        return "server_5xx"
+    if (isinstance(st, int) and 400 <= st < 500) or is_client_error(low):
+        return "client_4xx"
+    return "other"
+
+
 def bg_task_event(d: dict):
     """后台任务事件：返回 ("start", task_id, 描述) / ("end", task_id, "")；其他事件返回 None。
     Claude Code 对后台 Bash、后台子代理发 system/task_started，结束（完成、失败、被停）时发 system/task_notification。"""

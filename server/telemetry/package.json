@@ -1,0 +1,12 @@
+{
+  "name": "larkyard-telemetry",
+  "private": true,
+  "type": "module",
+  "description": "Larkyard 匿名统计后端（Cloudflare Worker + D1）",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}

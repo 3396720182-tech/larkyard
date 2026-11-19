@@ -26,6 +26,19 @@ jobs:
       - name: Card variants render
         run: /usr/bin/python3 scripts/validate_cards.py --dump > /dev/null
 
+  telemetry-worker:
+    name: telemetry backend (node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Worker unit tests
+        working-directory: server/telemetry
+        run: npm test
+
   systemd-user-service:
     name: systemd user service (ubuntu-latest)
     runs-on: ubuntu-latest

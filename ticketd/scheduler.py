@@ -564,7 +564,7 @@ class Scheduler:
                 core.enqueue_message(self.con, r.ticket_id, templates.api_error_message(
                     r.ticket_id, err, worker.account_error(err), r.bg_shown))
                 self.log(r.workdir, "模型接口报错，后台任务还在跑，已提醒用户")
-                metrics.record(self.con, r.ticket_id, "api_error", err)
+                metrics.record(self.con, r.ticket_id, "api_error", err, code=worker.error_code(err, result_event=r.result))
             return  # 单轮超时照旧兜底
         quiet = db.now() - max(t["last_action_at"] or 0, t["started_at"] or 0)
         if quiet >= config.stall_seconds() and not t["stall_alerted"]:
@@ -750,7 +750,8 @@ class Scheduler:
         if now - since < limit:
             every = config.outage_retry_every()
             if t["outage_since"] is None:  # 只在进入故障等待时告诉用户一次，之后的自动重试不再打扰
-                metrics.record(self.con, tid, "outage_start", "%s：%s" % (reason, detail))
+                metrics.record(self.con, tid, "outage_start", "%s：%s" % (reason, detail),
+                               code="balance" if "余额" in reason else "auth" if "认证" in reason else "network")
                 until = time.strftime("%m-%d %H:%M", time.localtime(since + limit))
                 plan = "每 %d 分钟自动试一次，最晚到 %s" % (max(1, int(every // 60)), until)
                 if account:
@@ -868,6 +869,9 @@ class Scheduler:
         stderr_text = _read_from(Path(r.workdir) / ".stderr.log", r.stderr_offset)
         acct = worker.account_error(err, r.last_text, stderr_text)
         transient = not acct and worker.is_transient(r.proc.returncode, r.result, stderr_text)
+        if acct or transient or err:
+            metrics.record(self.con, tid, "model_error", "", code=worker.error_code(
+                err, r.last_text, stderr_text, result_event=r.result))
         detail = worker._short(err or r.last_text or stderr_text or "没有看到 compact_boundary", 200)
         if t["state"] == "running" and (acct or transient):
             metrics.record(self.con, tid, "compact_failed", "稍后重试压缩：" + detail)
@@ -925,6 +929,9 @@ class Scheduler:
         err = worker.result_error_text(r.result)
         acct = worker.account_error(err, r.last_text, stderr_text)
         transient = not acct and worker.is_transient(code, r.result, stderr_text)
+        if acct or transient or err:  # 没交汇报就退出且看得出是模型接口的问题：记一条归类后的错误（匿名统计用）
+            metrics.record(self.con, tid, "model_error", "", code=worker.error_code(
+                err, r.last_text, stderr_text, result_event=r.result))
         delays = config.retry_delays()
         if transient and t["retries"] < len(delays):
             self._schedule_retry(r, t, delays[t["retries"]])

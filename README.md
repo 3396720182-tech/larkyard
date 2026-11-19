@@ -193,6 +193,8 @@ sudo loginctl enable-linger "$USER"
 | `TICKETD_WORKSPACE` | 空 | bridge 的工作目录，`ticket doctor` 检查里面的主会话约定是否落后于模板；不填就读 bridge 配置里的默认工作目录 |
 | `TICKETD_DIGEST` | `mon 10:00` | 每周运行概况（`ticket stats`）私信给主用户的时刻；空为不发 |
 | `TICKETD_COST_HINT_USD` | `30` | 会话累计成本到这个数（美元）就提示换新会话或开新单；`0` 为不提示 |
+| `TICKETD_TELEMETRY` | 空 | 设为 `0` 强制关闭匿名使用统计（`DO_NOT_TRACK=1` 同效）。统计默认关闭，`ticket telemetry on` 才开启，见 [docs/telemetry.md](./docs/telemetry.md) |
+| `TICKETD_TELEMETRY_URL` | 空（部署后填默认值） | 匿名统计的上报地址；fork 的人可以指向自己的后端（`server/telemetry/`） |
 | `TICKETD_STALL_INTERRUPT` | `1800` | 卡住处置：没有动作满这么多秒、且这次命令的进程没在消耗 CPU，就结束这条命令（worker 收到报错接着做）；`0` 为关 |
 | `TICKETD_STALL_ABORT` | `3600` | 仍没进展满这么多秒就中止这一轮、报「需要你决定」（会话保留，回复「继续」接着做）；`0` 为关 |
 | `TICKETD_OUTAGE_RETRY_EVERY` | `900` | 故障等待期间多久自动续跑一次（秒）：断网、接口故障（短重试用完后）、余额不足、认证失败 |

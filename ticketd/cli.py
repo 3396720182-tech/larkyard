@@ -77,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("stats", help="最近几天的运行概况（成本、需要你的次数、失败、事件）")
     st.add_argument("--days", type=float, default=7)
     st.add_argument("--backfill", action="store_true", help="先从老工单的 .stream.jsonl 补成本（只补没有记录的单）")
+    tm = sub.add_parser("telemetry", help="匿名使用统计（默认关闭）：status / show / on / off，见 docs/telemetry.md")
+    tm.add_argument("action", nargs="?", default="status", choices=("status", "show", "on", "off"))
+    tm.add_argument("--sent", action="store_true", help="和 show 一起用：看已经发过的报告")
     return p
 
 
@@ -334,6 +337,11 @@ def cmd_doctor(con, a) -> str:
         ok, note = _doctor_dm(con)
         bad += not ok
         lines.append(("✅ " if ok else "❌ ") + note)
+    try:
+        from . import telemetry
+        lines.append("ℹ️ " + telemetry.status_lines(con)[0])
+    except Exception as e:
+        lines.append("⚠️ 匿名统计状态读不出来：%r" % (e,))
     bad = sum(1 for line in lines if line.startswith("❌"))
     lines.insert(0, "配置自检：%s" % ("没有发现问题" if not bad else "%d 个问题" % bad))
     return "\n".join(lines)
@@ -382,6 +390,14 @@ def _doctor_dm(con, timeout: float = 45.0):
             return False, "测试私信没发出：%s" % (row["last_error"] or "")[:200]
         time.sleep(1)
     return False, "%d 秒内守护进程没有发出测试私信（服务没在运行，或发送在重试：看 ~/.ticketd/logs/alerts.log）" % timeout
+
+
+def cmd_telemetry(con, a) -> str:
+    from . import telemetry
+    try:
+        return telemetry.command(con, a.action, sent=a.sent)
+    except PermissionError as e:
+        raise core.TicketError(str(e))
 
 
 def cmd_stats(con, a) -> str:
@@ -433,6 +449,7 @@ COMMANDS = {
     "new": cmd_new, "send": cmd_send, "lookup": cmd_lookup, "report": cmd_report,
     "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "restart": cmd_restart, "approve": cmd_approve, "grant": cmd_grant,
     "ls": cmd_ls, "show": cmd_show, "stats": cmd_stats, "doctor": cmd_doctor,
+    "telemetry": cmd_telemetry,
 }
 
 

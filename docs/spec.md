@@ -323,6 +323,20 @@ ticket report --status ready|blocked|failed|dropped|waiting \
 - **调整（2026-11-19，外部评测）暂停 / 停止打断压缩**：压缩轮被用户暂停或停止时保留 `ctx_tokens`，这一轮的结果记 `held` / `stopped`，不算压缩失败；放开后 `start` 重新判断，仍超阈值就先压缩。原来落到「确定性失败」分支把 `ctx_tokens` 清零，放开后直接拿大上下文跑普通轮。
 - **D 按执行器分开**：窗口里有不止一种执行器时，`ticket stats` 分开列 Claude / Codex 的轮数和成本，并注明 Codex 不报成本、不自动压缩，避免直接拿来比。
 
+### 7.4 匿名使用统计（2026-11-19，T0035 设计、T0038 实现）
+
+起因：Larkyard 分发给别人用之后，维护者要能统一看到「运行得怎么样」，定位常见故障、决定优化顺序。原则：只收运行状况，绝不收用户在做什么；默认关闭。面向用户的说明和完整字段表在 `docs/telemetry.md`。
+
+- **开关**（`ticketd/telemetry.py`）：`ticket telemetry on` 在 `kv` 里记 `telemetry_consent=<同意的 schema 版本>`、`telemetry_id=<随机 UUIDv4>`、`telemetry_since=<开启的第二天>`；`off` 删掉所有 `telemetry_*` 键和 `pending/` 里的报告（`sent/` 副本留给用户自己删）。`DO_NOT_TRACK=1` 或 `TICKETD_TELEMETRY=0`（环境变量或 `config.env`）优先级最高，`on` 也拒绝。`CI=true` 时不发送。worker 里（有 `TICKETD_TICKET` / `TICKETD_SPOOL`）执行 `on` / `off` 报错，只读的 `status` / `show` 可以。
+- **数据来源**：只读数字和枚举列：`rounds`（时长、成本、结果、上下文）、`tickets.executor / created_at`、`reports.status / ask`（只看有没有）、`events.kind / code / seconds / size`、`grants` / `net_grants` 的时间和种类。**不读**标题、原话、汇报摘要、`events.detail`、`outbox.last_error`、路径。所有字符串经白名单映射，不认识的记 `other`。
+- **新埋点**：`events` 加 `code`（只放枚举值）、`seconds`、`size` 三列。`worker.error_code` 把模型接口报错归成 `balance / auth / rate_limit / overloaded / network / server_5xx / client_4xx / other`，在 worker 没交汇报就退出、压缩失败、后台任务时报错时记 `model_error` / `api_error`；`outbox.lark_error_code` 把飞书发送失败归成已知错误码 / `rate_limit / network / api_other / other`，每次失败记 `lark_error`；结果消息送达记 `delivery`（`sent / card_patched / fallback_text / card_patch_fallback / video_fallback / dead`）；图片上传、视频上传 / 视频消息、稿子导入成功或非网络失败时记 `media`（`image:ok` 这类码 + 耗时 + 字节数）。网络 / 超时这类会重试的媒体失败不记，免得一次断网记成几十次失败。这几类事件不进 `ticket stats` 的「事件」一行（`metrics.DETAIL_KINDS`）。版本号放在 `ticketd/__init__.py` 的 `__version__`。
+- **白名单**：`ticketd/telemetry_schema.json`，客户端（Python）和后端（`server/telemetry/src/validate.js`）共用。生成后、写入 `pending/` 前、发送前各校验一次；多一个键、类型不对、字符串不在枚举里整份丢弃，写 `alerts.log`（只写哪个字段，不回显内容）。
+- **生成与发送**：守护进程主循环每轮调用 `telemetry.maybe_send`（和 `maybe_digest` 同一位置）。每天 00:00 之后再加 0～6 小时随机延迟（每天抽一次，记在 `kv` 的 `telemetry_due`）；到点后给最近 7 天里开启过、还没生成过的日子（到昨天为止）生成报告写进 `~/.ticketd/telemetry/pending/<day>.json`，然后在单独的线程里用 `urllib` POST（10 秒超时），线程不碰数据库，结果写 `telemetry/last.json`。成功移到 `sent/`（最多留 90 份）；后端 4xx 拒收就删掉不重发；网络失败、429、5xx 留在 `pending/`，至少隔 30 分钟再试，每天最多 6 次，超过 7 天的删除。失败不告警、不私信，只在 `ticket telemetry status` 里显示。
+- **上报地址**：`TICKETD_TELEMETRY_URL`，默认值 `telemetry.DEFAULT_URL` 在后端部署前为空：开启后只在本机生成报告、不发送，`status` 和 `on` 都会说明。
+- **字段变更**：白名单扩一次 `schema` 加一，`docs/telemetry.md` 写明新增了什么；用户同意的是某个版本，没再次 `on` 之前按老版本发（v1 是第一版，按版本裁剪字段的代码等出现 v2 时再写）。
+- **后端**（`server/telemetry/`，维护者本人的 Cloudflare 账号，第一期 `*.workers.dev`）：`POST /v1/report` 严格校验、8KB 上限、只收最近 8 天、按 `(install_id, day)` 去重写入 D1，不读不存 IP 和 User-Agent，不开请求日志，按 IP 用 Rate Limiting 绑定限流（边缘计数，不落库）；每天定时删 365 天前的报告，每周一生成全体汇总，`GET /v1/summary` 公开（活跃机器少于 20 台只公开总量；取值少于 5 台机器的并进 `other`；不含 install_id）。部署清单见 `server/telemetry/README.md`。
+- **入口提示**：`install.sh` 结束时打印两行说明（不交互、不自动开启），`ticket doctor` 显示一行统计状态。
+
 ## 8. 容错
 
 | 情况 | 处理 |

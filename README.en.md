@@ -186,6 +186,8 @@ Everything lives in `~/.ticketd/config.env` (environment variables of the same n
 | `TICKETD_WORKSPACE` | empty | The bridge workspace; `ticket doctor` checks whether its CLAUDE.md lags behind the template. Empty reads the bridge's default workspace from its config |
 | `TICKETD_DIGEST` | `mon 10:00` | When to send the weekly summary (`ticket stats`) to the owner as a direct message; empty turns it off |
 | `TICKETD_COST_HINT_USD` | `30` | Once a session's cumulative cost reaches this (USD), suggest a fresh session or a new ticket; `0` turns it off |
+| `TICKETD_TELEMETRY` | empty | `0` forces anonymous usage statistics off (same as `DO_NOT_TRACK=1`). Statistics are off by default and only start after `ticket telemetry on`; see [docs/telemetry.md](./docs/telemetry.md) (Chinese) |
+| `TICKETD_TELEMETRY_URL` | empty (set once the backend is deployed) | Where anonymous statistics are sent; forks can point it at their own backend (`server/telemetry/`) |
 | `TICKETD_STALL_INTERRUPT` | `1800` | Stall handling: after this many seconds without an action, if the current command's processes are not using CPU, end that command (the worker gets a tool error and carries on); `0` turns it off |
 | `TICKETD_STALL_ABORT` | `3600` | Still no progress after this many seconds: stop the round and report blocked (the session is kept; reply "继续" to continue); `0` turns it off |
 | `TICKETD_OUTAGE_RETRY_EVERY` | `900` | While waiting out an outage, how often to resume automatically (seconds): network or API failures after the short retries, insufficient balance, authentication failures |

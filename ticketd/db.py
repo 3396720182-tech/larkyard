@@ -107,6 +107,10 @@ MIGRATIONS = [
     ("outbox", "card_json", "TEXT"),                             # 非空 = 发卡片（text 是卡片发不出去时的兜底）
     ("outbox", "report_id", "INTEGER"),                           # 这条消息对应的汇报
     ("outbox", "media_json", "TEXT"),                             # 非空 = 发视频消息（结果卡里放不进的视频；text 是发不出去时的兜底）
+    # 事件的归类结果（只放代码里写死的枚举值，如 balance / 230011 / image:ok）：匿名统计只读这一列，不读 detail 原文
+    ("events", "code", "TEXT NOT NULL DEFAULT ''"),
+    ("events", "seconds", "REAL"),                                # 媒体上传 / 导入用了多久
+    ("events", "size", "INTEGER"),                                # 媒体文件多大（字节）
 ]
 
 

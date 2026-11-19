@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "max_bytes": 8192,
+  "comment": "匿名使用统计的字段白名单（schema v1）。客户端（ticketd/telemetry.py）和后端（server/telemetry/src/validate.js）都按这一份校验：多一个键、类型不对、字符串不在枚举里，整份报告丢弃。改这里要升 schema、改 docs/telemetry.md、更新 tests/test_telemetry.py。",
+  "fields": {
+    "schema": {"type": "const", "value": 1, "required": true},
+    "install_id": {"type": "uuid", "required": true},
+    "day": {"type": "day", "required": true},
+    "version": {"type": "pattern", "pattern": "^(?:[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|dev)$", "required": true},
+    "os": {"type": "enum", "values": ["macos", "linux", "wsl", "other"], "required": true},
+    "os_major": {"type": "int", "min": 0, "max": 999},
+    "arch": {"type": "enum", "values": ["arm64", "x86_64", "other"], "required": true},
+    "python": {"type": "pattern", "pattern": "^(?:[0-9]{1,2}\\.[0-9]{1,3})?$"},
+    "claude_code": {"type": "pattern", "pattern": "^(?:[0-9]{1,3}\\.[0-9]{1,4})?$"},
+    "codex": {"type": "pattern", "pattern": "^(?:[0-9]{1,3}\\.[0-9]{1,4})?$"},
+    "config": {"type": "object", "fields": {
+      "max_workers": {"type": "int", "min": 1, "max": 8},
+      "digest_on": {"type": "bool"},
+      "compact_on": {"type": "bool"},
+      "video_folder_set": {"type": "bool"},
+      "worker_env_set": {"type": "bool"},
+      "model_set": {"type": "bool"}
+    }},
+    "tickets_new": {"type": "int", "min": 0, "max": 1000000},
+    "tickets_by_executor": {"type": "counts", "keys": ["claude", "codex", "other"]},
+    "rounds": {"type": "int", "min": 0, "max": 1000000},
+    "round_outcomes": {"type": "counts", "keys": ["ready", "blocked", "failed", "waiting", "dropped", "retry", "stopped",
+                                                  "held", "compact", "compact_failed", "other"]},
+    "round_minutes": {"type": "counts", "keys": ["<2", "2-10", "10-30", "30-60", "60-120", ">120"]},
+    "round_cost_usd": {"type": "counts", "keys": ["0", "<0.1", "0.1-1", "1-5", "5-20", ">20"]},
+    "day_cost_usd": {"type": "enum", "values": ["0", "<1", "1-5", "5-20", "20-50", ">50"]},
+    "rounds_per_ticket": {"type": "counts", "keys": ["1", "2-3", "4-10", ">10"]},
+    "ctx_tokens": {"type": "counts", "keys": ["<50k", "50-150k", "150-400k", ">400k"]},
+    "concurrency_max": {"type": "int", "min": 0, "max": 1000},
+    "events": {"type": "counts", "keys": ["stall_flag", "stall_interrupt", "stall_abort", "outage_start", "api_error",
+                                          "run_requested", "run_approved", "delivery_dead", "media_stuck", "card_giveup",
+                                          "compact", "compact_failed", "other"]},
+    "model_errors": {"type": "counts", "keys": ["balance", "auth", "rate_limit", "overloaded", "network", "server_5xx",
+                                                "client_4xx", "other"]},
+    "lark_errors": {"type": "counts", "keys": ["230001", "230002", "230011", "230025", "99992361", "rate_limit",
+                                               "network", "api_other", "other"]},
+    "needs_user": {"type": "counts", "keys": ["blocked", "waiting", "ask"]},
+    "grants": {"type": "counts", "keys": ["fs", "local_net", "socket"]},
+    "response_minutes": {"type": "counts", "keys": ["<10", "10-60", "60-240", ">240"]},
+    "delivery": {"type": "counts", "keys": ["sent", "card_patched", "fallback_text", "card_patch_fallback",
+                                            "video_fallback", "dead"]},
+    "media": {"type": "object", "fields": {
+      "image": {"type": "media"},
+      "video": {"type": "media"},
+      "doc": {"type": "media"}
+    }}
+  },
+  "media": {
+    "seconds": ["<5", "5-30", "30-120", ">120"],
+    "size_mb": ["<1", "1-10", "10-100", ">100"]
+  },
+  "max_count": 1000000
+}

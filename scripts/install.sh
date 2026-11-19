@@ -113,3 +113,5 @@ else
 fi
 echo "installed: $SERVICE_FILE"
 echo "workroot: $WORKROOT"
+echo "telemetry: 匿名使用统计默认关闭。想帮忙改进 Larkyard：先 bin/ticket telemetry show 看会发什么，再 bin/ticket telemetry on"
+echo "telemetry: 只发计数和区间，不发任何内容；说明见 docs/telemetry.md，随时 bin/ticket telemetry off 关闭"

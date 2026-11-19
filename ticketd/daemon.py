@@ -9,7 +9,7 @@ import time
 import traceback
 from typing import Optional
 
-from . import card, config, db, metrics, outbox
+from . import card, config, db, metrics, outbox, telemetry
 from .scheduler import Scheduler
 
 ALERT_INTERVAL = 600.0
@@ -292,6 +292,7 @@ def main(argv=None) -> int:
         # 只发已经准备好的行；要上传/导入的行先在媒体通道线程里准备，慢上传不拖住主循环
         _guarded(throttle, "flush", lambda: outbox.flush(con, lane=outbox.LANE_FAST))
         _guarded(throttle, "digest", lambda: metrics.maybe_digest(con))
+        _guarded(throttle, "telemetry", lambda: telemetry.maybe_send(con))  # 默认关闭；开启后每天一份，发送在单独线程
         _beat()
         time.sleep(next_sleep(throttle.streak()))
     media.stop()

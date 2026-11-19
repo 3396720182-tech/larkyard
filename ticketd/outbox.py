@@ -77,6 +77,40 @@ def _reply_gone(info: str) -> bool:
     return err.get("type") == "api" and err.get("code") in REPLY_GONE_CODES
 
 
+def lark_error_code(info: str) -> str:
+    """飞书 / lark-cli 失败归类，只返回写死的枚举值（匿名统计用，绝不带出原文）：
+    已知错误码（PERMANENT_CODES 里的）/ rate_limit / network / api_other / other。"""
+    info = info or ""
+    if "调用 lark-cli 失败" in info or '"type": "network"' in info:
+        return "network"
+    err = _parse_error(info)
+    code = err.get("code")
+    if isinstance(code, int) and code in PERMANENT_CODES:
+        return str(code)
+    blob = " ".join(str(err.get(k) or "") for k in ("type", "subtype", "message")).lower()
+    if "rate" in blob and "limit" in blob or code in (99991400, 11232):
+        return "rate_limit"
+    if err.get("type") == "api":
+        return "api_other"
+    return "other"
+
+
+def _metric(con, ticket_id: str, kind: str, code: str, seconds=None, size=None) -> None:
+    """记一条只带枚举值的指标事件（不带原文）。永不抛异常。"""
+    if con is None:
+        return
+    from . import metrics  # metrics 依赖 templates/db，本模块被 metrics 之外的很多模块先导入
+    metrics.record(con, ticket_id, kind, "", code=code, seconds=seconds, size=size)
+
+
+def _file_size(path: str, workdir: Optional[str]) -> Optional[int]:
+    try:
+        p = path if os.path.isabs(path) or not workdir else os.path.join(workdir, path)
+        return os.stat(p).st_size
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def _target_args(to: str) -> list:
     """om_ 开头：回复那条消息；oc_ 开头（回复目标被撤回后改投）：直接发到会话；ou_ 开头（告警、周报）：私信这个人。"""
     if (to or "").startswith("oc_"):
@@ -199,18 +233,25 @@ def _read_workdir_file(path: str, workdir: Optional[str], limit: int) -> bytes:
     return data
 
 
-def _upload_workdir_image(path: str, workdir: Optional[str], uploader) -> Tuple[str, str]:
-    """上传工单目录里的一张图（私有副本），返回 (image_key, 失败原因)。失败原因可用 _is_transient 判断能不能重试。"""
+def _upload_workdir_image(path: str, workdir: Optional[str], uploader, con=None,
+                          ticket_id: str = "") -> Tuple[str, str]:
+    """上传工单目录里的一张图（私有副本），返回 (image_key, 失败原因)。失败原因可用 _is_transient 判断能不能重试。
+    con 不为空时记一条媒体指标（成功，或不是网络/超时的失败；只记类型、耗时、大小）。"""
+    start, size = _clock(), None
     try:
         data = _read_workdir_image(path, workdir)
+        size = len(data)
         with tempfile.TemporaryDirectory(prefix="ticketd-img-") as d:
             tmp = os.path.join(d, "image" + os.path.splitext(path)[1].lower())
             with open(tmp, "wb") as f:
                 f.write(data)
             ok, info, _ = uploader(tmp)
-        return (info, "") if ok and info else ("", info or "未返回 image_key")
+        key, why = (info, "") if ok and info else ("", info or "未返回 image_key")
     except OSError as e:
-        return "", "文件不能上传：%s" % e
+        key, why = "", "文件不能上传：%s" % e
+    if key or not _is_transient(why):
+        _metric(con, ticket_id, "media", "image:ok" if key else "image:fail", _clock() - start, size)
+    return key, why
 
 
 def resolve_card_videos(card: dict, workdir: Optional[str], ticket_id: str, drive_uploader=None,
@@ -273,7 +314,11 @@ def _resolve_videos(card, workdir, ticket_id, drive_uploader=None, uploader=None
             if err:
                 out.append(el)
                 continue
+            start = _clock()
             ok, info = drive_uploader(video, workdir, ticket_id)
+            if ok or not _is_transient(info):
+                _metric(con, ticket_id, "media", "video:ok" if ok else "video:fail", _clock() - start,
+                        _file_size(video, workdir))
             if ok:
                 url = info
                 # 上传前后各算一次哈希，一致才缓存：上传途中文件被改写时不把旧哈希记到新内容的链接上
@@ -290,6 +335,7 @@ def _resolve_videos(card, workdir, ticket_id, drive_uploader=None, uploader=None
                 continue
             else:
                 alert("视频没能传到云空间，改为卡片后另发视频消息（%s）：%s" % (video, info))
+                _metric(con, ticket_id, "delivery", "video_fallback")
                 url = None
         cover = find_cover(video, workdir)
         key = ""
@@ -298,7 +344,7 @@ def _resolve_videos(card, workdir, ticket_id, drive_uploader=None, uploader=None
             if err:
                 out.append(dict(el, **({templates.VIDEO_URL_KEY: url} if url else {})))
                 continue
-            key, why = _upload_workdir_image(cover, workdir, uploader)
+            key, why = _upload_workdir_image(cover, workdir, uploader, con=con, ticket_id=ticket_id)
             if not key and _is_transient(why) and not degrade:
                 err = why
                 out.append(dict(el, **({templates.VIDEO_URL_KEY: url} if url else {})))  # 链接留着，下次只补封面
@@ -319,7 +365,7 @@ def resolve_card_images(card: dict, workdir: Optional[str], uploader=None) -> di
     return _resolve_images(card, workdir, uploader, degrade=True)[0]
 
 
-def _resolve_images(card, workdir, uploader=None, degrade=True, deadline=None):
+def _resolve_images(card, workdir, uploader=None, degrade=True, deadline=None, con=None, ticket_id: str = ""):
     """返回 (新卡片, 瞬时失败信息或 "")。上传的是读进来的字节的私有副本，不把 worker 可控的路径交给 lark-cli。
     degrade=False 时第一张遇到网络/超时就停：这张和后面没传的都保留占位，已经成功的换好 img_key。
     deadline（_clock 时间）之后不再开始新的上传（不论 degrade），没传的保留占位。"""
@@ -338,7 +384,7 @@ def _resolve_images(card, workdir, uploader=None, degrade=True, deadline=None):
                     out.append(el)
                     continue
                 path = el[templates.UPLOAD_KEY]
-                key, why = _upload_workdir_image(path, workdir, uploader)
+                key, why = _upload_workdir_image(path, workdir, uploader, con=con, ticket_id=ticket_id)
                 if key:
                     el = {k: v for k, v in el.items() if k != templates.UPLOAD_KEY}
                     el["img_key"] = key
@@ -548,17 +594,24 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None,
     if media and r["attempts"] >= VIDEO_MAX_ATTEMPTS and db.now() - r["created_at"] >= MEDIA_DEGRADE_AFTER:
         # 网络/超时反复失败且已等了 10 分钟：每次都要占住媒体通道最多 180 秒、还挡住同单后面的消息，不再硬发，改发文字
         alert("outbox %d（%s）视频连续 %d 次没发出，改发文字：%s" % (r["id"], r["ticket_id"], r["attempts"], r["last_error"]))
+        _metric(con, r["ticket_id"], "delivery", "fallback_text")
         con.execute("UPDATE outbox SET media_json='' WHERE id=?", (r["id"],))
         media = ""
     if media:
         t = con.execute("SELECT workdir FROM tickets WHERE id=?", (r["ticket_id"],)).fetchone()
-        ok, info, permanent = video_sender(r["reply_to"], json.loads(media)["video"], t["workdir"] if t else None, idem)
+        video, wd = json.loads(media)["video"], t["workdir"] if t else None
+        start = _clock()
+        ok, info, permanent = video_sender(r["reply_to"], video, wd, idem)
+        if ok or permanent:
+            _metric(con, r["ticket_id"], "media", "video:ok" if ok else "video:fail", _clock() - start,
+                    _file_size(video, wd))
         if ok or not permanent:
             return ok, info, permanent
         if _reply_gone(info):  # 回复目标没了：不是视频的问题，由 flush 改投到会话后原样重发
             return False, info, False
         # 视频发不出去（文件不合格或飞书永久拒收）：改发文字告诉用户文件在哪
         alert("outbox %d（%s）视频消息发送失败，改发文字：%s" % (r["id"], r["ticket_id"], info))
+        _metric(con, r["ticket_id"], "delivery", "fallback_text")
         con.execute("UPDATE outbox SET media_json='' WHERE id=?", (r["id"],))
         return sender(r["reply_to"], r["text"], idem + "-t")
     if media == "":  # 视频已放弃：兜底文字的每次重试都用同一个幂等键
@@ -578,7 +631,7 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None,
         deadline = _clock() + MEDIA_BUDGET  # 一轮里不在一行上耗太久（媒体通道里还有别的行在等）
         card, leftover, err = _resolve_videos(card, wd, r["ticket_id"], degrade=degrade, con=con, deadline=deadline)
         if not err:
-            card, err = _resolve_images(card, wd, degrade=degrade, deadline=deadline)
+            card, err = _resolve_images(card, wd, degrade=degrade, deadline=deadline, con=con, ticket_id=r["ticket_id"])
         with db.tx(con):
             con.execute("UPDATE outbox SET card_json=? WHERE id=?", (json.dumps(card, ensure_ascii=False), r["id"]))
             for v in leftover:  # 没进卡片的视频：卡片之后另发视频消息（id 更大，排在卡片后面）
@@ -613,6 +666,7 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None,
         if res is not None:
             # 飞书明确拒绝了这次覆盖（业务错误）：不在状态卡上反复重试，改发新消息（再被拒就走下面的文字兜底）
             alert("outbox %d（%s）结果覆盖状态卡被拒，改发新消息：%s" % (r["id"], r["ticket_id"], res[1]))
+            _metric(con, r["ticket_id"], "delivery", "card_patch_fallback")
     ok, info, permanent = card_sender(r["reply_to"], card, idem)
     if ok or not (permanent or _is_api_error(info)):
         return ok, info, permanent
@@ -620,6 +674,7 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None,
         return False, info, False
     # 飞书明确拒收了卡片（任何业务错误，不只是白名单里的码）：马上改发文字兜底，结果不能丢
     alert("outbox %d（%s）结果卡片发送失败，改发文字：%s" % (r["id"], r["ticket_id"], info))
+    _metric(con, r["ticket_id"], "delivery", "fallback_text")
     con.execute("UPDATE outbox SET card_json='', text=? WHERE id=?", (text, r["id"]))
     return sender(r["reply_to"], text, idem + "-t")
 
@@ -934,6 +989,7 @@ def _flush_row(con, r, sender, card_sender, card_patcher, lane) -> bool:
     try:
         ok, info, permanent = _send_row(r, sender, card_sender, con, card_patcher=card_patcher, lane=lane)
         if not ok and _reply_gone(info) and not r["reply_to"].startswith(("oc_", "ou_")):
+            _metric(con, r["ticket_id"], "lark_error", lark_error_code(info))  # 改投后不经过 _settle 的失败分支
             moved = _redirect_to_chat(con, r, info)
             if moved is not None:
                 r = moved
@@ -975,7 +1031,16 @@ def _settle(con, r, ok: bool, info: str, permanent: bool, sender) -> bool:
     if r["report_id"] is not None and (ok or permanent or db.now() - r["created_at"] > 24 * 3600):
         # 结果已送达（或确定送不到）：让状态卡下一轮就收起成终态
         _card_dirty(con, r["ticket_id"])
+    if not ok:
+        _metric(con, r["ticket_id"], "lark_error", lark_error_code(info))
     if ok:
+        if r["report_id"] is not None:  # 只统计结果怎么送到的（状态卡、追问提醒、系统私信不算）
+            try:  # 已经发出去了：指标查询出错不能挡住下面的记账
+                oncard = bool(info) and bool(con.execute(
+                    "SELECT 1 FROM tickets WHERE id=? AND card_message_id=?", (r["ticket_id"], info)).fetchone())
+                _metric(con, r["ticket_id"], "delivery", "card_patched" if oncard else "sent")
+            except Exception:
+                pass
         ping = _ping(con, r, info)
         with db.tx(con):
             con.execute("UPDATE outbox SET status='sent', attempts=?, sent_message_id=?, last_error=NULL"
@@ -988,6 +1053,8 @@ def _settle(con, r, ok: bool, info: str, permanent: bool, sender) -> bool:
         con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
                     (attempts, info, r["id"]))
         alert("outbox %d dead（%s）：%s" % (r["id"], r["ticket_id"], info))
+        if r["report_id"] is not None:
+            _metric(con, r["ticket_id"], "delivery", "dead")
         _notify_dead(con, r, info)
     elif db.now() - r["created_at"] > 24 * 3600:
         media = r["media_json"] if "media_json" in r.keys() else None
@@ -996,6 +1063,9 @@ def _settle(con, r, ok: bool, info: str, permanent: bool, sender) -> bool:
             tok, tinfo, _ = sender(r["reply_to"], r["text"], _idem(r) + "-t")
             if tok:
                 alert("outbox %d（%s）24 小时没发出，已改发文字：%s" % (r["id"], r["ticket_id"], info))
+                _metric(con, r["ticket_id"], "delivery", "fallback_text")
+                if r["report_id"] is not None:
+                    _metric(con, r["ticket_id"], "delivery", "sent")
                 with db.tx(con):
                     con.execute("UPDATE outbox SET status='sent', attempts=?, sent_message_id=?, last_error=?"
                                 " WHERE id=?", (attempts, tinfo, info, r["id"]))
@@ -1005,6 +1075,8 @@ def _settle(con, r, ok: bool, info: str, permanent: bool, sender) -> bool:
         con.execute("UPDATE outbox SET status='dead', attempts=?, last_error=? WHERE id=?",
                     (attempts, info, r["id"]))
         alert("outbox %d dead（%s）：重试 %d 次仍失败：%s" % (r["id"], r["ticket_id"], attempts, info))
+        if r["report_id"] is not None:
+            _metric(con, r["ticket_id"], "delivery", "dead")
         _notify_dead(con, r, info)
     else:
         delay = min(5 * 2 ** (attempts - 1), 300)

@@ -27,13 +27,20 @@ EVENT_LABELS = {
     "card_giveup": "状态卡放弃", "compact": "压缩会话", "compact_failed": "压缩会话失败",
 }
 
+# 只为细分统计记的事件（模型接口错误归类、飞书错误码、投递方式、媒体上传）：数量多，不进 ticket stats 的「事件」一行
+DETAIL_KINDS = ("model_error", "lark_error", "delivery", "media")
+
 
 # ---------- 落库 ----------
-def record(con, ticket_id: str, kind: str, detail: str = "") -> None:
-    """记一条事件。永不抛异常：指标不能挡住正事。"""
+def record(con, ticket_id: str, kind: str, detail: str = "", code: str = "",
+           seconds: Optional[float] = None, size: Optional[int] = None) -> None:
+    """记一条事件。永不抛异常：指标不能挡住正事。
+    code 只放代码里写死的枚举值（错误归类、投递方式、媒体类型），匿名统计只读它；detail 是给人看的原文，不外传。"""
+    if con is None:
+        return
     try:
-        con.execute("INSERT INTO events(ticket_id, kind, detail, created_at) VALUES(?,?,?,?)",
-                    (ticket_id, kind, templates.short(detail, 300), db.now()))
+        con.execute("INSERT INTO events(ticket_id, kind, detail, created_at, code, seconds, size) VALUES(?,?,?,?,?,?,?)",
+                    (ticket_id, kind, templates.short(detail, 300), db.now(), code or "", seconds, size))
     except Exception:
         pass
 
@@ -264,7 +271,7 @@ def stats(con, days: float = 7, now: Optional[float] = None) -> str:
         lines.append("失败 %d 次，最近：%s" % (len(fails), "；".join(
             "%s %s" % (f["ticket_id"], templates.short(f["summary"], 40)) for f in fails[:3])))
     ev = q("SELECT kind, COUNT(*) n FROM events WHERE created_at>=? GROUP BY kind ORDER BY n DESC", since)
-    ev = [e for e in ev if e["kind"] not in ("run_requested", "run_approved")]
+    ev = [e for e in ev if e["kind"] not in ("run_requested", "run_approved") + DETAIL_KINDS]
     if ev:
         lines.append("事件：" + "，".join("%s %d" % (EVENT_LABELS.get(e["kind"], e["kind"]), e["n"]) for e in ev))
     bridge = bridge_costs(since)
@@ -322,11 +329,11 @@ def bridge_costs(since: float) -> List[tuple]:
     return out
 
 
-def _response_minutes(con, since: float) -> List[float]:
+def _response_minutes(con, since: float, until: float = float("inf")) -> List[float]:
     """blocked / waiting 汇报之后，用户多久回应（追问、授权、放开、恢复，或批准沙箱外执行）。"""
     out = []
     for rep in con.execute("SELECT ticket_id, created_at FROM reports WHERE status IN ('blocked','waiting')"
-                           " AND created_at>=?", (since,)).fetchall():
+                           " AND created_at>=? AND created_at<?", (since, until)).fetchall():
         a = con.execute("SELECT MIN(created_at) m FROM inputs WHERE ticket_id=? AND created_at>?"
                         " AND kind IN ('followup','grant','release','fresh')",
                         (rep["ticket_id"], rep["created_at"])).fetchone()["m"]

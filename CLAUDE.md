@@ -13,6 +13,7 @@
 - `workspace/`：bridge 工作区的 `CLAUDE.md` 模板和个人覆盖示例。
 - `docs/spec.md`：设计规格。行为以它为准；改了行为要在对应章节写「调整」，说明改了什么、为什么。
 - `tests/`：`unittest`，用 `tests/fakes/` 里的假 claude 和假 lark-cli，不碰飞书。
+- `server/telemetry/`：匿名统计的后端（Cloudflare Worker + D1，JavaScript），`npm test` 用 Node 自带的 sqlite 跑，不碰 Cloudflare。字段白名单 `ticketd/telemetry_schema.json` 由客户端和后端共用；改字段按 `docs/telemetry.md` 末尾的清单来。
 
 ## 改动流程
 

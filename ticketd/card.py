@@ -68,6 +68,7 @@ def deliver(con, ticket_id: str, result: dict, patch=None, now: Optional[float] 
         # 卡片已经编辑不了（被删、超期等）：以后不再动它，这份结果改发新消息
         con.execute("UPDATE tickets SET card_wanted=0 WHERE id=?", (ticket_id,))
         outbox.alert("结果覆盖状态卡失败，改发新消息（%s）：%s" % (ticket_id, info))
+        outbox._metric(con, ticket_id, "delivery", "card_patch_fallback")
         return None
     return False, info, False
 

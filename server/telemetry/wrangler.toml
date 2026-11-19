@@ -1,0 +1,28 @@
+# Larkyard 匿名统计后端。部署前按 README.md 填 database_id；name 会成为 <name>.<账号子域名>.workers.dev
+name = "larkyard-telemetry"
+main = "src/index.js"
+compatibility_date = "2025-11-01"
+workers_dev = true
+
+# 不保存请求日志：日志里会有 IP 和请求头
+[observability]
+enabled = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "larkyard-telemetry"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# 每天 03:17（UTC）删 365 天前的报告；周一顺带生成公开汇总
+[triggers]
+crons = ["17 3 * * *"]
+
+# 按来源 IP 限流（Cloudflare 边缘计数，不落库）：每个地点每 60 秒最多 10 次
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "47101"
+
+  [ratelimits.simple]
+  limit = 10
+  period = 60
