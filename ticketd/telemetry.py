@@ -510,8 +510,17 @@ _thread: Optional[threading.Thread] = None
 _lock = threading.Lock()
 
 
-def send_pending(target: str, poster=None) -> dict:
-    """把 pending/ 里的报告按日期依次发出。遇到需要重试的失败就停。返回写进 last.json 的结果。线程里调用，不碰数据库。"""
+def _unlink(p: Path) -> None:
+    try:
+        p.unlink()
+    except OSError:
+        pass
+
+
+def send_pending(target: str, poster=None, current=None) -> dict:
+    """把 pending/ 里的报告按日期依次发出。遇到需要重试的失败就停。返回写进 last.json 的结果。
+    current：返回「现在有效的 install_id」的函数（关闭了返回 None）。每发一份前都问一次：
+    报告里的 ID 不是现在的 ID（中途关闭过、或关了又开换了 ID），这份是上一轮授权留下的，删掉不发。"""
     poster = poster or _post
     result = {"at": time.time(), "sent": [], "result": "nothing"}
     for p in sorted(_pending_dir().glob("*.json")):
@@ -522,6 +531,14 @@ def send_pending(target: str, poster=None) -> dict:
             _drop(p, "校验没通过，已丢弃：%s" % e)
             result.update(result="invalid", day=p.stem)
             continue
+        if current is not None:
+            now_id = current()
+            if now_id is None:
+                result.update(result="stopped")  # 已经关闭：turn_off 会删掉待发报告，这里不再发
+                break
+            if rep.get("install_id") != now_id:
+                _unlink(p)
+                continue
         body = json.dumps(rep, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         res, status = poster(target, body)
         result.update(day=p.stem, result=res, http=status)
@@ -573,9 +590,18 @@ def _due_at(con, today: str, now: float) -> float:
     return due
 
 
+def _active_id(con) -> Optional[str]:
+    """现在有效的 install_id；关闭了（或被强制关闭）返回 None。"""
+    return install_id(con) if enabled(con) else None
+
+
 def generate_missing(con, now: float) -> list:
-    """给最近 7 天里开启过、还没生成过的日子生成报告（到昨天为止），写进 pending/。返回生成了哪些天。"""
-    iid = install_id(con)
+    """给最近 7 天里开启过、还没生成过的日子生成报告（到昨天为止），写进 pending/。返回生成了哪些天。
+    生成一份要探 claude/codex 版本（几秒），期间用户可能执行了 off（甚至又 on 换了新 ID）：
+    每份写入前、写入后都核对 ID 还是开始时那个，不是就停，刚写的那份删掉。"""
+    iid = _active_id(con)
+    if iid is None:
+        return []
     since = _kv(con, K_SINCE) or _day(now)
     made = []
     for back in range(KEEP_PENDING_DAYS, 0, -1):
@@ -588,12 +614,19 @@ def generate_missing(con, now: float) -> list:
         if day <= done:
             continue
         rep = build(con, day, iid)
+        if _active_id(con) != iid:
+            break
+        path = _pending_dir() / (day + ".json")
         try:
             validate(rep)
         except Invalid as e:
-            _drop(_pending_dir() / (day + ".json"), "生成后校验没通过，没有发送：%s" % e)
+            _drop(path, "生成后校验没通过，没有发送：%s" % e)
         else:
-            _write_json(_pending_dir() / (day + ".json"), rep)
+            _write_json(path, rep)
+            # 写入和 off 之间还有一个窗口：写完再核对一次。off 在这之后发生的话，它自己会删 pending/
+            if _active_id(con) != iid:
+                _unlink(path)
+                break
             made.append(day)
         _kv_set(con, "telemetry_built", day)
     return made
@@ -626,6 +659,8 @@ def _run_once(con, now: float, poster=None) -> None:
     if not enabled(con):  # 主循环起线程之后用户刚好执行了 off
         return
     generate_missing(con, now)
+    if not enabled(con):  # 生成期间关闭了：不再写 kv，免得关闭后留下 telemetry_* 记录
+        return
     _expire_pending(now)
     if not any(_pending_dir().glob("*.json")):
         _kv_set(con, K_NEXT, str(_day_bounds(today)[1]))  # 今天没有要发的了
@@ -643,8 +678,8 @@ def _run_once(con, now: float, poster=None) -> None:
         return
     _kv_set(con, K_TRIES, "%s|%d" % (today, tries + 1))
     _kv_set(con, K_NEXT, str(now + RETRY_EVERY))
-    send_pending(target, poster)
-    if not any(_pending_dir().glob("*.json")):
+    send_pending(target, poster, current=lambda: _active_id(con))
+    if enabled(con) and not any(_pending_dir().glob("*.json")):
         _kv_set(con, K_NEXT, str(_day_bounds(today)[1]))  # 都发完了，明天再来
 
 
@@ -684,7 +719,8 @@ def maybe_send(con, now: Optional[float] = None, poster=None, wait: bool = False
                     pass
                 if tcon is not None:
                     try:  # 别让同一个错误每轮都起一个线程
-                        _kv_set(tcon, K_NEXT, str(now + RETRY_EVERY))
+                        if enabled(tcon):
+                            _kv_set(tcon, K_NEXT, str(now + RETRY_EVERY))
                     except Exception:
                         pass
             finally:

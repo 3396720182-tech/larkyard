@@ -135,6 +135,7 @@ test("汇总：分布按每个桶的贡献机器数做小样本保护", () => {
     if (i === 0) {
       over.ctx_tokens = { "50-150k": 7, ">400k": 1 };
       over.round_outcomes = { ready: 5, failed: 1 };
+      over.rounds = 6; // 客户端里 rounds 总是等于 round_outcomes 之和
       over.media = { video: { fail: 1, seconds: { ">120": 1 }, size_mb: { ">100": 1 } } };
       over.tickets_by_executor = { codex: 1 };
     }
@@ -147,13 +148,28 @@ test("汇总：分布按每个桶的贡献机器数做小样本保护", () => {
   const s = summarize(rows, "2026-11-12", "2026-11-18", "t");
   const dump = JSON.stringify(s);
   assert.equal(s.totals.ctx_tokens[">400k"], undefined);
-  assert.equal(s.totals.ctx_tokens.other, undefined); // 并进 other 后 other 也只有 1 台，不列
-  assert.equal(s.totals.ctx_tokens["50-150k"], 7 * MIN_MACHINES);
+  // other 只有 1 台不能单独公开，也不能删掉（删掉就能用总量减出来）：把机器最少的 150-400k 一起并进 other
+  assert.deepEqual(s.totals.ctx_tokens, { "50-150k": 7 * MIN_MACHINES, other: 2 * (MIN_MACHINES - 1) + 1 });
   assert.equal(s.totals.round_outcomes.failed, undefined);
   assert.equal(s.totals.media.video, undefined);
   assert.equal(s.totals.tickets_by_executor.codex, undefined);
   assert.ok(!dump.includes(">400k"));
   assert.ok(!dump.includes(">120"));
+  // 外部复查的第二个场景：rounds 和 round_outcomes 同时公开时，不能相减算出被隐藏的轮次
+  const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
+  assert.equal(sum(s.totals.round_outcomes), s.totals.rounds);
+  assert.equal(sum(few.totals.round_outcomes), few.totals.rounds);
+  // 每个公开的分布都加得回原始总量（没有被删掉的桶可减）
+  const raw = {};
+  for (const r of rows) {
+    for (const [k, v] of Object.entries(JSON.parse(r.body))) {
+      if (v && typeof v === "object" && k !== "config" && k !== "media") raw[k] = (raw[k] || 0) + sum(v);
+    }
+  }
+  for (const [k, v] of Object.entries(s.totals)) {
+    if (k !== "media" && typeof v === "object") assert.equal(sum(v), raw[k], k);
+  }
+  for (const [k, v] of Object.entries(s.machines_by)) assert.equal(sum(v), MIN_MACHINES, k);
   // 同一个桶有 5 台机器贡献就公开
   for (let i = 1; i < 5; i++) {
     const r = JSON.parse(rows[i].body);

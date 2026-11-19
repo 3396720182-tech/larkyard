@@ -58,8 +58,11 @@ export async function handleReport(request, env, now = Date.now()) {
 
 // ---------- 汇总 ----------
 // 小样本保护（docs/telemetry.md「公开汇总」）：
-// - 每个分布的每个桶都按「有多少台机器贡献过」判断，少于 MIN_BUCKET 台的并进 other；other 自己还不够就不列。
+// - 每个分布的每个桶都按「有多少台机器贡献过」判断，少于 MIN_BUCKET 台的并进 other。
 //   版本、系统这类头部字段一台机器只算一次，计数类字段（轮次结果、上下文桶、媒体耗时……）按贡献机器数判断。
+// - 补充合并：other 自己不到 MIN_BUCKET 台时，不把它删掉（删掉的话，公开的总量减去其余各桶就能算出它），
+//   而是再把机器最少的桶并进来，直到 other 够 MIN_BUCKET 台。这样公开的每个分布都加得回原来的总量，
+//   用总量或兄弟分布相减只能得到 other，而 other 至少有 MIN_BUCKET 台机器。整个分布都凑不够就整个不列。
 // - 活跃机器少于 MIN_MACHINES 台：只公开 TOTALS_ONLY 里的总量（分布照样做桶级保护），不公开头部字段。
 // - 活跃机器少于 MIN_BUCKET 台：连总量也不公开，只给机器数和报告数。
 const HEADER_ENUMS = ["version", "os", "arch", "python", "claude_code", "codex"];
@@ -73,23 +76,37 @@ function addBucket(dist, key, n, iid) {
 }
 
 function mergeSmall(dist) {
-  // dist：桶 → { n, machines }。返回 桶 → n，贡献机器少于 MIN_BUCKET 台的桶并进 other
-  const kept = {};
+  // dist：桶 → { n, machines }。返回 桶 → n：贡献机器少于 MIN_BUCKET 台的桶并进 other，
+  // other 不够 MIN_BUCKET 台就继续把机器最少的桶并进去（补充合并）；凑不够就返回 {}。结果总是加得回原总量。
+  const kept = new Map();
   let other = null;
+  const absorb = (b) => {
+    other = other || { n: 0, machines: new Set() };
+    other.n += b.n;
+    for (const m of b.machines) other.machines.add(m);
+  };
   for (const [k, b] of Object.entries(dist)) {
-    if (b.machines.size >= MIN_BUCKET && k !== "other") kept[k] = b.n;
-    else {
-      other = other || { n: 0, machines: new Set() };
-      other.n += b.n;
-      for (const m of b.machines) other.machines.add(m);
-    }
+    if (b.machines.size >= MIN_BUCKET && k !== "other") kept.set(k, b);
+    else absorb(b);
   }
-  if (other && other.machines.size >= MIN_BUCKET) kept.other = other.n;
-  return kept;
+  if (other && other.machines.size < MIN_BUCKET) {
+    const order = [...kept.entries()].sort((a, b) => a[1].machines.size - b[1].machines.size || a[1].n - b[1].n
+      || (a[0] < b[0] ? -1 : 1));
+    for (const [k, b] of order) {
+      kept.delete(k);
+      absorb(b);
+      if (other.machines.size >= MIN_BUCKET) break;
+    }
+    if (other.machines.size < MIN_BUCKET) return {};
+  }
+  const out = Object.fromEntries([...kept.entries()].map(([k, b]) => [k, b.n]));
+  if (other) out.other = other.n;
+  return out;
 }
 
 function sumSmall(machinesWithAny, n) {
-  // 总量也按贡献机器数判断：只有不到 MIN_BUCKET 台机器有过这类数据时不公开
+  // 总量也按贡献机器数判断：只有不到 MIN_BUCKET 台机器有过这类数据时不公开。
+  // 分布都是补充合并过的（加得回总量），所以公开总量不会让被并掉的桶露出来
   return machinesWithAny.size >= MIN_BUCKET ? n : undefined;
 }
 
@@ -146,8 +163,7 @@ export function summarize(rows, fromDay, toDay, generatedAt) {
   }
   const mediaOut = {};
   for (const [kind, t] of Object.entries(media)) {
-    const o = { ...mergeSmall(t.result) };
-    delete o.other; // ok/fail 只有两个桶，并进 other 没有意义
+    const o = { ...mergeSmall(t.result) }; // ok / fail 有一边不够 5 台时两边合成 other，只剩总次数
     for (const mk of ["seconds", "size_mb"]) {
       const m = mergeSmall(t[mk]);
       if (Object.keys(m).length) o[mk] = m;

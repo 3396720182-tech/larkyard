@@ -318,6 +318,59 @@ class SendTest(TelemetryTestCase):
         rep = json.loads((self.tm._pending_dir() / "2026-11-18.json").read_text())
         self.assertEqual(rep["claude_code"], "2.1")
 
+    def _off_during_probe(self, then_on: bool):
+        """外部复查复现的竞态：后台线程停在版本探测时用户执行 off（可能接着 on），放行后不能写回 / 发出旧报告。"""
+        from ticketd import db
+        old_id = self.tm.install_id(self.con)
+        real = self.tm._tool_version
+        fired = []
+
+        def probe(binary):
+            if not fired:
+                fired.append(1)
+                other = db.connect()  # 用户在另一个进程里执行 ticket telemetry off / on
+                self.tm.turn_off(other)
+                if then_on:
+                    self.tm.turn_on(other, now=ts("2026-11-19", 1))
+                other.close()
+            return real(binary)
+
+        self.tm._tool_version = probe
+        try:
+            self.tm._kv_set(self.con, self.tm.K_DUE, "2026-11-19|0")
+            self.assertTrue(self.send(ts("2026-11-19", 1)))
+        finally:
+            self.tm._tool_version = real
+        self.assertTrue(fired)
+        left = list(self.tm._pending_dir().glob("*.json")) if self.tm._pending_dir().exists() else []
+        self.assertEqual(left, [])
+        self.assertNotIn(old_id, json.dumps(self.calls))
+        return old_id
+
+    def test_off_during_generation_writes_nothing(self):
+        self._off_during_probe(then_on=False)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM kv WHERE key LIKE 'telemetry%'").fetchone()[0], 0)
+
+    def test_off_then_on_during_generation_does_not_leak_old_id(self):
+        old_id = self._off_during_probe(then_on=True)
+        self.assertNotEqual(self.tm.install_id(self.con), old_id)
+        # 新一轮从 11-20 起算：之后照常发，也不会带出旧 ID
+        self.tm._kv_set(self.con, self.tm.K_DUE, "2026-11-22|0")
+        self.send(ts("2026-11-22", 1))
+        self.assertEqual({c[1]["install_id"] for c in self.calls}, {self.tm.install_id(self.con)})
+        self.assertNotIn(old_id, json.dumps(self.calls))
+
+    def test_pending_with_stale_id_is_not_sent(self):
+        """pending/ 里已经有上一轮授权生成的报告（比如关闭时删除失败）：重新开启后不发。"""
+        stale = self.tm.build(self.con, "2026-11-18", "11111111-1111-4111-8111-111111111111")
+        self.tm._pending_dir().mkdir(parents=True)
+        (self.tm._pending_dir() / "2026-11-18.json").write_text(json.dumps(stale))
+        self.tm._kv_set(self.con, self.tm.K_DUE, "2026-11-19|0")
+        self.send(ts("2026-11-19", 1))
+        self.assertNotIn("11111111-1111-4111-8111-111111111111", json.dumps(self.calls))
+        self.assertFalse((self.tm._pending_dir() / "2026-11-18.json").exists())
+
     def test_jitter_is_within_six_hours_and_stable(self):
         self.con.execute("DELETE FROM kv WHERE key=?", (self.tm.K_DUE,))
         now = ts("2026-11-19", 0.5)
