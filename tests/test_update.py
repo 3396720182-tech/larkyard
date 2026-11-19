@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import tempfile
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -257,7 +259,7 @@ class CheckTest(UpdateBase):
                 results.append("ok")
             except ValueError:
                 results.append("bad")
-        with mock.patch.object(update.urllib.request, "urlopen", opener):
+        with mock.patch.object(update, "_open", opener):
             ts = [threading.Thread(target=go, args=(d,)) for d in (0, 0.02)]
             [t.start() for t in ts]
             [t.join() for t in ts]
@@ -416,12 +418,38 @@ class CheckTest(UpdateBase):
     def test_https_404_is_absent(self):
         import urllib.error
         err = urllib.error.HTTPError("https://x/y", 404, "nf", {}, None)
-        with mock.patch.object(update.urllib.request, "urlopen", side_effect=err):
+        with mock.patch.object(update, "_open", side_effect=err):
             self.assertIsNone(update.fetch("https://x/y"))
         err = urllib.error.HTTPError("https://x/y", 503, "busy", {}, None)
-        with mock.patch.object(update.urllib.request, "urlopen", side_effect=err):
+        with mock.patch.object(update, "_open", side_effect=err):
             with self.assertRaises(update.FetchError):
                 update.fetch("https://x/y")
+
+    def test_redirect_only_to_https(self):
+        h = update._HttpsOnlyRedirect()
+        import urllib.request as ur
+        req = ur.Request("https://x/y")
+        for bad in ("http://x/y", "ftp://x/y", "file:///etc/passwd"):
+            with self.assertRaises(urllib.error.URLError):
+                h.redirect_request(req, None, 302, "Found", {}, bad)
+        self.assertIsNotNone(h.redirect_request(req, None, 302, "Found", {}, "https://z/y"))
+
+    def test_fifo_source_is_refused(self):
+        fifo = self.tmp / "fifo"
+        os.mkfifo(str(fifo))
+        with self.assertRaises(update.FetchError):
+            update.fetch(fifo.as_uri())
+
+    def test_manifest_with_nan_or_bad_signed_at_or_newline_version(self):
+        for extra in ({"notes": float("nan")},):
+            with self.assertRaises(ValueError):
+                update._load(json.dumps(extra).encode(), ("release",))
+        self.assertFalse(updsig.VERSION_RE.fullmatch("0.3.0\n"))
+        with self.assertRaises(ValueError):
+            updsig.version_tuple("0.3.0\n")
+        doc = {"format": updsig.FORMAT, "product": updsig.PRODUCT, "kind": "release", "seq": 1, "signed_at": "x"}
+        with self.assertRaises(ValueError):
+            update._load(updsig.canonical(doc), ("release",))
 
     def test_jitter_range(self):
         import random
@@ -503,6 +531,28 @@ class RekeyTest(UpdateBase):
         self.assertIn("已下载", update.check(self.con, version="0.3.0"))
 
 
+class InterruptedRekeyTest(UpdateBase):
+    def test_finished_even_if_rekey_json_is_gone(self):
+        """换钥写了新主公钥就退出、之后更新源撤下了 rekey.json：下次检查照样补完，中间不安装旧主公钥验过的待装包。"""
+        self.trust()
+        self.src.manifest("0.3.1", seq=10 ** 9)
+        update.check(self.con, version="0.3.0")
+        self.src.rekey(200, self.k.main2, self.k.backup)
+        (self.src.root / "channels" / "stable" / "manifest.json").unlink()
+        with mock.patch.object(update, "_finish_rekey", side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                update.check(self.con, version="0.3.0")
+        self.assertIsNone(update.kv_json(self.con, "update.pending"))  # 写公钥之前就丢了
+        (self.src.root / "rekey.json").unlink()
+        up = update.Updater(self.con)
+        update.kv_put(self.con, "update.pending", {"version": "0.3.1", "package": "p", "sha256": "x", "seq": 1})
+        self.assertFalse(up._maybe_install(None, None, time.time()))  # 换钥没补完不装
+        update.check(self.con, version="0.3.0")
+        self.assertEqual(update.max_seq(self.con), 200)
+        self.assertIsNone(metrics.kv_get(self.con, "update.rekey_inflight"))
+        self.assertIsNone(update.kv_json(self.con, "update.pending"))
+
+
 class PauseTest(UpdateBase):
     def setUp(self):
         super().setUp()
@@ -517,6 +567,25 @@ class PauseTest(UpdateBase):
         self.assertIn("更新源已暂停", "\n".join(update.status_lines(self.con, now)))
         up = update.Updater(self.con)
         self.assertFalse(up._maybe_install(None, None, now))
+
+    def test_overlong_pause_is_invalid(self):
+        """泄露的主私钥签一份到 2099 年的暂停标记：客户端只认最长 7 天的窗口。"""
+        now = time.time()
+        self.src.pause(3, now - 3600, now + 80 * 365 * 86400)
+        update.check(self.con, version="0.3.0", now=now)
+        self.assertIsNone(update.pause_until(self.con, now))
+        self.assertIn("pause_invalid", self.codes())
+
+    def test_rekey_clears_pause_from_old_key(self):
+        now = time.time()
+        self.src.pause(3, now - 3600, now + 86400)
+        update.check(self.con, version="0.3.0", now=now)
+        self.assertIsNotNone(update.pause_until(self.con, now))
+        (self.src.root / "pause.json").write_text("{}")  # 更新源上的暂停标记换成了验不过的
+        self.src.rekey(100, self.k.main2, self.k.backup)
+        with mock.patch.object(update, "_check_pause"):  # 假装 pause.json 一直取不到
+            update.check(self.con, version="0.3.0", now=now)
+        self.assertIsNone(update.pause_until(self.con, now))
 
     def test_expired_pause_is_ignored(self):
         now = time.time()

@@ -63,7 +63,7 @@ def _git(repo: Path, *args, binary=False) -> "str | bytes":
 # ---------- 打包 ----------
 def tag_version(repo: Path, tag: str) -> tuple:
     """返回 (版本号, 提交号, 提交时间)。tag 不存在、__version__ 和 tag 不一致都拒绝。"""
-    if not re.match(r"^v\d+(\.\d+){1,3}$", tag):
+    if not re.fullmatch(r"v\d+(\.\d+){1,3}", tag):
         raise ReleaseError("tag 要写成 v<版本号>，如 v0.3.0")
     try:
         commit = _git(repo, "rev-parse", "--verify", "%s^{commit}" % tag).strip()

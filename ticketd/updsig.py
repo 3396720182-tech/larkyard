@@ -20,7 +20,7 @@ PRODUCT = "larkyard"
 FORMAT = 1
 CHANNELS = ("canary", "early", "stable")
 KINDS = ("release", "rollback", "rekey", "pause")
-VERSION_RE = re.compile(r"^\d+(\.\d+){1,3}$")
+VERSION_RE = re.compile(r"\d+(\.\d+){1,3}")  # 用 fullmatch：$ 会放过结尾的换行
 ED25519_TYPES = ("ssh-ed25519", "sk-ssh-ed25519@openssh.com")  # check-private: ignore（密钥类型名，不是邮箱）
 FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
 
@@ -52,7 +52,7 @@ def parse_iso(s) -> float:
 
 
 def version_tuple(v) -> tuple:
-    if not isinstance(v, str) or not VERSION_RE.match(v):
+    if not isinstance(v, str) or not VERSION_RE.fullmatch(v):
         raise ValueError("版本号格式不对：%r" % (v,))
     return tuple(int(x) for x in v.split("."))
 
@@ -65,6 +65,10 @@ def cmp_version(a: str, b: str) -> int:
 
 
 def ssh_keygen() -> str:
+    # 系统自带的优先：不按 PATH 找，免得 PATH 前面的目录里放一个假的 ssh-keygen 就能「验过」
+    for p in ("/usr/bin/ssh-keygen", "/bin/ssh-keygen"):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
     return shutil.which("ssh-keygen") or "/usr/bin/ssh-keygen"
 
 

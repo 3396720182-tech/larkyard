@@ -619,6 +619,9 @@ class AdoptTest(TicketdTestCase):
         sf = mock.patch.object(update, "service_file", lambda label: self.tmp / ("%s.plist" % label))
         sf.start()
         self.addCleanup(sf.stop)
+        import plistlib
+        (self.tmp / "dev.larkyard.ticketd.plist").write_bytes(plistlib.dumps(
+            {"Label": "dev.larkyard.ticketd", "EnvironmentVariables": {"TICKETD_HOME": os.environ["TICKETD_HOME"]}}))
 
     def fake_install(self, root, app, svc=None):
         self.installs.append((Path(root), app))
@@ -660,6 +663,55 @@ class AdoptTest(TicketdTestCase):
         self.assertEqual(update.read_state()["status"], "unadopted")
         with self.assertRaises(update.UpdateError):
             update.undo_adopt(run_install=self.fake_install)
+
+    def test_adopt_takes_head_not_skip_worktree_edits(self):
+        """标了 skip-worktree 的文件改过：git status 看不出来，但收进版本目录的仍是 HEAD 里的内容。"""
+        from ticketd import __version__
+        subprocess.run(["git", "-C", str(self.clone), "update-index", "--skip-worktree", "bin/ticket"], check=True)
+        (self.clone / "bin" / "ticket").write_text("EVIL")
+        update.adopt(str(self.ws), repo=self.clone, run_install=self.fake_install)
+        got = (update.versions_dir() / __version__ / "bin" / "ticket").read_bytes()
+        self.assertEqual(got, (REPO / "bin" / "ticket").read_bytes())
+        self.assertTrue(os.access(str(update.versions_dir() / __version__ / "bin" / "ticket"), os.X_OK))
+
+    def test_git_config_commands_not_run(self):
+        marker = self.tmp / "pwned"
+        subprocess.run(["git", "-C", str(self.clone), "config", "core.fsmonitor", "touch %s; false" % marker],
+                       check=True)
+        update.adopt(str(self.ws), repo=self.clone, run_install=self.fake_install)
+        self.assertFalse(marker.exists())
+
+    def test_symlinked_clone_path_is_rewritten_and_restored(self):
+        """CLAUDE.md 里写的是经过符号链接的路径（setup-workspace.sh 用 pwd）：同样改写，--undo 改回原样。"""
+        link = self.tmp / "via-link"
+        link.symlink_to(self.clone)
+        tmpl = (REPO / "workspace" / "CLAUDE.md.tmpl").read_text(encoding="utf-8")
+        original = tmpl.replace("@LARKYARD@", str(link)) + "\n手写的一段\n"
+        (self.ws / "CLAUDE.md").write_text(original, encoding="utf-8")
+        update.adopt(str(self.ws), repo=self.clone, run_install=self.fake_install)
+        text = (self.ws / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertNotIn("%s/bin/ticket" % link, text)
+        self.assertIn("%s/bin/ticket" % update.current_link(), text)
+        update.undo_adopt(run_install=self.fake_install)
+        self.assertEqual((self.ws / "CLAUDE.md").read_text(encoding="utf-8"), original)
+
+    def test_rewrite_only_whole_ticket_path(self):
+        md = self.tmp / "x.md"
+        md.write_text("a /r/bin/ticket b /r/bin/ticketd c /r/bin/ticket-x d `/r/bin/ticket`\n")
+        update._rewrite(md, "/r/bin/ticket", "/c/bin/ticket")
+        self.assertEqual(md.read_text(), "a /c/bin/ticket b /r/bin/ticketd c /r/bin/ticket-x d `/c/bin/ticket`\n")
+
+    def test_install_env_ignores_shell_service_vars(self):
+        seen = {}
+
+        def fake_run(cmd, env=None, **kw):
+            seen.update(env)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        os.environ["TICKETD_PYTHON"] = "/shell/python"
+        with mock.patch.object(update.subprocess, "run", fake_run):
+            update._install_sh(self.clone, None, {"label": "l", "env": {"TICKETD_HOME": "/h"}})
+        self.assertNotIn("TICKETD_PYTHON", seen)
+        self.assertEqual(seen["TICKETD_HOME"], "/h")
 
     def test_adopt_refuses_dirty_clone(self):
         (self.clone / "bin" / "ticket").write_text("changed")
@@ -761,12 +813,13 @@ class ServiceFileTest(TicketdTestCase):
         with mock.patch.object(host, "system", return_value="linux"):
             self.assertEqual(update.service_file("l.b"), Path("/cfg/systemd/user/l.b.service"))
 
-    def test_capture_service_without_service_file(self):
+    def test_capture_service_refuses_missing_service_file(self):
+        """当初用自定义服务名装的、这次 shell 里没设 TICKETD_LABEL：不另装一个默认名的服务。"""
         os.environ["TICKETD_LABEL"] = "dev.larkyard.ticketd.none-%d" % os.getpid()
-        os.environ["LARK_CHANNEL_PROFILE"] = "p"
-        label, env = update.capture_service()
-        self.assertEqual(label, os.environ["TICKETD_LABEL"])
-        self.assertEqual((env["TICKETD_HOME"], env["LARK_CHANNEL_PROFILE"]), (os.environ["TICKETD_HOME"], "p"))
+        with mock.patch.object(update, "service_file", lambda label: self.tmp / ("%s.plist" % label)):
+            with self.assertRaises(update.UpdateError) as cm:
+                update.capture_service()
+        self.assertIn("TICKETD_LABEL", str(cm.exception))
 
 
 class DoctorWorkspaceTest(TicketdTestCase):

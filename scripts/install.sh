@@ -76,6 +76,10 @@ render() {
     cat
   fi
 }
+if [ -n "$APP" ] && ! render | grep -q "$APP/launcher.py"; then
+  # 模板改过、替换没生效时，服务会绕过启动器直接跑版本目录，自动切回就失效了：宁可不装
+  echo "install: 受管模式没能把入口换成 $APP/launcher.py（服务模板和 install.sh 不匹配）" >&2; exit 1
+fi
 if [ "${1:-}" = "--print" ]; then render; exit 0; fi
 "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null \
   || { echo "install: 需要 Python 3.9+（当前：$PY）；用 TICKETD_PYTHON 指定解释器" >&2; exit 1; }

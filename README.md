@@ -228,7 +228,7 @@ bin/ticket update trust --main main.pub --fingerprint SHA256:... --backup backup
 # 2. 转成受管安装：版本放在 ~/.ticketd/app/versions/<版本>/，服务改为经版本目录外的启动器运行 ~/.ticketd/app/current，
 #    bridge 工作区 CLAUDE.md 里的 ticket 路径一并改为 ~/.ticketd/app/current/bin/ticket（改前备份）
 #    服务名和环境（TICKETD_LABEL、TICKETD_HOME、bridge 的 LARK_CHANNEL_HOME / LARK_CHANNEL_PROFILE）从现有的 plist / unit 读，
-#    --undo 和中途失败时的恢复都按它原样重装；自定义过服务名的，执行时带上同样的 TICKETD_LABEL
+#    --undo 和中途失败时的恢复都按它原样重装；自定义过服务名的，执行时带上同样的 TICKETD_LABEL（找不到这个服务就拒绝）
 bin/ticket update adopt
 # 3. 在 ~/.ticketd/config.env 里写更新源
 TICKETD_UPDATE_URL=https://updates.example.com/larkyard

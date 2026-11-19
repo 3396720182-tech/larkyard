@@ -46,6 +46,7 @@ PACKAGE_LIMIT = 200 * 1024 * 1024
 FETCH_TIMEOUT = 30.0
 DOWNLOAD_TIMEOUT = 600.0
 KEEP_VERSIONS = 3
+PAUSE_MAX = 7 * 86400 + 3600  # 一份暂停标记最长 7 天（发版工具按 7 天窗口签；留一小时余量）
 CONFIRM_AFTER = 60.0       # 新版本守护进程转满这么久（且不超过试用期的 1/3）算自检通过
 EXIT_RESTART = 75          # 切换版本后守护进程用这个退出码退出，由服务管理器重新拉起
 EVENT_DEDUPE = 86400.0     # 同一种、同一原因的更新事件一天只记一条（每小时检查一次，不刷屏）
@@ -131,7 +132,7 @@ def mark_clean_exit() -> None:
         pass
 
 
-CARRY = ("adopted_from", "label", "workspace_md", "service_env")  # 受管安装的来历：每次重写状态都要带上（--undo 要用）
+CARRY = ("adopted_from", "label", "workspace_md", "workspace_root", "service_env")  # 受管安装的来历：每次重写状态都要带上（--undo 要用）
 
 
 def carried(before: dict) -> dict:
@@ -226,13 +227,34 @@ class FetchError(Exception):
     pass
 
 
+class _HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """只跟随到 https 的重定向：不降级到 http / ftp，也不被引到别的协议。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlparse(newurl).scheme != "https":
+            raise urllib.error.URLError("拒绝重定向到 %s" % urllib.parse.urlparse(newurl).scheme)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_HttpsOnlyRedirect)
+
+
+def _open(url: str, timeout: float):
+    if urllib.parse.urlparse(url).scheme == "file":
+        p = urllib.request.url2pathname(urllib.parse.urlparse(url).path)
+        if os.path.exists(p) and not os.path.isfile(p):  # FIFO、设备文件读起来可能永远阻塞
+            raise urllib.error.URLError("不是普通文件：%s" % p)
+        return urllib.request.urlopen(url, timeout=timeout)
+    return _opener.open(url, timeout=timeout)
+
+
 def fetch(url: str, limit: int = MANIFEST_LIMIT, timeout: float = FETCH_TIMEOUT) -> Optional[bytes]:
     """file:// 或 https://。文件不存在 / 404 返回 None；其他失败抛 FetchError。"""
     scheme = urllib.parse.urlparse(url).scheme
     if scheme not in ("file", "https"):
         raise FetchError("不支持的地址：%s" % scheme)
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with _open(url, timeout) as r:
             data = r.read(limit + 1)
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -257,13 +279,16 @@ def download(url: str, dest: Path, size: int, sha256: str, timeout: float = DOWN
     h, n = hashlib.sha256(), 0
     try:
         try:
-            r = urllib.request.urlopen(url, timeout=timeout)
+            r = _open(url, timeout)
         except urllib.error.HTTPError as e:
             raise FetchError("下载包 HTTP %d" % e.code)
         except urllib.error.URLError as e:
             raise FetchError("下载包失败：%s" % str(e.reason)[:200])
+        started = time.monotonic()
         with r, open(str(part), "wb") as f:
             while True:
+                if time.monotonic() - started > timeout:  # 单次读的超时挡不住「每 29 秒滴一个字节」
+                    raise FetchError("下载包超过 %d 秒" % timeout)
                 chunk = r.read(1 << 16)
                 if not chunk:
                     break
@@ -297,7 +322,7 @@ def file_sha256(path: Path) -> str:
 def _load(data: bytes, kinds: tuple) -> dict:
     """签名已验过的清单：必须是确定性序列化的 JSON 对象、格式版本和产品名对得上。"""
     try:
-        obj = json.loads(data.decode("utf-8"))
+        obj = json.loads(data.decode("utf-8"), parse_constant=_no_constant)
     except (UnicodeDecodeError, ValueError):
         raise ValueError("不是 JSON")
     if not isinstance(obj, dict) or updsig.canonical(obj) != data:
@@ -308,7 +333,12 @@ def _load(data: bytes, kinds: tuple) -> dict:
         raise ValueError("类型不对：%r" % (obj.get("kind"),))
     if not isinstance(obj.get("seq"), int) or isinstance(obj.get("seq"), bool) or obj["seq"] <= 0:
         raise ValueError("序号不对")
+    updsig.parse_iso(obj.get("signed_at"))  # 格式不对抛 ValueError
     return obj
+
+
+def _no_constant(name):
+    raise ValueError("不接受 %s" % name)
 
 
 def _drop_pending(con) -> None:
@@ -321,7 +351,21 @@ def _drop_pending(con) -> None:
             pass
 
 
+def _resume_rekey(con) -> None:
+    """换钥写了新主公钥、还没重置序号就退出了：不依赖更新源上的 rekey.json 还在，直接补完。"""
+    seq = metrics.kv_get(con, "update.rekey_inflight")
+    if not seq:
+        return
+    try:
+        _finish_rekey(con, int(seq))
+    except ValueError:
+        kv_del(con, "update.rekey_inflight")
+        return
+    event(con, "rekey", "补完上次中断的换钥（序号 %s）" % seq, dedupe=False)
+
+
 def _check_rekey(con, base: str, now: float) -> Optional[str]:
+    _resume_rekey(con)
     data = fetch(base + "/rekey.json")
     if data is None:
         return None
@@ -356,6 +400,7 @@ def _check_rekey(con, base: str, now: float) -> Optional[str]:
         event(con, "rekey_invalid", "换钥清单要把主公钥换成备份公钥，已忽略")
         return "rekey_invalid"
     metrics.kv_set(con, "update.rekey_inflight", str(obj["seq"]))  # 先记下「正在换」，崩溃后下次检查补完
+    _drop_pending(con)  # 先丢：待装的包是旧主公钥验过的，可能来自泄露的私钥
     updsig.write_signers(main_signers(), updsig.MAIN_PRINCIPAL, key)
     _finish_rekey(con, obj["seq"])
     event(con, "rekey", "主公钥已换成 %s（序号 %d）" % (updsig.fingerprint(key), obj["seq"]), dedupe=False)
@@ -369,6 +414,7 @@ def _finish_rekey(con, seq: int) -> None:
         # 主私钥泄露期间攻击者签的清单可能把 max_seq 推得很大，不重置的话发布者之后的清单都会被当成旧清单
         metrics.kv_set(con, "update.max_seq", str(seq))
         kv_del(con, "update.accepted")
+        kv_del(con, "update.pause")  # 泄露的旧主私钥可能签了一份很长的暂停标记
         kv_del(con, "update.rekey_inflight")
     _drop_pending(con)  # 待装的包是旧主公钥验过的，可能来自泄露的私钥
 
@@ -384,6 +430,8 @@ def _check_pause(con, base: str, now: float) -> None:
             raise ValueError("签名验不过")
         obj = _load(data, ("pause",))
         nb, na = updsig.parse_iso(obj.get("not_before")), updsig.parse_iso(obj.get("not_after"))
+        if not nb < na or na - nb > PAUSE_MAX:
+            raise ValueError("暂停窗口不对（最长 7 天）")
     except ValueError as e:
         kv_del(con, "update.pause")  # 无效的暂停标记当作不存在
         event(con, "pause_invalid", "暂停标记无效（%s），当作没有暂停" % e)
@@ -450,10 +498,13 @@ def evaluate(con, data: bytes, sig: bytes, version: str, now: float) -> tuple:
 
 
 def _accept(con, m: dict, data: bytes) -> None:
-    _raise_seq(con, m["seq"])
-    metrics.kv_set(con, "update.accepted", hashlib.sha256(data).hexdigest())
-    metrics.kv_set(con, "update.channel_signed_at", str(updsig.parse_iso(m.get("signed_at"))) if m.get("signed_at") else "0")
-    kv_del(con, "update.too_old")
+    with db.tx(con):  # 序号和「上次接受的那份」要一起落盘：只写了序号的话，同一份清单以后都算旧清单
+        if m["seq"] > max_seq(con):
+            metrics.kv_set(con, "update.max_seq", str(m["seq"]))
+        metrics.kv_set(con, "update.accepted", hashlib.sha256(data).hexdigest())
+        metrics.kv_set(con, "update.channel_signed_at",
+                       str(updsig.parse_iso(m.get("signed_at"))) if m.get("signed_at") else "0")
+        kv_del(con, "update.too_old")
 
 
 def check(con, version: Optional[str] = None, now: Optional[float] = None) -> str:
@@ -544,6 +595,7 @@ def trust(con, main_key: str, main_fp: str, backup_key: str, backup_fp: str) -> 
         with db.tx(con):
             kv_del(con, "update.max_seq")
             kv_del(con, "update.accepted")
+            kv_del(con, "update.pause")  # 旧主公钥签的暂停标记也不再算数
         _drop_pending(con)
         out.append("主公钥换了：已接受的最大序号清零，待安装的包已丢弃（旧主公钥签的清单从此验不过）")
     return out
@@ -828,6 +880,8 @@ class Updater:
         pend = kv_json(self.con, "update.pending")
         if not pend or hold_until(self.con, now) or pause_until(self.con, now):
             return False
+        if metrics.kv_get(self.con, "update.rekey_inflight"):
+            return False  # 换钥没补完：待装的包来历不明，等下次检查补完换钥（会丢掉它）
         if now < float(pend.get("retry_at") or 0):
             return False  # 上次安装因环境问题（如磁盘满）失败：退避到下一次检查的时间再试
         if busy_reasons(self.con, sched, media):
@@ -933,28 +987,45 @@ def install(con, pend: dict, now: Optional[float] = None) -> str:
 
 
 # ---------- 受管安装：adopt / adopt --undo ----------
-def _git(repo: Path, *args) -> str:
-    p = subprocess.run(["git", "-C", str(repo)] + list(args), capture_output=True, text=True)
+# 克隆的 .git/config 里的 fsmonitor、钩子、外部 diff 这类会执行命令的配置一律关掉，也不让 shell 里的 GIT_* 改了仓库位置
+_GIT_SAFE = ["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false",
+             "-c", "diff.external=", "-c", "core.pager=cat"]
+
+
+def _git(repo: Path, *args, binary: bool = False):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+    p = subprocess.run(["git"] + _GIT_SAFE + ["-C", str(repo)] + list(args), capture_output=True, env=env,
+                       stdin=subprocess.DEVNULL)
     if p.returncode != 0:
-        raise UpdateError("git %s 失败：%s" % (" ".join(args), p.stderr.strip()[:200]))
-    return p.stdout
+        raise UpdateError("git %s 失败：%s" % (" ".join(args), p.stderr.decode("utf-8", "replace").strip()[:200]))
+    return p.stdout if binary else p.stdout.decode("utf-8", "replace")
 
 
 def copy_tracked(repo: Path, dest: Path) -> None:
-    """把克隆里被 git 跟踪的文件（工作树须干净，内容即 HEAD）拷进版本目录：它就是正在运行的代码，信任关系不变。"""
+    """把克隆 HEAD 里的文件拷进版本目录：内容从 git 对象库取，不读工作树（标了 skip-worktree / assume-unchanged
+    的改动也收不进来）。工作树仍须干净，免得用户以为自己的本地改动被带上了。"""
     if _git(repo, "status", "--porcelain", "--untracked-files=no").strip():
         raise UpdateError("%s 有未提交的改动：先提交或还原，受管安装只收被跟踪、已提交的文件" % repo)
-    files = [f for f in _git(repo, "ls-files", "-z").split("\0") if f]
+    entries = []
+    for rec in _git(repo, "ls-tree", "-r", "-z", "--full-tree", "HEAD", binary=True).split(b"\0"):
+        if not rec:
+            continue
+        meta, path = rec.split(b"\t", 1)
+        mode, typ, oid = meta.decode().split()
+        path = path.decode("utf-8")
+        if typ != "blob" or mode not in ("100644", "100755"):
+            raise UpdateError("不支持链接或子模块：%s" % path)
+        if path.startswith("/") or ".." in path.split("/"):
+            raise UpdateError("路径不对：%s" % path)
+        entries.append((path, mode, oid))
     if dest.exists():
         shutil.rmtree(str(dest))
-    for f in files:
-        src = repo / f
-        if src.is_symlink() or not src.is_file():
-            raise UpdateError("不支持链接或子模块：%s" % f)
-        out = dest / f
+    for path, mode, oid in entries:
+        out = dest / path
         out.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(str(src), str(out))
-        os.chmod(str(out), 0o755 if os.stat(str(src)).st_mode & 0o111 else 0o644)
+        out.write_bytes(_git(repo, "cat-file", "blob", oid, binary=True))
+        os.chmod(str(out), 0o755 if mode == "100755" else 0o644)
 
 
 DEFAULT_LABEL = "dev.larkyard.ticketd"
@@ -994,9 +1065,12 @@ def capture_service() -> tuple:
     """adopt 前记下现有服务的名字和环境：重装（adopt、--undo、adopt 失败时恢复）都按它来，不按当前 shell 的环境，
     免得自定义了 TICKETD_LABEL / TICKETD_HOME / bridge profile 的安装被装成另一个服务（对抗审查）。"""
     label = os.environ.get("TICKETD_LABEL") or DEFAULT_LABEL
-    env = read_service_env(service_file(label))
-    if not env:  # 服务文件不在（或读不了）：退回当前环境里显式设置过的
-        env = {k: os.environ[k] for k in SERVICE_KEYS if os.environ.get(k)}
+    sf = service_file(label)
+    if not sf.is_file():
+        # 当初用自定义服务名装的、这次 shell 里又没设：照默认名装会多出第二个服务，和原来的抢 daemon.lock
+        raise UpdateError("找不到服务 %s（%s）：当初装服务时设过 TICKETD_LABEL 的，带上同样的 TICKETD_LABEL 再执行；"
+                          "还没装过服务的先跑 scripts/install.sh" % (label, sf))
+    env = read_service_env(sf)
     env.setdefault("TICKETD_HOME", str(config.home()))
     if Path(env["TICKETD_HOME"]).expanduser().resolve() != config.home().resolve():
         raise UpdateError("服务 %s 用的数据目录是 %s，和当前的 %s 不同：用同一个 TICKETD_HOME（必要时再设 TICKETD_LABEL）"
@@ -1006,7 +1080,8 @@ def capture_service() -> tuple:
 
 def _install_sh(repo: Path, app: Optional[Path], svc: Optional[dict] = None) -> None:
     env = dict(os.environ)
-    env.pop("TICKETD_APP", None)
+    for k in ("TICKETD_APP", "TICKETD_LABEL") + SERVICE_KEYS:
+        env.pop(k, None)  # 只用记下的服务环境，shell 里碰巧设着的不混进去
     svc = svc or {}
     if svc.get("label"):
         env["TICKETD_LABEL"] = svc["label"]
@@ -1025,13 +1100,19 @@ def _rewrite(path: Path, old: str, new: str) -> Optional[str]:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return None
-    if old not in text:
+    # 只换完整的命令路径：<克隆>/bin/ticketd、<克隆>/bin/ticket-x 这类不动
+    pat = re.compile(re.escape(old) + r"(?![\w.-])")
+    if not pat.search(text):
         return None
     bak = path.with_name("%s.bak-%s" % (path.name, time.strftime("%Y%m%d%H%M%S")))
     shutil.copy2(str(path), str(bak))
     tmp = path.with_name(path.name + ".tmp-%d" % os.getpid())
-    tmp.write_text(text.replace(old, new), encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    try:
+        tmp.write_text(pat.sub(lambda m: new, text), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     return str(bak)
 
 
@@ -1063,20 +1144,28 @@ def adopt(workspace: str = "", repo: Optional[Path] = None, run_install=_install
     st = {"status": "confirmed", "version": version, "adopted_from": str(repo), "adopted_at": time.time(),
           "label": label, "service_env": svc_env}
     out = ["版本目录：%s" % vd, "启动器：%s" % (app / "launcher.py")]
+    write_state(st)  # 先记来历：后面任何一步失败，--undo 都认得这份受管安装
     if workspace:
         ws_md = Path(workspace) / "CLAUDE.md"
-        bak = _rewrite(ws_md, "%s/bin/ticket" % repo, "%s/bin/ticket" % current_link())
+        # setup-workspace.sh 写的是 pwd 得到的逻辑路径（可能经过符号链接），这里的 repo 是解析过的真实路径：两种都试
+        bak = None
+        for root in dict.fromkeys([str(repo)] + _aliases(ws_md, repo)):
+            if root:
+                bak = _rewrite(ws_md, "%s/bin/ticket" % root, "%s/bin/ticket" % current_link())
+                if bak:
+                    st.update(workspace_md=str(ws_md), workspace_root=root)
+                    write_state(st)
+                    break
         if bak:
-            st["workspace_md"] = str(ws_md)
             out.append("主会话约定：%s 里的 ticket 路径改为 %s/bin/ticket（备份 %s）" % (ws_md, current_link(), bak))
         else:
-            out.append("主会话约定：%s 里没有 %s/bin/ticket，没改" % (ws_md, repo))
+            out.append("❌ 主会话约定：%s 里没有 %s/bin/ticket，没改。主会话会继续用克隆里的 ticket；"
+                       "用 %s/scripts/setup-workspace.sh <工作目录> --force 重新生成" % (ws_md, repo, current_link()))
     else:
         out.append("⚠️ 找不到 bridge 工作目录，主会话约定没改（config.env 里写 TICKETD_WORKSPACE 后重跑）")
-    write_state(st)
     try:
         run_install(vd, app, svc)
-    except Exception as e:
+    except BaseException as e:  # Ctrl-C 也要恢复：install.sh 可能已经卸掉旧服务
         # install.sh 可能已经卸掉旧服务、写了一半新的：按原来的服务名和环境从克隆重装一次，再改回工作区
         try:
             run_install(repo, None, svc)
@@ -1089,10 +1178,28 @@ def adopt(workspace: str = "", repo: Optional[Path] = None, run_install=_install
     return out
 
 
+def _aliases(md: Path, repo: Path) -> list:
+    """CLAUDE.md 里写的、解析后就是这份克隆的其他路径（经过符号链接的逻辑路径）。"""
+    try:
+        text = md.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    out = []
+    for m in re.finditer(r"(/[^\s`'\"()<>]*?)/bin/ticket(?![\w.-])", text):
+        root = m.group(1)
+        try:
+            if root not in out and Path(root).resolve() == repo:
+                out.append(root)
+        except OSError:
+            continue
+    return out
+
+
 def _undo_files(st: dict, repo: Path) -> Optional[str]:
     bak = None
     if st.get("workspace_md"):
-        bak = _rewrite(Path(st["workspace_md"]), "%s/bin/ticket" % current_link(), "%s/bin/ticket" % repo)
+        root = st.get("workspace_root") or str(repo)
+        bak = _rewrite(Path(st["workspace_md"]), "%s/bin/ticket" % current_link(), "%s/bin/ticket" % root)
     for p in (current_link(), app_dir() / "launcher.py"):
         try:
             p.unlink()
@@ -1155,10 +1262,13 @@ def rollback_target() -> Optional[str]:
     if not vd.is_dir():
         return None
     others = [p.name for p in vd.iterdir() if p.is_dir() and not p.name.startswith(".") and p.name != cur]
-    try:
-        lower = [v for v in others if updsig.cmp_version(v, cur) < 0]
-    except ValueError:
-        lower = []
+    lower = []
+    for v in others:
+        try:
+            if updsig.cmp_version(v, cur) < 0:
+                lower.append(v)
+        except ValueError:
+            continue  # 名字不是版本号的目录（手工备份之类）跳过，不连累其他候选
     if not lower:
         return None
     return max(lower, key=updsig.version_tuple)
