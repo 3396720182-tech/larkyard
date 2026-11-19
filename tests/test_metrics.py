@@ -159,6 +159,32 @@ class StatsTest(TicketdTestCase):
         self.assertIn("跑了 4 轮，worker 成本约 $5.00（其中 4 轮是从老工单补算的", text)
 
 
+class StreamCostTest(TicketdTestCase):
+    def costs(self, evs):
+        p = self.tmp / "s.jsonl"
+        p.write_text("\n".join(json.dumps(e) for e in evs) + "\n")
+        from ticketd import metrics
+        return metrics.stream_costs(p)
+
+    def test_new_session_bigger_than_old_is_not_undercounted(self):  # 外部评测：旧会话 $2、新会话首轮 $5
+        rows, last = self.costs([
+            {"type": "system", "subtype": "init", "session_id": "s1"},
+            {"type": "result", "session_id": "s1", "total_cost_usd": 2.0},
+            {"type": "system", "subtype": "init", "session_id": "s2"},
+            {"type": "result", "session_id": "s2", "total_cost_usd": 5.0}])
+        self.assertAlmostEqual(sum(rows), 7.0)
+        self.assertEqual(last, 5.0)
+
+    def test_session_from_init_when_result_has_none_and_legacy_fallback(self):
+        rows, _ = self.costs([
+            {"type": "system", "subtype": "init", "session_id": "s1"}, {"type": "result", "total_cost_usd": 2.0},
+            {"type": "system", "subtype": "init", "session_id": "s1"}, {"type": "result", "total_cost_usd": 3.0},
+            {"type": "system", "subtype": "init", "session_id": "s2"}, {"type": "result", "total_cost_usd": 5.0}])
+        self.assertEqual([round(x, 2) for x in rows], [2.0, 1.0, 5.0])
+        rows, _ = self.costs([{"type": "result", "total_cost_usd": c} for c in (1.0, 3.0, 0.5)])  # 老记录没有 session_id
+        self.assertEqual([round(x, 2) for x in rows], [1.0, 2.0, 0.5])
+
+
 class DigestTest(TicketdTestCase):
     def setUp(self):
         super().setUp()
@@ -442,6 +468,63 @@ class CompactTest(TicketdTestCase):
         self.assertEqual(self.core.last_report(self.con, tid)["status"], "waiting")
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM inputs WHERE ticket_id=? AND status='pending'",
                                           (tid,)).fetchone()[0], 1)  # 追问还没投递
+
+    def test_compaction_outage_expiry_stops_auto_retry(self):  # 外部评测 P1
+        os.environ.update({"TICKETD_OUTAGE_RETRY_HOURS": "1", "TICKETD_OUTAGE_RETRY_EVERY": "3600"})
+        os.environ["FAKE_CTX"] = "200000"
+        tid = self.new_ticket()
+        self.wait(lambda: self.idle(tid), self.sched)
+        os.environ["FAKE_COMPACT_FAIL"] = "Failed to authenticate. API Error: 403 insufficient balance"
+        self.core.send_followup(self.con, tid, "om_2", "再改一下 [[fake:ready]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None and self.idle(tid), self.sched)
+        self.con.execute("UPDATE tickets SET retry_at=0, outage_since=? WHERE id=?", (time.time() - 7200, tid))
+        self.wait(lambda: self.core.get(self.con, tid)["state"] == "failed" and tid not in self.sched.running,
+                  self.sched)
+        n = len(self.argv_log(tid))
+        for _ in range(5):
+            self.sched.tick()
+        self.assertEqual(len(self.argv_log(tid)), n)  # 不再一拍接一拍地重试压缩
+        t = self.core.get(self.con, tid)
+        self.assertEqual(t["auto_halted"], 1)
+        self.assertEqual(t["ctx_tokens"], 200110)
+        pending = [r["text"] for r in self.con.execute(
+            "SELECT text FROM inputs WHERE ticket_id=? AND status='pending'", (tid,))]
+        self.assertEqual(pending, ["再改一下 [[fake:ready]]"])  # 原追问保留
+        # 用户充值后回复「继续」：先压缩，再把原追问和「继续」一起投递
+        del os.environ["FAKE_COMPACT_FAIL"]
+        os.environ["FAKE_CTX"] = "30000"
+        self.core.send_followup(self.con, tid, "om_3", "继续")
+        self.wait(lambda: self.outcomes(tid)[-1] == "ready" and len(self.outcomes(tid)) > 2 and self.idle(tid),
+                  self.sched)
+        calls = self.argv_log(tid)
+        self.assertTrue(calls[-2]["argv"][-1].startswith("/compact"))
+        self.assertIn("再改一下", calls[-1]["card"])
+        self.assertIn("继续", calls[-1]["card"])
+
+    def test_hold_during_compaction_keeps_context_and_compacts_after_release(self):  # 外部评测 P2
+        os.environ["FAKE_CTX"] = "200000"
+        tid = self.new_ticket()
+        self.wait(lambda: self.idle(tid), self.sched)
+        os.environ["FAKE_COMPACT_SLEEP"] = "30"
+        self.core.send_followup(self.con, tid, "om_2", "再改一下 [[fake:ready]]")
+        self.wait(lambda: tid in self.sched.running and self.sched.running[tid].compact, self.sched)
+        self.core.hold(self.con, tid)
+        self.wait(lambda: tid not in self.sched.running, self.sched)
+        t = self.core.get(self.con, tid)
+        self.assertEqual(t["state"], "held")
+        self.assertEqual(t["ctx_tokens"], 200110)  # 原来被清成 0
+        self.assertEqual(self.outcomes(tid), ["ready", "held"])  # 不算压缩失败
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE kind='compact_failed'").fetchone()[0], 0)
+        del os.environ["FAKE_COMPACT_SLEEP"]
+        os.environ["FAKE_CTX"] = "30000"
+        self.core.release(self.con, tid)
+        self.wait(lambda: len(self.outcomes(tid)) == 4 and self.idle(tid), self.sched)
+        calls = self.argv_log(tid)
+        # 被暂停杀掉的那次压缩可能来不及写 argv；放开后重新判断，先压缩成功，再投递追问
+        self.assertEqual(self.outcomes(tid), ["ready", "held", "compact", "ready"])
+        self.assertTrue(calls[-2]["argv"][-1].startswith("/compact"))
+        self.assertIn("再改一下", calls[-1]["card"])
+        self.assertEqual(self.core.get(self.con, tid)["ctx_tokens"], 30110)
 
     def test_failed_compaction_still_runs_the_round(self):
         os.environ["FAKE_CTX"] = "200000"

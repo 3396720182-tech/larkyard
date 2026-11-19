@@ -178,6 +178,20 @@ class SchedulerTest(TicketdTestCase):
         self.assertEqual(rep["status"], "failed")
         self.assertIn("继续", rep["ask"])
 
+    def test_outage_expiry_halts_until_user_says_continue(self):  # 外部评测 P1
+        os.environ["TICKETD_OUTAGE_RETRY_HOURS"] = "1"
+        tid = self.new_ticket(request="[[fake:balance]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None, self.sched)
+        self.con.execute("UPDATE tickets SET retry_at=0, outage_since=? WHERE id=?", (time.time() - 7200, tid))
+        self.wait(lambda: self.state(tid) == "failed" and tid not in self.sched.running, self.sched)
+        n = len(self.argv_log(tid))
+        self.assertEqual(self.core.get(self.con, tid)["auto_halted"], 1)
+        for _ in range(5):
+            self.sched.tick()
+        self.assertEqual(len(self.argv_log(tid)), n)  # 留着的输入不会让调度器再选中它
+        self.core.send_followup(self.con, tid, "om_2", "继续 [[fake:ready]]")
+        self.wait(lambda: self.core.last_report(self.con, tid)["status"] == "ready", self.sched)
+
     def test_followup_during_outage_runs_now(self):
         os.environ["TICKETD_OUTAGE_RETRY_HOURS"] = "24"
         os.environ["TICKETD_OUTAGE_RETRY_EVERY"] = "3600"
@@ -390,6 +404,72 @@ class SchedulerTest(TicketdTestCase):
         self.assertIn("无法启动 worker", self.core.last_report(self.con, tid)["summary"])
         self.assertIsNone(self.con.execute("SELECT * FROM locks").fetchone())
         self.assertNotIn(tid, self.sched.running)
+
+    # ---------- 外部评测 P1：worker 没起来时输入不能算已投递 ----------
+    def _pending_texts(self, tid):
+        return [r["text"] for r in self.con.execute(
+            "SELECT text FROM inputs WHERE ticket_id=? AND status='pending' ORDER BY id", (tid,))]
+
+    def test_popen_failure_keeps_followup_pending_and_halts(self):
+        import subprocess
+        from unittest import mock
+        from ticketd import scheduler
+        tid = self.new_ticket()
+        self.wait(lambda: self.state(tid) == "idle" and tid not in self.sched.running, self.sched)
+        self.core.send_followup(self.con, tid, "om_2", "追问原话 [[fake:ready]]")
+        with mock.patch.object(scheduler.subprocess, "Popen", side_effect=OSError("注入：起不来")):
+            self.sched.tick()
+            self.assertEqual(self.state(tid), "failed")
+            self.assertEqual(self._pending_texts(tid), ["追问原话 [[fake:ready]]"])
+            self.assertEqual(self.core.get(self.con, tid)["auto_halted"], 1)
+            n = len(self.con.execute("SELECT * FROM reports WHERE ticket_id=?", (tid,)).fetchall())
+            for _ in range(3):  # 停止自动调度：不会每个 tick 再起一次、再报一次失败
+                self.sched.tick()
+            self.assertEqual(len(self.con.execute("SELECT * FROM reports WHERE ticket_id=?", (tid,)).fetchall()), n)
+        self.assertIn("继续", self.core.last_report(self.con, tid)["ask"])
+        self.assertEqual(len(self.argv_log(tid)), 1)
+        # 用户回复「继续」：原追问和新追问一起进任务卡
+        self.core.send_followup(self.con, tid, "om_3", "继续")
+        self.wait(lambda: len(self.argv_log(tid)) == 2 and self.state(tid) == "idle"
+                  and tid not in self.sched.running, self.sched)
+        card = self.argv_log(tid)[1]["card"]
+        self.assertIn("追问原话", card)
+        self.assertIn("继续", card)
+        self.assertEqual(self._pending_texts(tid), [])
+
+    def test_failure_after_popen_kills_worker_and_keeps_inputs(self):
+        from unittest import mock
+        from ticketd import scheduler
+        tid = self.new_ticket(request="[[fake:sleep]] 原话")
+        real = scheduler.core.expire_pending_runs
+        calls = []
+
+        def boom(con, t):
+            calls.append(1)
+            raise RuntimeError("注入：进程起来之后记库失败")
+
+        with mock.patch.object(scheduler.core, "expire_pending_runs", boom):
+            self.sched.tick()
+        self.assertEqual(calls, [1])
+        self.assertNotIn(tid, self.sched.running)
+        self.assertEqual(self.state(tid), "failed")
+        self.assertEqual(self.core.get(self.con, tid)["auto_halted"], 1)
+        self.assertEqual(self._pending_texts(tid), ["[[fake:sleep]] 原话"])  # 整个事务回滚，任务卡没算投递
+        self.assertIsNone(self.con.execute("SELECT * FROM locks").fetchone())
+        self.assertIs(scheduler.core.expire_pending_runs, real)
+
+    def test_grant_or_restart_clears_auto_halt(self):
+        tid = self.new_ticket()
+        self.core.touch(self.con, tid, state="failed", auto_halted=1)
+        self.sched.tick()
+        self.assertNotIn(tid, self.sched.running)
+        proj = self.tmp / "proj"
+        proj.mkdir()
+        self.core.grant(self.con, tid, str(proj))
+        self.assertEqual(self.core.get(self.con, tid)["auto_halted"], 0)
+        self.core.touch(self.con, tid, auto_halted=1)
+        self.core.restart(self.con, tid)
+        self.assertEqual(self.core.get(self.con, tid)["auto_halted"], 0)
 
     def test_bad_workdir_does_not_block_other_tickets(self):
         blocker = self.tmp / "afile"

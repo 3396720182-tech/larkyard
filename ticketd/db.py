@@ -103,6 +103,7 @@ MIGRATIONS = [
     ("tickets", "cost_usd", "REAL NOT NULL DEFAULT 0"),           # 这张单 worker 累计花了多少（美元，Claude 报的）
     ("tickets", "session_cost", "REAL NOT NULL DEFAULT 0"),       # 当前会话的累计成本（Claude 的 total_cost_usd 按会话累计）                          # 非空 = 故障等待中（断网、余额不足等），从这一刻起算时限
     ("tickets", "bg_wait", "TEXT"),                               # 非空 = 本轮已结束但还在等后台任务（内容是任务描述）
+    ("tickets", "auto_halted", "INTEGER NOT NULL DEFAULT 0"),     # 1 = 停止自动调度（故障等待到期、worker 起不来），等用户追问 / 放开 / 换会话
     ("outbox", "card_json", "TEXT"),                             # 非空 = 发卡片（text 是卡片发不出去时的兜底）
     ("outbox", "report_id", "INTEGER"),                           # 这条消息对应的汇报
     ("outbox", "media_json", "TEXT"),                             # 非空 = 发视频消息（结果卡里放不进的视频；text 是发不出去时的兜底）

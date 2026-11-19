@@ -296,7 +296,7 @@ class Scheduler:
     # ---------- 启动 ----------
     def _launch(self) -> None:
         rows = self.con.execute(
-            "SELECT * FROM tickets t WHERE t.state IN ('queued','idle','failed') AND t.retry_at<=?"
+            "SELECT * FROM tickets t WHERE t.state IN ('queued','idle','failed') AND t.retry_at<=? AND t.auto_halted=0"
             " AND EXISTS(SELECT 1 FROM inputs i WHERE i.ticket_id=t.id AND i.status='pending')"
             " ORDER BY t.created_at", (db.now(),)).fetchall()
         for t in rows:
@@ -369,8 +369,8 @@ class Scheduler:
             inputs = self.con.execute("SELECT * FROM inputs WHERE ticket_id=? AND status='pending' ORDER BY id",
                                       (tid,)).fetchall()
             ids = [i["id"] for i in inputs]
-            self.con.executemany("UPDATE inputs SET status='delivered' WHERE id=?", [(i,) for i in ids])
-            core.expire_pending_runs(self.con, tid)
+            # 输入此时只是「认领」：进程真的起来之后才标 delivered（见下面）。原来在这里就标掉，worker 没起来时
+            # 追问已经算投递过，用户说「继续」时任务卡里没有它（外部评测 P1）；守护进程在两者之间崩溃同理
             mark = self.con.execute("SELECT COALESCE(MAX(id),0) FROM reports WHERE ticket_id=?", (tid,)).fetchone()[0]
             core.touch(self.con, tid, state="running")
         fds: List[int] = []
@@ -396,23 +396,42 @@ class Scheduler:
             proc = subprocess.Popen(cmd, cwd=str(workdir), stdin=fin, stdout=fout, stderr=ferr, env=env,
                                     start_new_session=True)
         except Exception as e:
-            self.con.execute("DELETE FROM locks WHERE ticket_id=?", (tid,))
-            core.touch(self.con, tid, started_at=db.now())  # 这一轮从这里算起：结果卡的用时、阶段不串到上一轮
-            core.add_report(self.con, tid, "failed", "无法启动 worker：%s" % e)
-            core.touch_if(self.con, tid, ("running",), state="failed", pid=None)
-            self.log(str(workdir), "无法启动 worker：%r" % e)
+            self._start_failed(tid, str(workdir), e)
             return False
         finally:
             for fd in fds:
                 os.close(fd)
         # 不写 state：可能已被停止/暂停
         t0 = db.now()
-        core.touch(self.con, tid, pid=proc.pid, started_at=t0, last_action_at=t0, last_step=None, stall_alerted=0,
-                   bg_wait=None)
+        try:
+            with db.tx(self.con):
+                self.con.executemany("UPDATE inputs SET status='delivered' WHERE id=?", [(i,) for i in ids])
+                core.expire_pending_runs(self.con, tid)
+                core.touch(self.con, tid, pid=proc.pid, started_at=t0, last_action_at=t0, last_step=None,
+                           stall_alerted=0, bg_wait=None)
+        except Exception as e:
+            # 进程起来了但没记下来（如库被锁）：不能让它没人盯着跑，工单也不能卡在 running。杀掉，按没起来处理
+            _signal_group(proc, signal.SIGKILL)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            self._start_failed(tid, str(workdir), e)
+            return False
         self.running[tid] = Running(proc, tid, str(workdir), ids, mark, so, eo, ex.name, t["session_id"])
         self.running[tid].cost_seen = float(t["session_cost"] or 0) if t["session_started"] else 0.0
         self.log(str(workdir), "开始第 %d 轮（输入 %d 条）" % (n, len(inputs)))
         return True
+
+    def _start_failed(self, tid: str, workdir: str, e: Exception) -> None:
+        """worker 没起来：输入还是 pending（没标 delivered），原样留给下一次；停止自动调度，免得每个 tick 都再起一次、
+        再报一次失败。用户追问「继续」、授权、换会话后接着调度，那时这一轮的输入和新消息一起投递。"""
+        self.con.execute("DELETE FROM locks WHERE ticket_id=?", (tid,))
+        core.touch(self.con, tid, started_at=db.now())  # 这一轮从这里算起：结果卡的用时、阶段不串到上一轮
+        core.add_report(self.con, tid, "failed", "无法启动 worker：%s" % e,
+                        ask="处理好之后引用这条消息回复「继续」，这一轮的输入会原样交给 worker")
+        core.touch_if(self.con, tid, ("running",), state="failed", pid=None, auto_halted=1)
+        self.log(workdir, "无法启动 worker，停止自动调度：%r" % e)
 
     # ---------- 监视与收割 ----------
     def _on_event(self, r: Running, ev: dict) -> None:
@@ -697,15 +716,19 @@ class Scheduler:
                 pass
         self.log(rp.workdir, "沙箱外执行 R%d 结束：退出码 %s，用时 %.0fs" % (rp.run_id, code, took))
 
+    def _requeue_inputs(self, r: Running, t, add_input: bool) -> None:
+        """这一轮没做完：让下一轮还能拿到它的输入。会话已建立则加一条「从中断处继续」，否则把原输入改回 pending。"""
+        if not add_input:
+            return  # 压缩轮：输入还没投递，原样留着
+        if t["session_started"]:
+            core.add_input(self.con, r.ticket_id, "retry", RETRY_TEXT)
+        else:
+            self.con.executemany("UPDATE inputs SET status='pending' WHERE id=?", [(i,) for i in r.input_ids])
+
     def _schedule_retry(self, r: Running, t, delay: float, add_input: bool = True, **fields) -> None:
         tid = r.ticket_id
         with db.tx(self.con):
-            if not add_input:
-                pass  # 压缩轮：输入还没投递，原样留着
-            elif t["session_started"]:
-                core.add_input(self.con, tid, "retry", RETRY_TEXT)
-            else:
-                self.con.executemany("UPDATE inputs SET status='pending' WHERE id=?", [(i,) for i in r.input_ids])
+            self._requeue_inputs(r, t, add_input)
             core.touch_if(self.con, tid, ("running",), state="idle", pid=None, retries=t["retries"] + 1,
                           retry_at=db.now() + delay, **fields)
 
@@ -736,8 +759,13 @@ class Scheduler:
             core.add_report(self.con, tid, "failed",
                             "%s，自动重试 %.0f 小时仍未恢复：%s" % (reason, limit / 3600, detail),
                             ask="恢复后引用这条消息回复「继续」，我从中断处接着做")
-        core.touch_if(self.con, tid, ("running",), state="failed", pid=None, outage_since=None)
-        self.log(r.workdir, "%s，不再自动重试，本轮失败" % reason)
+        # 到期：停止自动调度（auto_halted），但输入照样留好——压缩轮的追问原本就还是 pending，普通轮按重试的规则补上。
+        # 原来只标 failed，压缩轮留着的追问让调度器下一拍又选中这张单，一直重试下去（外部评测 P1）。
+        # 用户追问「继续」、放开、授权、换会话时清掉 auto_halted，连同留着的输入一起投递
+        with db.tx(self.con):
+            self._requeue_inputs(r, t, add_input)
+            core.touch_if(self.con, tid, ("running",), state="failed", pid=None, outage_since=None, auto_halted=1)
+        self.log(r.workdir, "%s，不再自动重试，本轮失败，等用户回复「继续」" % reason)
 
     def _show_bg_wait(self, r: Running, waiting: bool) -> None:
         text = _short_join(r.bg.values()) if waiting else None
@@ -781,7 +809,9 @@ class Scheduler:
         try:
             self._settle(r)
             t = core.get(self.con, tid)
-            if r.compact:
+            if r.compact and t["state"] in ("held", "stopped"):
+                outcome = t["state"]  # 被用户打断的压缩不算压缩失败（不进压缩统计）
+            elif r.compact:
                 outcome = "compact" if r.compacted else "compact_failed"
             else:
                 outcome = metrics.round_outcome(self.con, t)
@@ -813,6 +843,12 @@ class Scheduler:
             return
         core.touch(self.con, tid, pid=None, bg_wait=None)
         t = core.get(self.con, tid)
+        if t["state"] in ("held", "stopped"):
+            # 用户暂停 / 停止打断了压缩：会话没有变短，保留 ctx_tokens，放开后由 start 重新判断、先压缩。
+            # 原来落到下面的「确定性失败」分支清零，放开后直接拿大上下文跑普通轮（外部评测 P2）。不算压缩失败
+            self.log(r.workdir, "会话压缩被用户%s打断，保留上下文规模，恢复后重新判断是否压缩" % (
+                "暂停" if t["state"] == "held" else "停止"))
+            return
         stderr_text = _read_from(Path(r.workdir) / ".stderr.log", r.stderr_offset)
         acct = worker.account_error(err, r.last_text, stderr_text)
         transient = not acct and worker.is_transient(r.proc.returncode, r.result, stderr_text)

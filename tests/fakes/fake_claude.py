@@ -31,6 +31,8 @@ emit({"type": "system", "subtype": "init", "session_id": sid})
 if argv and argv[-1].startswith("/compact"):
     # 会话压缩（ticketd 在上下文很大时先跑这一轮）：不读任务卡、不汇报
     once = Path(".compact_failed_once")
+    if os.environ.get("FAKE_COMPACT_SLEEP"):  # 压缩跑得慢：测暂停 / 停止打断压缩
+        time.sleep(float(os.environ["FAKE_COMPACT_SLEEP"]))
     if os.environ.get("FAKE_COMPACT_FAIL") and not (os.environ.get("FAKE_COMPACT_FAIL_ONCE") and once.exists()):
         once.write_text("1")
         msg = os.environ["FAKE_COMPACT_FAIL"]

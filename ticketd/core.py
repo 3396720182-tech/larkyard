@@ -104,6 +104,7 @@ def grant_net(con: sqlite3.Connection, ticket_id: str, local: bool = False, sock
                 con.execute("INSERT OR IGNORE INTO net_grants VALUES(?,?,?,?)", (ticket_id, "socket", p, now))
             what = "unix socket：%s" % paths[0]
         add_input(con, ticket_id, "grant", "用户已授权%s。" % what)
+        touch(con, ticket_id, auto_halted=0)
     return what
 
 
@@ -170,7 +171,7 @@ def send_followup(con: sqlite3.Connection, ticket_id: str, message_id: str, text
         con.execute("INSERT OR IGNORE INTO bindings VALUES(?,?)", (message_id, ticket_id))
         add_input(con, ticket_id, "followup", text, message_id)
         # 用户说话了：马上投递（不等故障重试的时间点），故障等待重新起算，再失败会重新告诉用户
-        touch(con, ticket_id, retries=0, retry_at=0, outage_since=None)
+        touch(con, ticket_id, retries=0, retry_at=0, outage_since=None, auto_halted=0)
 
 
 def _reply_target(con: sqlite3.Connection, ticket_id: str) -> str:
@@ -430,7 +431,7 @@ def release(con: sqlite3.Connection, ticket_id: str) -> str:
         st = get(con, ticket_id)["state"]
         if st not in ("held", "stopped"):
             raise TicketError("%s 不在暂停中，也没有停止" % ticket_id)
-        touch(con, ticket_id, state="idle", retries=0, retry_at=0, outage_since=None)
+        touch(con, ticket_id, state="idle", retries=0, retry_at=0, outage_since=None, auto_halted=0)
         add_input(con, ticket_id, "release", "用户已放开暂停，可以继续。" if st == "held" else RESUME_TEXT)
     return st
 
@@ -453,7 +454,7 @@ def restart(con: sqlite3.Connection, ticket_id: str) -> None:
         # 之前没投递的输入已经包含在上面的追问里，标掉，免得新会话里重复
         con.execute("UPDATE inputs SET status='delivered' WHERE ticket_id=? AND status='pending'", (ticket_id,))
         touch(con, ticket_id, session_id=str(uuid.uuid4()), session_started=0, state="idle",
-              retries=0, retry_at=0, outage_since=None, session_cost=0)
+              retries=0, retry_at=0, outage_since=None, session_cost=0, auto_halted=0)
         add_input(con, ticket_id, "fresh", text)
 
 
@@ -489,7 +490,7 @@ def approve(con: sqlite3.Connection, ticket_id: str) -> int:
         con.execute("UPDATE runs SET status='approved', approved_at=? WHERE id=?", (db.now(), run["id"]))
         con.execute("INSERT INTO events(ticket_id, kind, detail, created_at) VALUES(?,?,?,?)",
                     (ticket_id, "run_approved", "R%d" % run["id"], db.now()))
-        touch(con, ticket_id, retry_at=0)
+        touch(con, ticket_id, retry_at=0, auto_halted=0)
     return run["id"]
 
 
@@ -505,6 +506,7 @@ def grant(con: sqlite3.Connection, ticket_id: str, path: str) -> str:
             raise TicketError("%s 已停止" % ticket_id)
         con.execute("INSERT OR IGNORE INTO grants VALUES(?,?,?)", (ticket_id, p, db.now()))
         add_input(con, ticket_id, "grant", "用户已授权可写目录：%s" % p)
+        touch(con, ticket_id, auto_halted=0)
     return p
 
 

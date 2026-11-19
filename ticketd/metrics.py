@@ -126,23 +126,36 @@ def context_summary(con, since: float) -> Optional[str]:
 
 def stream_costs(path: Path) -> Optional[tuple]:
     """从 .stream.jsonl 重算成本：返回 ([每个 result 事件新增的成本], 最后的会话累计值)；没有文件返回 None。
-    规则和调度器实时记账一样：total_cost_usd 是会话累计值，比上次小说明换了会话。"""
+    total_cost_usd 是会话累计值，按 session_id 分开累计（result 事件自己带，没有就用最近一个 init 的）：
+    原来只靠「比上次小」识别换会话，新会话首轮就比旧会话累计值大时（旧 $2、新 $5）会少算成 $3（外部评测）。
+    完全没有 session_id 的老记录退回原来的规则。"""
     if not path.is_file():
         return None
     prev, rows = 0.0, []
+    seen = {}            # session_id → 该会话已记的累计值
+    sid = None           # 当前会话（最近一个带 session_id 的 init / result）
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
-                if '"result"' not in line:
+                if '"result"' not in line and '"session_id"' not in line:
                     continue
                 try:
                     ev = json.loads(line)
                 except ValueError:
                     continue
-                c = ev.get("total_cost_usd") if isinstance(ev, dict) and ev.get("type") == "result" else None
+                if not isinstance(ev, dict):
+                    continue
+                s = ev.get("session_id")
+                if isinstance(s, str) and s and (ev.get("type") == "result"
+                                                 or (ev.get("type") == "system" and ev.get("subtype") == "init")):
+                    sid = s
+                c = ev.get("total_cost_usd") if ev.get("type") == "result" else None
                 if not isinstance(c, (int, float)) or isinstance(c, bool):
                     continue
-                rows.append(c - prev if c >= prev else c)
+                last = seen.get(sid, 0.0) if sid is not None else prev
+                rows.append(c - last if c >= last else c)
+                if sid is not None:
+                    seen[sid] = c
                 prev = c
     except OSError:
         return None
