@@ -135,10 +135,12 @@ def _send_lock():
 
 def turn_off(con) -> int:
     """关闭：删除匿名 ID、同意记录和没发出的报告（已发副本留在本机）。返回删了几份待发报告。
-    正在发送的请求会先发完（最多等一次 POST 的超时），返回之后不会再发。"""
+    正在发送的请求会先发完（最多等一次 POST 的超时），返回之后不会再发。
+    先删同意记录、再等锁：flock 不保证先来先得，发送方放锁后可能马上又抢到锁去发下一份。
+    同意记录先没了，发送方下一次拿到锁核对时就会停，off 最多只等在途的那一次请求。"""
+    with db.tx(con):
+        con.execute("DELETE FROM kv WHERE key LIKE 'telemetry\\_%' ESCAPE '\\'")
     with _send_lock():
-        with db.tx(con):
-            con.execute("DELETE FROM kv WHERE key LIKE 'telemetry\\_%' ESCAPE '\\'")
         n = 0
         for p in _pending_dir().glob("*.json"):
             try:

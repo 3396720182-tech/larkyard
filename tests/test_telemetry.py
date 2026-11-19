@@ -435,7 +435,26 @@ class SendTest(TelemetryTestCase):
             other.close()
             order.append("off_returned")
 
-        t = threading.Thread(target=off)
+        # flock 不保证先来先得（macOS CI 上实际出现过：发送方放锁后又先抢到锁发了第二份）。
+        # 这里让 off 线程拿锁时故意慢一拍（非阻塞试锁失败就睡 0.3 秒再试），稳定复现「发送方先抢到」的时序
+        real_fcntl = self.tm.fcntl
+
+        class SlowForOff:
+            LOCK_EX, LOCK_NB, LOCK_UN = real_fcntl.LOCK_EX, real_fcntl.LOCK_NB, real_fcntl.LOCK_UN
+
+            @staticmethod
+            def flock(fd, op):
+                if threading.current_thread().name != "off":
+                    return real_fcntl.flock(fd, op)
+                while True:
+                    try:
+                        return real_fcntl.flock(fd, op | real_fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        time.sleep(0.3)
+
+        self.tm.fcntl = SlowForOff
+        self.addCleanup(setattr, self.tm, "fcntl", real_fcntl)
+        t = threading.Thread(target=off, name="off")
         t.start()
         time.sleep(0.5)
         self.assertNotIn("off_returned", order)  # 在途请求没结束，off 还在等
