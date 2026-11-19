@@ -450,6 +450,15 @@ class IdleTest(ManagedBase):
         self.assertIsNone(update.kv_json(self.con, "update.pending"))
         self.assertIn("0.3.1", update.blocked_versions(self.con))
 
+    def test_local_hash_mismatch_does_not_block_version(self):
+        """本地包被截断（磁盘、并发写）：丢掉待装、下次检查重新下载，不拉黑这个版本（R1）。"""
+        tgz = update.update_dir() / "pending" / "p"
+        tgz.parent.mkdir(parents=True)
+        tgz.write_bytes(b"short")
+        self.assertFalse(self.updater()._maybe_install(None, None, 1000.0))
+        self.assertIsNone(update.kv_json(self.con, "update.pending"))
+        self.assertNotIn("0.3.1", update.blocked_versions(self.con))
+
     def test_scheduler_does_not_launch_during_install(self):
         from ticketd.scheduler import Scheduler
         sched = Scheduler(self.con)

@@ -241,6 +241,7 @@ TICKETD_UPDATE_URL=https://updates.example.com/larkyard
 - 守护进程起不来、命令也用不了时：`ln -sfn versions/<旧版本> ~/.ticketd/app/current`，然后 `launchctl kickstart -k gui/$(id -u)/dev.larkyard.ticketd`（Linux：`systemctl --user restart dev.larkyard.ticketd`）。
 
 发布者：`scripts/release.py` 在你自己的电脑上从 git tag 打包、一次签齐 canary / early / stable 三份清单（`ssh-keygen -Y sign`，只接受 Ed25519），另能签回滚清单（最长 7 天有效）、按 7 天窗口预签 12 周暂停标记、用离线备份私钥签换钥清单；`release.py publish` 把签好的文件放到更新源。更新源上没有私钥。
+- 撤回：已下载、还没装的版本，用一份指回当前版本的回滚清单撤回（客户端丢掉待装的包）；只把通道清单撤下（404）和更新源暂时不可达区分不了，不算撤回。
 - 序号全局递增：回滚清单、暂停标记和发布清单共用一个序号。提前签好、晚些才放出去的发布清单，如果中间签过回滚清单，序号会比客户端见过的小而被当成重放拒绝，要重新签。
 - 主私钥泄露：先发布当前窗口的暂停标记，再用离线备份私钥 `release.py rekey` 签一份换钥清单并发布；客户端换成新主公钥，旧主私钥签的东西全部失效。
 - 两把私钥都丢了：只能在每台机器上重新 `ticket update trust` 新公钥（按新指纹）。

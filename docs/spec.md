@@ -420,6 +420,8 @@ cp <工作区>/CLAUDE.md.bak-<时间> <工作区>/CLAUDE.md
 
 **worker**：在 worker 环境里（有 `TICKETD_TICKET` 或 `TICKETD_SPOOL`）`ticket update trust | hold | resume | rollback | adopt` 一律拒绝；`status`、`check` 可以。信任公钥文件在 `~/.ticketd/update/`，不在 worker 沙箱的可写范围里。命令层的拒绝只防误用（环境变量可以去掉），真正的边界是沙箱：worker 写不了 `~/.ticketd`，也就改不了信任公钥、`kv` 和 `update-state.json`。
 
+**撤回**：检查时接受了一份序号更大、版本低于待安装版本的清单（通常是指回当前版本的回滚清单），就丢掉待安装的包、记 `withdrawn`。安装时本地包和清单对不上（磁盘、并发写）只丢掉待装记录，下次检查重新下载，不拉黑；下载的临时文件按进程和线程分开。
+
 **序号和预签**：回滚清单、暂停标记、发布清单共用 `release.py` 的一个序号计数。签过回滚清单之后，早先预签、还没放出去的发布清单序号更小，客户端会按旧清单拒绝，要重新签。
 
 **没做的**（后续变更）：控制台、入网、心跳上报、按心跳对比版本来发现冻结攻击（这一期只在 `ticket doctor` 里对超过 `TICKETD_UPDATE_STALE_DAYS` 天没换过的清单标黄）。

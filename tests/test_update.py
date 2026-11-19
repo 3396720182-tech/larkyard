@@ -2,6 +2,7 @@
 对应 openspec/changes/add-signed-self-update/specs/self-update/spec.md 的各个场景。用临时密钥和 file:// 更新源，不碰网络。"""
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import tempfile
@@ -213,6 +214,56 @@ class CheckTest(UpdateBase):
         # 再查一次：同一份清单不算重放，也不重复下载
         self.assertIn("待安装", self.check())
         self.assertEqual(self.codes(), ["downloaded"])
+
+    def test_rollback_manifest_withdraws_pending_upgrade(self):
+        """已下载 0.3.1 待装，发布者签了指回 0.3.0 的回滚清单：待装的作废，不再安装 0.3.1（审查第 2 轮 R2）。"""
+        self.src.manifest("0.3.1", seq=10)
+        self.assertIn("已下载", self.check())
+        self.src.manifest("0.3.0", seq=11, kind="rollback", expires_at=updsig.iso(time.time() + 3600))
+        self.check()
+        self.assertIsNone(update.kv_json(self.con, "update.pending"))
+        self.assertFalse((update.update_dir() / "pending" / "larkyard-0.3.1.tar.gz").exists())
+        self.assertIn("withdrawn", self.codes())
+        self.assertEqual(update.max_seq(self.con), 11)
+
+    def test_concurrent_downloads_do_not_clobber(self):
+        """后台检查和手动检查同时下载同一个包：各写各的临时文件，落盘的包一定是校验过的那份（R1）。"""
+        import io
+        import threading
+        good = os.urandom(1 << 18)
+        evil = b"E" * len(good)
+        sha = hashlib.sha256(good).hexdigest()
+        dest = self.tmp / "pkg.tar.gz"
+        calls = []
+
+        class Slow(io.BytesIO):
+            def __init__(s, d, delay):
+                super().__init__(d)
+                s.delay = delay
+
+            def read(s, n=-1):
+                time.sleep(s.delay)
+                return super().read(n)
+
+        def opener(url, timeout=None):
+            calls.append(1)
+            return Slow(evil, 0.004) if len(calls) == 1 else Slow(good, 0.001)
+        results = []
+
+        def go(delay):
+            time.sleep(delay)
+            try:
+                update.download("x", dest, len(good), sha)
+                results.append("ok")
+            except ValueError:
+                results.append("bad")
+        with mock.patch.object(update.urllib.request, "urlopen", opener):
+            ts = [threading.Thread(target=go, args=(d,)) for d in (0, 0.02)]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+        self.assertEqual(sorted(results), ["bad", "ok"])
+        self.assertEqual(update.file_sha256(dest), sha)
+        self.assertEqual([p.name for p in self.tmp.glob("pkg.tar.gz.part*")], [])
 
     def test_untrusted_signature(self):
         self.src.manifest("0.3.1", seq=5, key=self.k.evil)

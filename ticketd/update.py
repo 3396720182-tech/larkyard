@@ -39,7 +39,7 @@ CODES = {
     "too_old": "需要手工升级", "blocked": "跳过已拉黑的版本", "downloaded": "已下载待安装", "installed": "已安装",
     "confirmed": "已确认", "rolled_back": "更新失败已回滚", "rollback_failed": "更新失败且切不回",
     "manual_rollback": "手工切回", "rekey": "已换钥", "rekey_invalid": "换钥清单无效", "pause_invalid": "暂停标记无效",
-    "install_failed": "安装失败",
+    "install_failed": "安装失败", "withdrawn": "待装版本被撤回",
 }
 MANIFEST_LIMIT = 64 * 1024
 PACKAGE_LIMIT = 200 * 1024 * 1024
@@ -54,6 +54,11 @@ WORKER_DENIED = ("trust", "hold", "resume", "rollback", "adopt")
 
 class UpdateError(Exception):
     pass
+
+
+class PendingDropped(UpdateError):
+    """待安装记录作废了（本地包和清单对不上、回滚清单过期、版本已拉黑）：已经丢掉，下次检查重新来过。
+    和包本身坏了不同，不拉黑这个版本。"""
 
 
 # ---------- 路径和状态 ----------
@@ -211,7 +216,8 @@ def fetch(url: str, limit: int = MANIFEST_LIMIT, timeout: float = FETCH_TIMEOUT)
 def download(url: str, dest: Path, size: int, sha256: str, timeout: float = DOWNLOAD_TIMEOUT) -> None:
     """边下边算 SHA-256；大小或摘要和清单不一致就删掉并抛 ValueError。网络失败抛 FetchError。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    part = dest.with_name(dest.name + ".part")
+    # 后台检查线程和手动的 ticket update check 可能同时下载同一个包：各写各的临时文件
+    part = dest.with_name("%s.part-%d-%d" % (dest.name, os.getpid(), threading.get_ident()))
     h, n = hashlib.sha256(), 0
     try:
         try:
@@ -437,6 +443,11 @@ def check(con, version: Optional[str] = None, now: Optional[float] = None) -> st
     metrics.kv_set(con, "update.last_ok_at", str(now))
     verdict, m = evaluate(con, data, sig, version, now)
     label = "%s（%s）" % (m["version"], m["kind"]) if m else ""
+    pend = kv_json(con, "update.pending")
+    if pend and m and verdict in ("current", "ok") and updsig.cmp_version(m["version"], pend["version"]) < 0:
+        # 发布者撤回：一份更新的清单（通常是回滚清单）指向比待装版本低的版本，待装的就不装了
+        _drop_pending(con)
+        event(con, "withdrawn", "%s 被序号 %d 的清单撤回" % (pend["version"], m["seq"]), dedupe=False)
     if verdict in ("same", "current"):
         if verdict == "current":
             _accept(con, m, data)
@@ -793,7 +804,9 @@ class Updater:
         except Exception as e:
             if sched is not None:
                 sched.update_hold = False
-            if isinstance(e, UpdateError):
+            if isinstance(e, PendingDropped):
+                pass
+            elif isinstance(e, UpdateError):
                 # 包本身的问题（签过名但解不开、版本号不符、缺入口）：重试不会好，拉黑这个版本、丢掉待安装
                 block_version(self.con, pend["version"])
                 _drop_pending(self.con)
@@ -839,10 +852,10 @@ def install(con, pend: dict, now: Optional[float] = None) -> str:
         if pend.get("kind") == "rollback" and now >= updsig.parse_iso(pend.get("expires_at")):
             event(con, "rollback_expired", "%s 的回滚清单在安装前过期了" % version)
             _drop_pending(con)
-            raise UpdateError("回滚清单已过期")
+            raise PendingDropped("回滚清单已过期")
         if version in blocked_versions(con):
             _drop_pending(con)
-            raise UpdateError("%s 已拉黑" % version)
+            raise PendingDropped("%s 已拉黑" % version)
         if not pkg.is_file() or file_sha256(pkg) != pend["sha256"]:
             event(con, "bad_hash", "%s：待安装的包和清单不一致" % version, dedupe=False)
             _drop_pending(con)
@@ -850,7 +863,8 @@ def install(con, pend: dict, now: Optional[float] = None) -> str:
                 pkg.unlink()
             except OSError:
                 pass
-            raise UpdateError("待安装的包和清单不一致")
+            # 本地问题（磁盘、并发写）：签过名的清单没问题，不拉黑，下次检查重新下载
+            raise PendingDropped("待安装的包和清单不一致")
         cur = current_version()
         unpack(pkg, version)
         start = time.time()
