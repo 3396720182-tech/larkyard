@@ -37,6 +37,10 @@
 - **WHEN** 发布者发 `0.3.0`，之后要把它从 `canary` 推进到 `stable`
 - **THEN** 只需把发版时已签好的 `stable` 清单放到更新源的 `stable` 通道，不需要再次签名
 
+#### Scenario: 中间签过回滚清单
+- **WHEN** 发版之后、推进到 `stable` 之前，发布者签过一份回滚清单并发到了 `stable` 通道
+- **THEN** 预签的 `stable` 清单序号比回滚清单小，客户端按旧清单拒绝；发版工具的说明 MUST 提示这种情况要为 `stable` 重新签一份清单
+
 ### Requirement: 用发布者本机的 Ed25519 主密钥签名
 发版工具 SHALL 用 `ssh-keygen -Y sign` 和发布者指定的 Ed25519 主私钥签名，签名命名空间固定为 `larkyard-release`，每份清单输出对应的 `.sig`。发版工具 MUST NOT 把私钥写入仓库、版本包、清单或任何日志，也 MUST NOT 提供在服务器上签名的模式。非 Ed25519 的密钥 MUST 被拒绝。
 

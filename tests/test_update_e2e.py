@@ -1,7 +1,8 @@
 """端到端：临时 HOME、file:// 替身更新源、真实的签名（scripts/release.py）、真实的守护进程进程，
 用一个模仿 launchd KeepAlive / systemd Restart=always 的小监督器反复拉起「解释器 + 版本目录外的启动器」。
 
-覆盖 tasks 6.1（正常升级）、6.4（启动就崩的版本、bin/ticketd 有语法错误的版本都自动切回并私信）。
+覆盖 tasks 6.1（正常升级）、6.3（等工单跑完再装）、6.4（启动就崩、bin/ticketd 有语法错误、活着但从不确认的版本
+都自动切回并私信）、验签失败 / 降级 / 重放旧清单被拒，以及 adopt（改写工作区 CLAUDE.md）→ 自动更新 → adopt --undo。
 慢（每个用例几十秒），默认跳过；TICKETD_E2E_UPDATE=1 时运行。"""
 from __future__ import annotations
 
@@ -106,13 +107,22 @@ class SelfUpdateE2E(unittest.TestCase):
         git(self.repo, "checkout", "-q", "HEAD~1", "--", ".")
         git(self.repo, "commit", "-qam", "back to base")
 
-    def adopt(self):
-        """不跑真的 install.sh（不碰 launchd / systemd）：直接调 adopt，服务换成下面的监督器。"""
-        code = ("import sys; sys.path.insert(0, %r); from ticketd import update; "
-                "print('\\n'.join(update.adopt('', repo=__import__('pathlib').Path(%r), run_install=lambda r, a, s=None: None)))"
-                % (str(self.repo), str(self.repo)))
+    def run_py(self, root, body):
+        """在 root 这份代码里跑一段 update 模块的调用；install.sh 换成只记录参数的替身（不碰 launchd / systemd）。"""
+        code = ("import sys, json; sys.path.insert(0, %r); from pathlib import Path; from ticketd import update\n"
+                "calls = []\n"
+                "def fake(r, a, s=None):\n"
+                "    calls.append([str(r), str(a) if a else None, s])\n"
+                "%s\n"
+                "print(json.dumps({'out': out, 'calls': calls}))\n" % (str(root), body))
         p = subprocess.run([sys.executable, "-c", code], env=self.env, capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout.strip().splitlines()[-1])
+
+    def adopt(self, workspace=""):
+        """不跑真的 install.sh：直接调 adopt，服务换成下面的监督器。"""
+        r = self.run_py(self.repo, "out = update.adopt(%r, repo=Path(%r), run_install=fake)" % (workspace, str(self.repo)))
+        self.assertEqual(r["calls"][0][:2], [str(self.th / "app" / "versions" / self.base), str(self.th / "app")])
         fp = lambda n: subprocess.run(["ssh-keygen", "-lf", str(self.keys / (n + ".pub"))], capture_output=True,
                                       text=True).stdout.split()[1]
         self.ticket("update", "trust", "--main", str(self.keys / "main.pub"), "--fingerprint", fp("main"),
@@ -260,6 +270,72 @@ class SelfUpdateE2E(unittest.TestCase):
         reports = [r[0] for r in con.execute("SELECT status FROM reports WHERE ticket_id='T0001'")]
         con.close()
         self.assertIn("ready", reports)
+
+    def test_bad_signature_downgrade_and_replay_rejected(self):
+        """验签失败、降级、重放旧清单：命令行检查报拒绝，守护进程不切换，信任和序号不受影响。"""
+        self.adopt()
+        self.supervise()
+        self.wait_for(lambda: (self.th / "heartbeat").exists(), 30, "启动")
+        chan = self.src / "channels" / "canary"
+        # 1. 正常发 9.0.1 并装上、确认
+        self.tag("9.0.1")
+        self.force_check()
+        self.wait_for(lambda: self.state().get("status") == "confirmed" and self.current() == "9.0.1", 150, "装上 9.0.1")
+        good = (chan / "manifest.json").read_bytes(), (chan / "manifest.json.sig").read_bytes()
+        # 2. 验签失败：用不受信任的私钥签一份更高的版本
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "evil", "-f", str(self.keys / "evil")],
+                       check=True)
+        self.tag("9.0.9")
+        bad = json.loads((chan / "manifest.json").read_text())
+        (chan / "manifest.json.sig").unlink()
+        subprocess.run(["ssh-keygen", "-Y", "sign", "-f", str(self.keys / "evil"), "-n", "larkyard-release",
+                        str(chan / "manifest.json")], check=True, capture_output=True)
+        self.assertIn("验签失败", self.ticket("update", "check").stdout)
+        # 3. 降级：受信任的私钥签的普通清单，指向比当前低的版本
+        self.tag("8.0.0")
+        self.assertIn("拒绝降级", self.ticket("update", "check").stdout)
+        # 4. 重放：把早先 9.0.1 那份（序号更小、签名有效）放回去
+        self.tag("9.0.5")
+        self.assertIn("已下载", self.ticket("update", "check").stdout)  # 序号推到 9.0.5 这份
+        self.wait_for(lambda: self.state().get("status") == "confirmed" and self.current() == "9.0.5", 150,
+                      "装上 9.0.5")
+        (chan / "manifest.json").write_bytes(good[0])
+        (chan / "manifest.json.sig").write_bytes(good[1])
+        self.assertIn("旧清单", self.ticket("update", "check").stdout)
+        time.sleep(5)
+        self.assertEqual(self.current(), "9.0.5")
+        self.assertNotEqual(bad["version"], self.current())
+        self.assertNotIn("9.0.9", os.listdir(str(self.th / "app" / "versions")))
+
+    def test_adopt_rewrites_workspace_survives_update_and_undo_restores(self):
+        """adopt 改写工作区 CLAUDE.md 的 ticket 路径；自动更新后主会话的 ticket 是新版本；--undo 改回原文、按原服务重装。"""
+        ws = self.tmp / "ws"
+        ws.mkdir()
+        tmpl = (self.repo / "workspace" / "CLAUDE.md.tmpl").read_text(encoding="utf-8")
+        original = tmpl.replace("@LARKYARD@", str(self.repo)) + "\n手写的一段\n"
+        (ws / "CLAUDE.md").write_text(original, encoding="utf-8")
+        self.adopt(str(ws))
+        md = (ws / "CLAUDE.md").read_text(encoding="utf-8")
+        cur_ticket = str(self.th / "app" / "current" / "bin" / "ticket")
+        self.assertIn(cur_ticket, md)
+        self.assertNotIn("%s/bin/ticket" % self.repo, md)
+        self.supervise()
+        self.wait_for(lambda: (self.th / "heartbeat").exists(), 30, "启动")
+        self.tag("9.0.1")
+        self.force_check()
+        self.wait_for(lambda: self.state().get("status") == "confirmed" and self.current() == "9.0.1", 150, "装上 9.0.1")
+        p = subprocess.run([cur_ticket, "update", "status"], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertIn("当前版本：9.0.1", p.stdout)  # 主会话按 CLAUDE.md 里的路径调用的就是新版本
+        self.assertEqual(self.state().get("workspace_md"), str(ws / "CLAUDE.md"))  # 自动更新没丢掉 adopt 的来历
+        self.sup.terminate()
+        self.sup.wait(60)
+        self.sup = None
+        r = self.run_py(self.th / "app" / "current", "out = update.undo_adopt(run_install=fake)")
+        self.assertEqual((ws / "CLAUDE.md").read_text(encoding="utf-8"), original)
+        self.assertEqual(r["calls"][-1][:2], [str(self.repo), None])  # 服务按原克隆重装
+        self.assertTrue(any("比正在运行的" in l for l in r["out"]))  # 克隆是旧版本：提示
+        self.assertFalse((self.th / "app" / "current").exists())
+        self.assertEqual(self.state().get("status"), "unadopted")
 
 
 if __name__ == "__main__":

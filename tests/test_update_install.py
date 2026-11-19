@@ -675,6 +675,23 @@ class AdoptTest(TicketdTestCase):
         self.assertEqual(seen["cmd"][1], str(self.clone / "scripts" / "install.sh"))
 
 
+class ServiceFileTest(TicketdTestCase):
+    def test_service_file_per_platform(self):
+        from ticketd import host
+        with mock.patch.object(host, "system", return_value="darwin"):
+            self.assertEqual(update.service_file("l.b"), Path.home() / "Library" / "LaunchAgents" / "l.b.plist")
+        os.environ["XDG_CONFIG_HOME"] = "/cfg"
+        with mock.patch.object(host, "system", return_value="linux"):
+            self.assertEqual(update.service_file("l.b"), Path("/cfg/systemd/user/l.b.service"))
+
+    def test_capture_service_without_service_file(self):
+        os.environ["TICKETD_LABEL"] = "dev.larkyard.ticketd.none-%d" % os.getpid()
+        os.environ["LARK_CHANNEL_PROFILE"] = "p"
+        label, env = update.capture_service()
+        self.assertEqual(label, os.environ["TICKETD_LABEL"])
+        self.assertEqual((env["TICKETD_HOME"], env["LARK_CHANNEL_PROFILE"]), (os.environ["TICKETD_HOME"], "p"))
+
+
 class DoctorWorkspaceTest(TicketdTestCase):
     def test_doctor_expects_current_link_when_managed(self):
         from ticketd import cli

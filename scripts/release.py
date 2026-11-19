@@ -17,6 +17,8 @@
 本工具不读、不复制、不记录私钥内容，也没有在服务器上签名的模式。
 序号：$LARKYARD_RELEASE_HOME（默认 ~/.larkyard-release）下的 seq 计数器 + signlog.jsonl 签名日志，每签一份加一；
 计数器比日志里用过的最大序号小（被回拨）时拒绝签名。产物默认写到 $LARKYARD_RELEASE_HOME/out。
+所有清单共用这一个序号：发版后签过回滚清单，再推进预签的通道清单时它的序号更小，客户端会按旧清单拒绝；
+publish 发现目标位置已有序号更大的清单就拒绝，这时用 release 重新签一份。
 """
 from __future__ import annotations
 
@@ -354,6 +356,16 @@ def cmd_publish(a) -> list:
         dst = to / "rekey.json"
     else:
         raise ReleaseError("不认识的类型：%r" % (kind,))
+    try:
+        live = json.loads(dst.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        live = {}
+    if kind != "pause" and isinstance(live, dict) and isinstance(live.get("seq"), int) \
+            and live["seq"] > doc.get("seq", 0):  # 暂停标记按时间窗口生效，客户端不比序号
+        # 客户端只认更大的序号：比如推进前这个通道发过回滚清单，预签的清单放上去也会被当成重放拒绝
+        hint = "用 release.py release 为这个版本重新签" if kind == "release" else "重新签一份"
+        raise ReleaseError("%s 上现在是序号 %d 的%s清单，这份是 %d：客户端会按旧清单拒绝。%s" % (
+            dst, live["seq"], live.get("kind", ""), doc.get("seq", 0), hint))
     _copy_pair(src, dst)
     return ["已发布：%s → %s" % (src, dst)]
 

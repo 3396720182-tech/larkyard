@@ -254,6 +254,23 @@ class ReleaseTest(unittest.TestCase):
         self.run_tool("unpublish-pause", "--to", str(src))
         self.assertFalse((src / "pause.json").exists())
 
+    def test_publish_refuses_presigned_manifest_older_than_live(self):
+        """发版后在 stable 上发过回滚清单：预签的 stable 清单序号更小，客户端会拒，publish 直接拦下并提示重签。"""
+        self.release()
+        self.write_version("0.3.1")
+        git(self.repo, "commit", "-qam", "bump")
+        git(self.repo, "tag", "v0.3.1")
+        self.release("v0.3.1")
+        src = self.tmp / "source"
+        code, _, err = self.run_tool("rollback", "--version", "0.3.0", "--channel", "stable", "--key", str(self.main))
+        self.assertEqual(code, 0, err)
+        rb = next((self.out / "signed" / "0.3.0").glob("rollback-stable-*.json"))
+        self.assertEqual(self.run_tool("publish", str(rb), "--to", str(src))[0], 0)
+        code, _, err = self.run_tool("publish", str(self.out / "signed" / "0.3.1" / "stable.json"), "--to", str(src))
+        self.assertNotEqual(code, 0)
+        self.assertIn("重新签", err)
+        self.assertEqual(json.loads((src / "channels" / "stable" / "manifest.json").read_text())["kind"], "rollback")
+
 
 if __name__ == "__main__":
     unittest.main()

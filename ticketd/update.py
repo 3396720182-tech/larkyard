@@ -907,7 +907,7 @@ SERVICE_KEYS = ("TICKETD_HOME", "LARK_CHANNEL_HOME", "LARK_CHANNEL_PROFILE", "TI
 
 def service_file(label: str) -> Path:
     from . import host
-    if host.platform() == "darwin":
+    if host.system() == "darwin":
         return Path.home() / "Library" / "LaunchAgents" / ("%s.plist" % label)
     xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(xdg) / "systemd" / "user" / ("%s.service" % label)
