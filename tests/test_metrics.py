@@ -526,6 +526,40 @@ class CompactTest(TicketdTestCase):
         self.assertIn("再改一下", calls[-1]["card"])
         self.assertEqual(self.core.get(self.con, tid)["ctx_tokens"], 30110)
 
+    def test_release_after_signal_before_reap_still_keeps_context(self):  # 外部复查：发信号 → 继续 → 收尾
+        os.environ["FAKE_CTX"] = "200000"
+        tid = self.new_ticket()
+        self.wait(lambda: self.idle(tid), self.sched)
+        os.environ["FAKE_COMPACT_SLEEP"] = "30"
+        self.core.send_followup(self.con, tid, "om_2", "再改一下 [[fake:ready]]")
+        self.wait(lambda: tid in self.sched.running and self.sched.running[tid].compact, self.sched)
+        self.core.hold(self.con, tid)
+        self.sched._watch(tid)  # 只发停止信号，进程还没被收尾
+        r = self.sched.running[tid]
+        self.assertIsNotNone(r.term_at)
+        del os.environ["FAKE_COMPACT_SLEEP"]
+        os.environ["FAKE_CTX"] = "30000"
+        self.core.release(self.con, tid)  # 收尾前用户就点了「继续」，工单状态已经是 idle
+        self.wait(lambda: len(self.outcomes(tid)) == 4 and self.idle(tid), self.sched)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE kind='compact_failed'").fetchone()[0], 0)
+        self.assertEqual(self.outcomes(tid), ["ready", "held", "compact", "ready"])  # 原来跳过压缩直接续做
+        calls = self.argv_log(tid)
+        self.assertTrue(calls[-2]["argv"][-1].startswith("/compact"))
+        self.assertIn("再改一下", calls[-1]["card"])
+        self.assertEqual(self.core.get(self.con, tid)["ctx_tokens"], 30110)
+
+    def test_release_after_signal_before_reap_normal_round_not_failed(self):  # 同一时序下的普通轮
+        tid = self.new_ticket("[[fake:sleep]]")
+        self.wait(lambda: tid in self.sched.running, self.sched)
+        self.core.hold(self.con, tid)
+        self.sched._watch(tid)
+        self.assertIsNotNone(self.sched.running[tid].term_at)
+        self.core.release(self.con, tid)
+        self.wait(lambda: tid not in self.sched.running or self.sched.running[tid].term_at is None, self.sched)
+        self.assertEqual(self.outcomes(tid)[0], "held")
+        self.assertFalse(any(rep["status"] == "failed" for rep in self.con.execute(
+            "SELECT status FROM reports WHERE ticket_id=?", (tid,))))  # 原来记成「未交汇报就退出」
+
     def test_failed_compaction_still_runs_the_round(self):
         os.environ["FAKE_CTX"] = "200000"
         tid = self.new_ticket()

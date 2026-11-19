@@ -128,6 +128,9 @@ class Running:
         self.tail = worker.StreamTail(Path(workdir) / ".stream.jsonl", stream_offset)
         self.started = time.monotonic()
         self.term_at: Optional[float] = None
+        # 发停止信号时记下的用户打断原因（held / stopped）。收尾时工单状态可能已经被「继续」改回 idle，
+        # 只看收尾时的状态会把这次打断当成普通失败（外部复查：发信号 → 继续 → 收尾）
+        self.user_halt: Optional[str] = None
         self.timed_out = False
         self.last_text = ""
         self.result: Optional[dict] = None
@@ -155,6 +158,13 @@ class Running:
         self.started_wall = db.now()               # 这一轮（含压缩轮）真实的开始时刻，rounds 表用
         self.compact = False                       # 这是一轮会话压缩（不投递输入、不要求汇报）
         self.compacted = False                     # 看到了 compact_boundary
+
+
+def _halted(r: "Running", t) -> Optional[str]:
+    """这一轮是不是被用户暂停 / 停止打断的：优先用发信号时记下的原因，没发过信号再看工单当前状态。"""
+    if r.user_halt:
+        return r.user_halt
+    return t["state"] if t["state"] in ("held", "stopped") else None
 
 
 class AdoptedProc:
@@ -785,6 +795,7 @@ class Scheduler:
             if state == "running":
                 self._while_running(r, t)
             if r.term_at is None and state in ("stopped", "held"):
+                r.user_halt = state
                 self._terminate(r, "用户停止" if state == "stopped" else "用户暂停")
             elif r.term_at is None and time.monotonic() - r.started > config.turn_timeout():
                 r.timed_out = True
@@ -809,12 +820,15 @@ class Scheduler:
         try:
             self._settle(r)
             t = core.get(self.con, tid)
-            if r.compact and t["state"] in ("held", "stopped"):
-                outcome = t["state"]  # 被用户打断的压缩不算压缩失败（不进压缩统计）
+            halt = _halted(r, t)
+            if r.compact and halt:
+                outcome = halt  # 被用户打断的压缩不算压缩失败（不进压缩统计）
             elif r.compact:
                 outcome = "compact" if r.compacted else "compact_failed"
             else:
                 outcome = metrics.round_outcome(self.con, t)
+                if halt and outcome == t["state"]:  # 没有汇报：按打断原因记，不记成收尾时已恢复的 idle
+                    outcome = halt
                 if r.ctx_max:
                     core.touch(self.con, tid, ctx_tokens=r.ctx_max)
             metrics.add_round(self.con, t, r.round_cost, outcome, r.ctx_max, started=r.started_wall)
@@ -843,11 +857,13 @@ class Scheduler:
             return
         core.touch(self.con, tid, pid=None, bg_wait=None)
         t = core.get(self.con, tid)
-        if t["state"] in ("held", "stopped"):
+        halt = _halted(r, t)
+        if halt:
             # 用户暂停 / 停止打断了压缩：会话没有变短，保留 ctx_tokens，放开后由 start 重新判断、先压缩。
-            # 原来落到下面的「确定性失败」分支清零，放开后直接拿大上下文跑普通轮（外部评测 P2）。不算压缩失败
+            # 原来落到下面的「确定性失败」分支清零，放开后直接拿大上下文跑普通轮（外部评测 P2）。不算压缩失败。
+            # 用发信号时记下的原因判断：信号发出后、收尾前用户已经点了「继续」，工单状态已是 idle
             self.log(r.workdir, "会话压缩被用户%s打断，保留上下文规模，恢复后重新判断是否压缩" % (
-                "暂停" if t["state"] == "held" else "停止"))
+                "暂停" if halt == "held" else "停止"))
             return
         stderr_text = _read_from(Path(r.workdir) / ".stderr.log", r.stderr_offset)
         acct = worker.account_error(err, r.last_text, stderr_text)
@@ -876,11 +892,12 @@ class Scheduler:
         self.con.execute("DELETE FROM locks WHERE ticket_id=?", (tid,))
         core.touch(self.con, tid, pid=None, bg_wait=None)  # 进程已退出；下面的状态迁移即使因停止/暂停而落空，pid 也要清掉
         t = core.get(self.con, tid)
-        if t["state"] != "stopped":
+        halt = _halted(r, t)  # 同一个时序也会让普通轮在「继续」之后被当成「未交汇报就退出」
+        if halt != "stopped":
             self._ingest_round(r, t["workdir"])
         code = r.proc.returncode
         self.log(r.workdir, "进程退出 code=%s" % code)
-        if t["state"] in ("stopped", "held"):
+        if halt:
             core.touch(self.con, tid, pid=None)
             return
         if r.stall_aborted:
