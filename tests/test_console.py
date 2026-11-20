@@ -785,6 +785,8 @@ class HeartbeatTest(ConsoleBase):
         for status, c, stops in ((401, "DeviceLeft", True), (401, "DeviceUnknown", True),
                                  (403, "DeviceRevoked", False), (401, "RateLimited", False)):
             self.con.execute("DELETE FROM kv WHERE key LIKE 'console.%'")
+            if console.stopped_path().exists():
+                console.stopped_path().unlink()
             self.fake.routes[("POST", "/api/v1/heartbeat")] = err(c, status)
             self.assertEqual(console.send_heartbeat(self.con)["stopped"], stops, (status, c))
 
@@ -933,14 +935,15 @@ class UpdateSourceTest(ConsoleBase):
         self.fake.routes[("GET", "/api/v1/updates/channels/stable/manifest.json")] = (200, b"x" * (70 * 1024))
         with self.assertRaises(update.FetchError):
             update.fetch(base + "/channels/stable/manifest.json")
-        self.fake.routes[("GET", "/api/v1/updates/channels/stable/manifest.json")] = err("DeviceRevoked", 401)
-        with self.assertRaises(update.FetchError):
-            update.fetch(base + "/channels/stable/manifest.json")
         self.fake.routes[("GET", "/api/v1/updates/x.json")] = ssl.SSLCertVerificationError(1, "bad")
         with mock.patch.object(console, "ca_problem", return_value=None):
             with self.assertRaises(update.FetchError) as cm:
                 update.fetch(base + "/x.json")
         self.assertIn("证书校验失败", str(cm.exception))
+        self.fake.routes[("GET", "/api/v1/updates/channels/stable/manifest.json")] = err("DeviceRevoked", 401)
+        with self.assertRaises(update.FetchError):
+            update.fetch(base + "/channels/stable/manifest.json")
+        self.assertIsNone(console.updates_base())  # 被吊销：之后不再经控制台更新
 
     def test_download_via_console(self):
         import hashlib
@@ -1064,6 +1067,92 @@ class ReviewFixesTest(ConsoleBase):
             with self.assertRaises(OSError):
                 ORIGINAL_OPEN("GET", URL + "/x", {}, None, 1.0)
         self.assertLess(time.monotonic() - start, 3.0)
+
+    def test_deadline_covers_slow_dns(self):
+        """getaddrinfo 没有超时：解析也要算进总时限。"""
+        def slow(*a, **k):
+            time.sleep(3)
+            raise OSError("late")
+        start = time.monotonic()
+        with mock.patch("socket.getaddrinfo", slow):
+            with self.assertRaises(OSError):
+                ORIGINAL_OPEN("GET", URL + "/x", {}, None, 0.5)
+        self.assertLess(time.monotonic() - start, 1.5)
+
+    def test_deadline_covers_every_address(self):
+        """解析出多个地址时，逐个连接合起来也不超过总时限（不是每个地址各给一次完整时限）。"""
+        import socket as socket_mod
+        tried = []
+
+        class SlowSock:
+            def __init__(self, *a):
+                self.t = None
+
+            def settimeout(self, t):
+                self.t = t
+
+            def connect(self, addr):
+                tried.append(addr)
+                time.sleep(min(self.t, 0.4))
+                raise socket_mod.timeout("slow")
+
+            def close(self):
+                pass
+        addrs = [(socket_mod.AF_INET, socket_mod.SOCK_STREAM, 6, "", ("192.0.2.%d" % i, 443)) for i in range(1, 6)]
+        start = time.monotonic()
+        with mock.patch.object(console, "_resolve", lambda h, p, t: addrs), \
+                mock.patch("socket.socket", SlowSock):
+            with self.assertRaises(OSError):
+                console._connect("console.example.com", 443, 1.0)
+        self.assertLess(time.monotonic() - start, 1.4)
+        self.assertLess(len(tried), 5)
+
+    def test_slow_connect_leaves_no_time_for_request(self):
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+
+        def slow_connect(h, p, t):
+            time.sleep(t + 0.1)
+            return a
+        with mock.patch.object(console, "_connect", slow_connect):
+            with self.assertRaises(OSError):
+                ORIGINAL_OPEN("GET", URL + "/x", {}, None, 0.3)
+        b.settimeout(0.1)
+        try:
+            data = b.recv(1)
+        except OSError:
+            data = b""
+        self.assertEqual(data, b"")  # 没有写出任何请求内容
+
+    def test_lost_confirm_response_tells_user_to_get_device_revoked(self):
+        """确认请求发出后没收到回应、重试得到 EnrollExpired：控制台可能已经登记了设备，要提示找管理员吊销。"""
+        self.fake.routes[("POST", "/api/v1/enroll/confirm")] = [ConnectionError("reset"), err("EnrollExpired")]
+        with self.assertRaises(ValueError) as cm:
+            self.enroll(answers=("yes", "123456", "123456"))
+        self.assertIn("吊销", str(cm.exception))
+        self.assertIn("test-host", str(cm.exception))
+        self.nothing_written()
+
+    def test_update_401_stops_token_use_everywhere(self):
+        """自动更新先发现被吊销：之后的更新和心跳都不再带令牌请求控制台。"""
+        from ticketd import update
+        self.enrolled_state()
+        self.fake.routes[("GET", "/api/v1/updates/stable/manifest.json")] = err("DeviceRevoked", 401)
+        with self.assertRaises(Exception):
+            update.fetch(console.updates_base() + "/stable/manifest.json")
+        self.assertIsNone(console.updates_base())
+        before = len(self.fake.calls)
+        res = console.send_heartbeat(self.con)
+        self.assertEqual((res["sent"], res["stopped"], res["code"]), (False, True, "DeviceRevoked"))
+        self.assertEqual(len(self.fake.calls), before)
+
+    def test_reenroll_clears_stale_stopped_marker(self):
+        self.enrolled_state()
+        console.stopped_path().write_text("DeviceRevoked\n")
+        self.enrolled_state()  # 重新入网写入新令牌
+        self.assertFalse(console.stopped_path().exists())
+        self.assertIsNotNone(console.updates_base())
 
     def test_tls_minimum_12(self):
         self.assertEqual(console._ssl_context().minimum_version, ssl.TLSVersion.TLSv1_2)

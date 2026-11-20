@@ -183,6 +183,10 @@ def save(info: dict, token: str) -> None:
     d = console_dir()
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(str(d), 0o700)
+    try:
+        stopped_path().unlink()  # 上一次入网留下的「已停止」标记（只手动删了令牌和 console.json 时会剩下）
+    except FileNotFoundError:
+        pass
     _write_private(token_path(), (token + "\n").encode("ascii"))
     _write_private(info_path(), (json.dumps(info, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
 
@@ -219,9 +223,43 @@ def _ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def _resolve(host_: str, port: int, timeout: float) -> list:
+    """域名解析也算进总时限：getaddrinfo 本身没有超时，放到后台线程里等。"""
+    box = {}
+
+    def run():
+        try:
+            box["ok"] = socket.getaddrinfo(host_, port, 0, socket.SOCK_STREAM)
+        except OSError as e:
+            box["err"] = e
+    t = threading.Thread(target=run, name="console-resolve", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise socket.timeout("解析域名超过 %d 秒" % timeout)
+    if "err" in box:
+        raise box["err"]
+    return box["ok"]
+
+
 def _connect(host_: str, port: int, timeout: float) -> socket.socket:
-    """TCP 连接（单测在这里换成假 socket）。"""
-    return socket.create_connection((host_, port), timeout=timeout)
+    """TCP 连接（单测在这里换成假 socket）。解析和逐个地址连接合起来不超过 timeout。"""
+    deadline = time.monotonic() + timeout
+    last: Optional[OSError] = None
+    for family, type_, proto, _, addr in _resolve(host_, port, timeout):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        s = socket.socket(family, type_, proto)
+        try:
+            s.settimeout(left)
+            s.connect(addr)
+            s.settimeout(timeout)
+            return s
+        except OSError as e:
+            last = e
+            s.close()
+    raise last or socket.timeout("连接超过 %d 秒" % timeout)
 
 
 _limits = threading.local()  # 本线程这次请求最多读多少字节（_open 的默认实现用；请求方另外再查一遍）
@@ -241,9 +279,13 @@ def _open(method: str, url: str, headers: dict, body, timeout: float) -> tuple:
     path = (u.path or "/") + ("?" + u.query if u.query else "")
     deadline = time.monotonic() + timeout
     ctx = _ssl_context()
-    raw = _connect(hostname, port, timeout)
+    raw = _connect(hostname, port, timeout)  # 解析和连接也在总时限里
     # 整个请求的总时限：socket 的超时只管单次读写，控制台每隔几秒挤一个字节就能一直拖着；到点直接断开连接
     cur = {"sock": raw, "late": False}
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raw.close()
+        raise socket.timeout("整个请求超过 %d 秒" % timeout)
 
     def _expire():
         cur["late"] = True
@@ -251,7 +293,7 @@ def _open(method: str, url: str, headers: dict, body, timeout: float) -> tuple:
             socket.socket.shutdown(cur["sock"], socket.SHUT_RDWR)
         except (OSError, TypeError, ValueError):
             pass
-    timer = threading.Timer(timeout, _expire)
+    timer = threading.Timer(left, _expire)
     timer.daemon = True
     timer.start()
     try:
@@ -395,7 +437,14 @@ def fetch_raw(url: str, limit: int, timeout: float) -> Optional[bytes]:
     if status == 404:
         return None
     if not 200 <= status < 300:
-        raise _error_of(status, raw[:BODY_LIMIT])
+        e = _error_of(status, raw[:BODY_LIMIT])
+        if status == 401 and e.code in STOP_CODES and enrolled():
+            # 更新请求先发现被吊销：立刻停止用这个令牌（心跳下一轮看到标记也不再发）
+            try:
+                _write_private(stopped_path(), (e.code + "\n").encode("ascii"))
+            except OSError:
+                pass
+        raise e
     return raw
 
 
@@ -543,6 +592,7 @@ def enroll(con, url: str, code: str, release_fp: str, backup_fp: str, hostname: 
         % (_safe_text(st.get("person_hint"), 20) or "（未知）", _safe_text(st.get("marker"), 8) or "（未知）"))
     deadline = time.monotonic() + ttl
     res = None
+    unanswered = False  # 有一次确认请求发出去了却没收到回应：控制台可能已经登记了设备
     while res is None:
         if time.monotonic() > deadline:
             raise ValueError("确认码已过期：请重新执行 ticket enroll。本机没有写入任何东西")
@@ -557,8 +607,13 @@ def enroll(con, url: str, code: str, release_fp: str, backup_fp: str, hostname: 
                 out(HINTS["ConfirmWrong"])
                 continue
             if e.code in ("Network", "Unavailable", "RateLimited"):
+                unanswered = unanswered or e.code != "RateLimited"
                 out("%s；可以重新输入确认码再试" % e.text())
                 continue
+            if unanswered:
+                raise ValueError("入网失败：%s。本机没有写入任何东西；但之前有一次确认请求没收到回应，控制台可能已经登记了"
+                                 "这台设备（主机名 %s）。请告诉管理员在控制台吊销它，再重新入网"
+                                 % (e.text(), _safe_text(body.get("hostname"), 64)))
             raise ValueError("入网失败：%s。本机没有写入任何东西" % e.text())
     device_id, token = res.get("device_id"), res.get("device_token")
     if not isinstance(device_id, str) or not DEVICE_ID_RE.match(device_id) or \
@@ -722,6 +777,15 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
     st = state(con)
     if st.startswith("stopped:"):
         return {"sent": False, "ok": False, "code": st.split(":", 1)[1], "next_in": None, "stopped": True}
+    if stopped_path().exists():  # 自动更新请求已经发现被吊销 / 退出：不再带令牌请求
+        try:
+            code = stopped_path().read_text("ascii").strip()
+        except (OSError, UnicodeDecodeError):
+            code = ""
+        code = code if code in STOP_CODES else "DeviceRevoked"
+        metrics.kv_set(con, "console.state", "stopped:" + code)
+        _event(con, "stopped", "%s，停止上报" % HINTS[code])
+        return {"sent": False, "ok": False, "code": code, "next_in": None, "stopped": True}
     try:
         token = read_token()
         payload = build_heartbeat(con, now)
