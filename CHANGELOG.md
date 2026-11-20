@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — 未发布
+## 0.3.0 — 2026-11-21
 
 - 一行安装、bridge 随包发布（`openspec/changes/vendor-bridge-one-line-install/`，规格见 `docs/spec.md` §13）：
   - `curl -fsSL <发布地址>/install.sh | sh`：按 `install.sh` 里写死的两把发版公钥指纹核对公钥、验签通道清单、核对包，装成受管安装（第一天就能自动更新），下载 Node 和 lark-cli 官方包到 `~/.ticketd`（按 `vendor/runtime.json` 核对 SHA-256），然后进入新的 `ticket setup` 向导：扫码建飞书应用、工作区、bridge / ticketd 服务和每天 04:07 的 bridge 重启窗口、用 bot 身份查应用所有者自动认主人（不对就发 6 位码）、可选的用户身份授权、自检。内部员工的命令多带 `--console <地址> --enroll <入网码>`，装完接着入网，不用手抄指纹。原来「先 npm 装 bridge、clone、install.sh、抄 open_id、setup-workspace」的步骤不再需要（从 clone 安装仍可用）。
