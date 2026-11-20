@@ -9,7 +9,7 @@ import time
 import traceback
 from typing import Optional
 
-from . import card, config, db, metrics, outbox, telemetry, update
+from . import card, config, console, db, metrics, outbox, telemetry, update
 from .scheduler import Scheduler
 
 ALERT_INTERVAL = 600.0
@@ -285,6 +285,7 @@ def main(argv=None) -> int:
     throttle = _ErrorThrottle()
     media = MediaLane()
     updater = update.Updater(con)  # 没配置更新源时不发请求；切回后的私信、试用期确认在这里
+    beat = console.Heartbeat()  # 没入网时只看一眼 ~/.ticketd/console/，不发请求；入网后每 5 分钟在后台线程报一次
     print("ticketd started", flush=True)
     code = 0
     while not stop["flag"]:
@@ -295,6 +296,7 @@ def main(argv=None) -> int:
         _guarded(throttle, "flush", lambda: outbox.flush(con, lane=outbox.LANE_FAST))
         _guarded(throttle, "digest", lambda: metrics.maybe_digest(con))
         _guarded(throttle, "telemetry", lambda: telemetry.maybe_send(con))  # 默认关闭；开启后每天一份，发送在单独线程
+        _guarded(throttle, "console", beat.tick)
         _beat()
         restart = {"go": False}
 

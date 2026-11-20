@@ -34,3 +34,25 @@ def lark_cli_data_dir() -> str:
 def shared_tmp() -> str:
     """/tmp 的真实路径：macOS 上 /tmp 是 /private/tmp 的软链，沙箱规则要写真实路径。"""
     return "/tmp" if is_linux() else "/private/tmp"
+
+
+def os_info() -> dict:
+    """系统名称、版本和架构（控制台入网和心跳用，原样上报前由 console 按字符集规整）。
+    macOS：("macOS", mac_ver)；Linux：/etc/os-release 的 NAME / VERSION_ID（读不到为 "Linux" 和内核版本）。"""
+    import platform
+    if system() == "darwin":
+        return {"name": "macOS", "version": platform.mac_ver()[0] or platform.release(), "arch": platform.machine()}
+    if is_linux():
+        name, version = "Linux", platform.release()
+        try:
+            rel = {}
+            for line in Path("/etc/os-release").read_text(encoding="utf-8", errors="replace").splitlines():
+                k, sep, v = line.partition("=")
+                if sep:
+                    rel[k.strip()] = v.strip().strip("\"'")
+            name = rel.get("NAME") or name
+            version = rel.get("VERSION_ID") or version
+        except OSError:
+            pass
+        return {"name": name, "version": version, "arch": platform.machine()}
+    return {"name": system(), "version": platform.release(), "arch": platform.machine()}

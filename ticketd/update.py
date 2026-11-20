@@ -224,9 +224,25 @@ def event(con, code: str, detail: str = "", dedupe: bool = True) -> None:
 
 
 # ---------- 启用条件 ----------
-def disabled_reasons(repo: Optional[Path] = None, probe: bool = True) -> list:
-    """空列表 = 启用。第一条没满足时（没配地址）就不看后面的，开源默认安装什么都不做。"""
+def source() -> tuple:
+    """(更新源, 是否经控制台)。本机配置了 TICKETD_UPDATE_URL 时以它为准；没配、但入网了控制台时是控制台上的
+    更新源（经 console 的连接、带设备令牌）；都没有为 ("", False)。"""
     url = config.update_url()
+    if url:
+        return url, False
+    from . import console
+    base = console.updates_base()
+    return (base, True) if base else ("", False)
+
+
+def _via_console(url: str) -> bool:
+    base, via = source()
+    return via and url.startswith(base.rstrip("/") + "/")
+
+
+def disabled_reasons(repo: Optional[Path] = None, probe: bool = True) -> list:
+    """空列表 = 启用。第一条没满足时（没配地址、也没入网控制台）就不看后面的，开源默认安装什么都不做。"""
+    url = source()[0]
     if not url:
         return ["没有配置更新源（TICKETD_UPDATE_URL）"]
     why = []
@@ -272,6 +288,8 @@ def fetch(url: str, limit: int = MANIFEST_LIMIT, timeout: float = FETCH_TIMEOUT)
     scheme = urllib.parse.urlparse(url).scheme
     if scheme not in ("file", "https"):
         raise FetchError("不支持的地址：%s" % scheme)
+    if _via_console(url):
+        return _console_fetch(url, limit, timeout)
     try:
         with _open(url, timeout) as r:
             data = r.read(limit + 1)
@@ -290,6 +308,18 @@ def fetch(url: str, limit: int = MANIFEST_LIMIT, timeout: float = FETCH_TIMEOUT)
     return data
 
 
+def _console_fetch(url: str, limit: int, timeout: float) -> Optional[bytes]:
+    """入网后经控制台取：同一个连接函数、同一套证书校验、带设备令牌。404 返回 None。"""
+    from . import console
+    try:
+        data = console.fetch_raw(url, limit, timeout)
+    except console.ConsoleError as e:
+        raise FetchError(e.text()[:200])
+    if data is not None and len(data) > limit:
+        raise FetchError("文件超过 %d 字节" % limit)
+    return data
+
+
 def download(url: str, dest: Path, size: int, sha256: str, timeout: float = DOWNLOAD_TIMEOUT) -> None:
     """边下边算 SHA-256；大小或摘要和清单不一致就删掉并抛 ValueError。网络失败抛 FetchError。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -298,7 +328,17 @@ def download(url: str, dest: Path, size: int, sha256: str, timeout: float = DOWN
     h, n = hashlib.sha256(), 0
     try:
         try:
-            r = _open(url, timeout)
+            if _via_console(url):
+                from . import console
+                try:
+                    data = console.fetch_raw(url, size, timeout)
+                except console.ConsoleError as e:
+                    raise FetchError("下载包失败：%s" % e.text()[:200])
+                if data is None:
+                    raise FetchError("下载包 HTTP 404")
+                r = io.BytesIO(data)
+            else:
+                r = _open(url, timeout)
         except urllib.error.HTTPError as e:
             raise FetchError("下载包 HTTP %d" % e.code)
         except urllib.error.URLError as e:
@@ -530,7 +570,7 @@ def check(con, version: Optional[str] = None, now: Optional[float] = None) -> st
     """检查一次。返回一行给人看的结论。调用方保证已启用（disabled_reasons 为空）。"""
     now = time.time() if now is None else now
     version = version or __version__
-    base = config.update_url().rstrip("/")
+    base = source()[0].rstrip("/")
     metrics.kv_set(con, "update.last_check_at", str(now))
     try:
         _check_rekey(con, base, now)
@@ -1407,7 +1447,7 @@ def status_lines(con, now: Optional[float] = None) -> list:
     elif not updsig.verify_available():
         lines.insert(0, "自动更新：未启用（系统的 ssh-keygen 不支持 -Y verify，需要 OpenSSH ≥ 8.1）")
     else:
-        lines.insert(0, "自动更新：已启用（%s）" % config.update_url())
+        lines.insert(0, "自动更新：已启用（%s）" % source()[0])
     st = read_state()
     if st.get("status") == "probation":
         lines.append("试用期：%s → %s，%s 前要通过自检" % (st.get("from"), st.get("to"), _ts(st.get("deadline"))))
@@ -1446,8 +1486,12 @@ def doctor_line(con, now: Optional[float] = None) -> str:
     """ticket doctor 的更新一项：未启用 / 正常 / 清单过期 / 验签工具不可用。"""
     now = time.time() if now is None else now
     why = disabled_reasons(probe=False)
-    if why and not config.update_url():
+    url, via = source()
+    if why and not url:
         return "ℹ️ 自动更新：未启用（默认关闭；%s）" % why[0]
+    if why and via:
+        # 更新源是入网时自动带上的控制台，不是本人配的：没转受管安装不算问题
+        return "ℹ️ 自动更新：未启用：%s（更新源是控制台）" % "；".join(why)
     if not updsig.verify_available():
         return "❌ 自动更新：系统的 ssh-keygen 不支持 -Y verify（需要 OpenSSH ≥ 8.1），不能启用"
     if why:

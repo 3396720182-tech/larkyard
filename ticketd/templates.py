@@ -223,6 +223,23 @@ def details_panel(rest: str, files: List[str], workdir: Optional[str]) -> dict:
             "elements": els}
 
 
+def with_badge(card: dict, badge: Optional[str]) -> dict:
+    """入网控制台的机器：结果卡收起的详情里加一行内部版标识（console.badge）；没有收起的详情面板时，
+    在页脚（最后一行）之前新建一个只有这一行的收起面板。badge 为空（没入网）时原样返回。"""
+    if not badge:
+        return card
+    els = card["body"]["elements"]
+    for e in els:
+        if e.get("tag") == "collapsible_panel" and not e.get("expanded"):
+            e["elements"].append(note(badge))
+            return card
+    els.insert(max(len(els) - 1, 0), {
+        "tag": "collapsible_panel", "expanded": False, "vertical_spacing": "4px",
+        "header": {"title": {"tag": "plain_text", "content": "详情", "text_size": "notation", "text_color": "grey"}},
+        "elements": [note(badge)]})
+    return card
+
+
 def run_elements(run: dict) -> list:
     """沙箱外执行申请：完整脚本（worker 写的，plain_text）放在默认展开的面板里，用户看过再批准。"""
     head = "🖥️ 申请在沙箱外执行（R%s · %s）" % (run["id"], short(run["path"], 60))

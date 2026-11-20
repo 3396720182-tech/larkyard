@@ -89,6 +89,15 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--backup-fingerprint", help="trust：备份公钥的 SHA256 指纹")
     up.add_argument("--days", type=int, help="hold：暂停几天（1～7，默认 7）")
     up.add_argument("--undo", action="store_true", help="adopt：退回原来的就地运行")
+    en = sub.add_parser("enroll", help="接入控制台（只由本人在终端执行）；--leave 退出。见 docs/spec.md §12")
+    en.add_argument("url", nargs="?", help="控制台地址（https://）")
+    en.add_argument("code", nargs="?", help="入网码（LY-XXXX-XXXX-XXXX，管理员给你）")
+    en.add_argument("--release-key", help="主发版公钥的指纹 SHA256:…（管理员在控制台以外给你）")
+    en.add_argument("--backup-key", help="备份发版公钥的指纹 SHA256:…")
+    en.add_argument("--hostname", help="上报的主机名（默认本机主机名，只保留字母、数字和 . _ -）")
+    en.add_argument("--leave", action="store_true", help="退出控制台：通知控制台并删除本机的设备令牌和控制台配置")
+    cs = sub.add_parser("console", help="控制台接入（只读）：status / show（下一次心跳的完整内容）")
+    cs.add_argument("action", nargs="?", default="status", choices=("status", "show"))
     return p
 
 
@@ -306,56 +315,70 @@ def _status_lines(con, t) -> list:
     return out
 
 
-def cmd_doctor(con, a) -> str:
+# ticket doctor 每一项的稳定英文 id（控制台心跳的 doctor.failed 用它，改名要同步控制台；格式 ^[a-z0-9_.-]{1,40}$）
+DOCTOR_IDS = ("config", "config.unknown", "workspace", "costs", "owner", "daemon", "dm", "update", "telemetry",
+              "console")
+
+
+def doctor_checks(con, dm: bool = False) -> list:
     """守护进程由 launchd / systemd 启动，只读 config.env；ticket 命令在 Claude Code 会话里跑，会先读环境变量
     （如 ~/.claude/settings.json 的 env）。两边不一致时，派单正常但守护进程的私信、执行会用错的值（2026-11-09 实例：
-    TICKETD_OWNER 在 config.env 里是迁移带来的旧 open_id，周报私信报 open_id cross app）。"""
-    lines, bad = [], 0
+    TICKETD_OWNER 在 config.env 里是迁移带来的旧 open_id，周报私信报 open_id cross app）。
+    返回 [(检查项 id, 给人看的一行)]；一行以 ❌ 开头算不通过。ticket doctor 和控制台心跳共用。"""
+    lines = []
     names = sorted(set(k for k in os.environ if k.startswith("TICKETD_")) | set(
         k for k in config._file_values() if k.startswith("TICKETD_")))
     for k in names:
         env, file = os.environ.get(k), config.file_value(k)
-        if env is not None and file is not None and env != file:
-            bad += 1
-            lines.append("❌ %s：当前环境和 config.env 不一致（守护进程用 config.env 里的）" % k)
+        if k.startswith("TICKETD_CONSOLE"):
+            # 控制台地址只能由 ticket enroll 写进 ~/.ticketd/console/，没有对应的配置项
+            lines.append(("config.unknown", "⚠️ %s：没有这个配置项，不起作用（控制台只能用 ticket enroll 接入）" % k))
+        elif env is not None and file is not None and env != file:
+            lines.append(("config", "❌ %s：当前环境和 config.env 不一致（守护进程用 config.env 里的）" % k))
         elif env is not None and file is None and k not in ("TICKETD_HOME", "TICKETD_SPOOL", "TICKETD_TICKET",
                                                               "TICKETD_RUN", "TICKETD_PYTHON"):
-            lines.append("⚠️ %s：只在当前环境里有，config.env 没有，守护进程看不到" % k)
-    lines += _workspace_drift()
+            lines.append(("config", "⚠️ %s：只在当前环境里有，config.env 没有，守护进程看不到" % k))
+    lines += [("workspace", x) for x in _workspace_drift()]
     checked, mismatched = metrics.reconcile_costs(con)
     if mismatched:
-        lines.append("❌ 成本账目有 %d 张单和原始记录对不上：%s" % (len(mismatched), "，".join(
-            "%s 库里 $%.2f / 重算 $%.2f" % m for m in mismatched[:5])))
+        lines.append(("costs", "❌ 成本账目有 %d 张单和原始记录对不上：%s" % (len(mismatched), "，".join(
+            "%s 库里 $%.2f / 重算 $%.2f" % m for m in mismatched[:5]))))
     elif checked:
-        lines.append("✅ 成本账目和原始记录一致（核对了 %d 张单）" % checked)
+        lines.append(("costs", "✅ 成本账目和原始记录一致（核对了 %d 张单）" % checked))
     owner = config.file_value("TICKETD_OWNER") or ""
     if not owner.startswith("ou_"):
-        bad += 1
-        lines.append("❌ config.env 里没有有效的 TICKETD_OWNER（ou_ 开头）：只为主用户派单、私信告警都会失败")
+        lines.append(("owner", "❌ config.env 里没有有效的 TICKETD_OWNER（ou_ 开头）：只为主用户派单、私信告警都会失败"))
     try:
         age = time.time() - config.heartbeat_path().stat().st_mtime
         if age > 60:
-            bad += 1
-            lines.append("❌ 守护进程心跳 %d 秒前，可能没在运行" % age)
+            lines.append(("daemon", "❌ 守护进程心跳 %d 秒前，可能没在运行" % age))
         else:
-            lines.append("✅ 守护进程在运行（心跳 %d 秒前）" % age)
+            lines.append(("daemon", "✅ 守护进程在运行（心跳 %d 秒前）" % age))
     except OSError:
-        bad += 1
-        lines.append("❌ 没有守护进程心跳文件，服务可能没装或没启动")
-    if getattr(a, "dm", False):
+        lines.append(("daemon", "❌ 没有守护进程心跳文件，服务可能没装或没启动"))
+    if dm:
         ok, note = _doctor_dm(con)
-        bad += not ok
-        lines.append(("✅ " if ok else "❌ ") + note)
+        lines.append(("dm", ("✅ " if ok else "❌ ") + note))
     try:
         from . import update
-        lines.append(update.doctor_line(con))
+        lines.append(("update", update.doctor_line(con)))
     except Exception as e:
-        lines.append("⚠️ 自动更新状态读不出来：%r" % (e,))
+        lines.append(("update", "⚠️ 自动更新状态读不出来：%r" % (e,)))
     try:
         from . import telemetry
-        lines.append("ℹ️ " + telemetry.status_lines(con)[0])
+        lines.append(("telemetry", "ℹ️ " + telemetry.status_lines(con)[0]))
     except Exception as e:
-        lines.append("⚠️ 匿名统计状态读不出来：%r" % (e,))
+        lines.append(("telemetry", "⚠️ 匿名统计状态读不出来：%r" % (e,)))
+    try:
+        from . import console
+        lines.append(("console", console.doctor_line(con)))
+    except Exception as e:
+        lines.append(("console", "⚠️ 控制台状态读不出来：%r" % (e,)))
+    return lines
+
+
+def cmd_doctor(con, a) -> str:
+    lines = [line for _, line in doctor_checks(con, dm=getattr(a, "dm", False))]
     bad = sum(1 for line in lines if line.startswith("❌"))
     lines.insert(0, "配置自检：%s" % ("没有发现问题" if not bad else "%d 个问题" % bad))
     return "\n".join(lines)
@@ -425,6 +448,25 @@ def cmd_update(con, a) -> str:
         raise core.TicketError(str(e))
 
 
+def cmd_enroll(con, a) -> str:
+    from . import console
+    try:
+        if a.leave:
+            if a.url or a.code or a.release_key or a.backup_key or a.hostname:
+                raise core.TicketError("--leave 不带其他参数")
+            return "\n".join(console.leave(con))
+        return "\n".join(console.enroll(con, a.url, a.code, a.release_key, a.backup_key, hostname=a.hostname))
+    except (PermissionError, ValueError, console.ConsoleError) as e:
+        raise core.TicketError(e.text() if isinstance(e, console.ConsoleError) else str(e))
+    except (KeyboardInterrupt, EOFError):
+        raise core.TicketError("已取消")
+
+
+def cmd_console(con, a) -> str:
+    from . import console
+    return console.command_console(con, a.action)
+
+
 def cmd_stats(con, a) -> str:
     out = []
     if a.backfill:
@@ -474,7 +516,7 @@ COMMANDS = {
     "new": cmd_new, "send": cmd_send, "lookup": cmd_lookup, "report": cmd_report,
     "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "restart": cmd_restart, "approve": cmd_approve, "grant": cmd_grant,
     "ls": cmd_ls, "show": cmd_show, "stats": cmd_stats, "doctor": cmd_doctor,
-    "telemetry": cmd_telemetry, "update": cmd_update,
+    "telemetry": cmd_telemetry, "update": cmd_update, "enroll": cmd_enroll, "console": cmd_console,
 }
 
 

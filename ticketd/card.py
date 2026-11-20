@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from . import config, core, db, outbox, templates
+from . import config, console, core, db, outbox, templates
 from .templates import dur, hm, ago, note, short, text, hr
 
 CARD_GIVEUP = 24 * 3600.0
@@ -95,6 +95,7 @@ def view(con, t, now: float) -> dict:
         "phases": core.phases(con, tid, since) if started else [],
         "last_step": t["last_step"], "last_action_at": last_action or None, "elapsed": None,
         "queued_note": None, "bg_wait": None,
+        "badge": console.badge(con, now),  # 入网控制台的机器才有；不进 key，不会因为它单独刷卡
     }
     if state == "stopped":
         v["label"], v["color"] = "⏹️ 已停止", "grey"
@@ -199,6 +200,8 @@ def render(t, v: dict, grant_paths, now: float) -> dict:
         els.append(note("目标：" + short(goal, 120)))
     els.append(note("可写：%s · %s 更新 · 引用此卡可追问" % (
         short(templates.scope_text(grant_paths), 80), hm(now))))
+    if v.get("badge"):
+        els.append(note(v["badge"]))  # 状态卡没有折叠详情：内部版标识放在页脚最后一行
     preview = "%s %s" % (tid, v["label"])
     if v["state"] == "running" and v["phase"] and v["final"] is None:
         preview += "：" + short(v["phase"], 30)
