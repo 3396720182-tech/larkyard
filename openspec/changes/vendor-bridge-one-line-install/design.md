@@ -82,7 +82,7 @@
 - ① 读 `~/.lark-channel/config.json`：已有这个 profile（默认 `claude`，`--profile` 可改）就跳过；否则执行打包的 bridge `profile create <p> --agent claude --workspace <工作区>`（`--app-id` 时用已有应用，App Secret 由 bridge 在不回显的提示里读），标准输入输出直接接终端。
 - ② 工作区默认 `~/larkyard-workspace`（已有 profile 时用它的 `workspaces.default`）；目录不存在就建；`CLAUDE.md` 不存在时用 `setup-workspace.sh` 渲染，已存在就不动（提示 `ticket doctor` 会比较模板）。
 - ③ 服务：bridge 服务按 D4 写（服务名同 bridge 自己的；该名字的服务文件已存在、又不是 Larkyard 写的，就停下提示用 `ticket bridge adopt`），PATH = `~/.ticketd/runtime/node/bin:~/.ticketd/bin:<claude 所在目录>[:<codex 所在目录>]:/usr/bin:/bin:/usr/sbin:/sbin`（Linux 多 `/usr/local/bin`）；ticketd 服务用现有的 `scripts/install.sh`（受管模式，`LARK_CHANNEL_PROFILE` 传进去）；每天 04:07 的重启任务（`dev.larkyard.bridge-restart`，launchd `StartCalendarInterval` / systemd timer）。
-- ④ 认主人：`config.env` 已有 `TICKETD_OWNER` 就跳过。否则等 bridge 完成 `lark-cli config bind`（最多 60 秒），用 bot 身份 `GET /open-apis/application/v6/applications/<app_id>?user_id_type=open_id` 取 `owner.owner_id`（bridge 运行时就是这样认 owner 的），再试 `GET /open-apis/contact/v3/users/<id>` 取名字（没有通讯录权限就只显示 open_id 后 6 位）。终端问「是你吗」，确认就写入。查不到、或者用户说不是：生成 4 位码，请用户在飞书里给 bot 私聊发「认主人 <码>」，读 bridge 当天日志里 `enter` 事件（`preview` 含这个码、时间在提示之后）的 `sender`，最多等 5 分钟，再确认一次写入。
+- ④ 认主人：`config.env` 已有 `TICKETD_OWNER` 就跳过。否则等 bridge 完成 `lark-cli config bind`（最多 60 秒），用 bot 身份 `GET /open-apis/application/v6/applications/<app_id>?user_id_type=open_id` 取 `owner.owner_id`（bridge 运行时就是这样认 owner 的），再试 `GET /open-apis/contact/v3/users/<id>` 取名字（没有通讯录权限就只显示 open_id 后 6 位）。终端问「是你吗」，确认就写入。查不到、或者用户说不是：生成 6 位码，请用户在飞书里给 bot 私聊发「认主人 <码>」，读 bridge 当天日志里 `enter` 事件（`preview` 含这个码、时间在提示之后）的 `sender`，最多等 5 分钟，再确认一次写入。
 - ⑤ 「现在授权用户身份吗？（传视频、导入文档要用）」默认否；是就执行 `lark-cli auth login`。以后 `ticket setup --user-auth` 单独做这一步。
 - ⑥ `ticket doctor`，再 `ticket doctor --dm` 让守护进程按自己的配置私信你一条；提示在飞书里给 bot 说句话确认主会话能回。
 
@@ -103,7 +103,7 @@ CLAUDE.md「上游边界」改为：bridge 基于 fork 的固定提交；补丁�
 ## Risks / Trade-offs
 
 - **扫码建应用的非交互参数没在真实租户上走过**：`profile create` 的 `--agent`、`--workspace`、`--app-id` 覆盖首次配置的全部问题，按源码确认过，但没在新租户上跑；缺参数时 bridge 会在终端里问，向导把终端原样交给它，不会卡死。
-- **bot 身份查应用 owner 在沙箱里测不了**（钥匙串），单测用假 lark-cli；失败时自动走 4 位码。
+- **bot 身份查应用 owner 在沙箱里测不了**（钥匙串），单测用假 lark-cli；失败时自动走 6 位码。
 - **公司租户要管理员审批权限**：向导替代不了，自检里 `ticket doctor --dm` 失败时说明找谁审批。
 - **bridge 健康检查靠日志关键字**（`ws connected` / `profile-online`）：bridge 改了日志措辞会误判为失败而切回；切回本身是安全方向，并且会私信说明。
 - **包变大约 45 MB**：对 200 MB 上限还有余量；以后可以考虑裁剪依赖。

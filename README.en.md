@@ -7,8 +7,8 @@
 [中文](./README.md)
 
 > **Larkyard is built on top of [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge).**
-> Message I/O, sessions, `<bridge_context>`, the bot identity and the lark-cli environment all come from lark-channel-bridge (npm package `lark-channel-bridge`, MIT).
-> Larkyard does not fork, patch or vendor it. It uses it as a dependency and adds a layer on top: a dispatch daemon, status cards and a set of workspace conventions. See [NOTICE.md](./NOTICE.md).
+> Message I/O, sessions, `<bridge_context>`, the bot identity and the lark-cli environment all come from lark-channel-bridge (MIT).
+> Larkyard release packages bundle it, built from [our fork](https://github.com/3396720182-tech/lark-coding-agent-bridge) at the commit pinned in `vendor/bridge.lock.json`, so it is signed, installed and updated together with Larkyard. On top of it Larkyard adds a dispatch daemon, status cards and a set of workspace conventions. See [NOTICE.md](./NOTICE.md).
 
 **Two kinds of worker, switched with one phrase**: each ticket can be run by **Claude Code** or the **Codex CLI**. Say "use codex to …" in Feishu and that ticket goes to Codex; otherwise it goes to the default executor (Claude Code unless you configure Codex). Both share the same queueing, status cards, permission boundaries, follow-ups and result delivery. See [Routing: Claude Code or Codex](#routing-claude-code-or-codex).
 
@@ -77,6 +77,8 @@ A few details about Codex workers:
 | Executors | `ticketd/executors.py` | Separates "which agent CLI runs a turn" from the scheduler: one implementation for Claude Code and one for Codex; Codex events are translated into the same shape, so status cards, stall detection and retries are shared |
 | Workspace conventions | `workspace/CLAUDE.md.tmpl` | `CLAUDE.md` for the bridge workspace: the attention principle, dispatch rules, follow-ups and control commands, honest delivery |
 | Personal overrides | `workspace/CLAUDE.local.example.md`, `config.example.env` | Your own preferences and settings, never committed |
+| Bundled bridge | `vendor/bridge.lock.json`, `vendor/runtime.json`, `scripts/build_bridge.py`, `ticketd/bridge.py` | lark-channel-bridge from a pinned fork commit, plus the Node and lark-cli versions and SHA-256s; installed under `~/.ticketd` with service definitions written by Larkyard, independent of nvm / npm |
+| One-line install | `install.sh`, `ticketd/bootstrap.py`, `ticketd/setup.py` | Check the release keys and signature → managed install → runtimes → the `ticket setup` wizard (QR app creation, workspace, services, owner detection) |
 | Design spec | `docs/spec.md` | Data model, permissions and sandbox, status cards, outbox, and the reason behind every change (Chinese) |
 
 ```
@@ -106,20 +108,51 @@ you ──Feishu──▶ lark-channel-bridge ──▶ bridge session (Claude C
 ## Requirements
 
 - macOS, or Linux (including WSL2 on Windows). On macOS the daemon runs under launchd and workers in the Seatbelt sandbox; on Linux it runs as a systemd user service and workers in the bubblewrap sandbox, with the extra requirements under "Linux / WSL2" below. Native Windows is not supported; use WSL2
-- Python 3.9+ (standard library only): `/usr/bin/python3` by default, or any interpreter set in `TICKETD_PYTHON`
-- Node.js ≥ 20.12 and a working [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge) (tested with 0.7.0)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart), logged in (tested with 2.1.300). Required: the bridge session and the default worker use it
-- lark-cli (`npm i -g @larksuite/cli`) on PATH; importing documents into Feishu Docs and uploading videos to Drive need it logged in as a user (optional; without it a video is sent as a separate video message after the card)
-- [Codex CLI](https://github.com/openai/codex) (`codex` logged in or with a provider configured; verified on codex-cli 0.134.0). Optional: only needed to route tickets to Codex. Install it before running `scripts/install.sh`, which adds it to the daemon's PATH
+- Python 3.9+ (standard library only): `/usr/bin/python3` by default (on macOS run `xcode-select --install` if it is missing), or any interpreter set in `TICKETD_PYTHON`
+- `curl`, `tar`, `ssh-keygen` (part of the OS; used to verify signatures)
+- A Lark/Feishu account (you scan a QR code to create the bot app). Tenants that require admin approval for app scopes follow their own approval flow
+- [Codex CLI](https://github.com/openai/codex) (`codex` logged in or with a provider configured; verified on codex-cli 0.134.0). Optional: only needed to route tickets to Codex. Run `ticket setup` again after installing it so the services' PATH includes it
+
+You do not install Node, npm, lark-channel-bridge or lark-cli yourself: the installer downloads the official Node and lark-cli builds listed in `vendor/runtime.json` (SHA-256 checked) into `~/.ticketd`, and the bridge ships inside the release package.
 
 UI strings (receipts, cards, prompts) are currently in Chinese.
 
 ## Install
 
 ```bash
-# 0. Install lark-channel-bridge per its README, bind the bot, and make sure you can chat with Claude Code from Feishu.
-#    Note the bridge workspace directory (the profile's workspaces.default, or what you passed to --workspace).
+curl -fsSL <release-url>/install.sh | sh
+```
 
+One command and two interactions: **scan one QR code** with Lark/Feishu (creates the bot app with its scopes and event subscriptions) and **confirm the owner's name**. The script:
+
+1. Checks the release keys at the release URL against the two fingerprints hard-coded in `install.sh`, verifies the signed channel manifest, downloads the package and checks it. Any mismatch stops the install and nothing is written under `~/.ticketd`. The fingerprints are the same as in this repository's [`install.sh`](./install.sh), so the two can be compared.
+2. Installs Larkyard as a managed install (`~/.ticketd/app`, auto-updates from day one) and downloads Node and lark-cli into `~/.ticketd` (SHA-256 checked).
+3. Runs the `ticket setup` wizard: ① scan to create the app (skipped if the profile exists; `--app-id` uses an existing app) → ② workspace (default `~/larkyard-workspace`, conventions written) → ③ bridge service, ticketd service and the daily 04:07 bridge restart window → ④ looks up the app owner as the bot, shows the name for you to confirm and writes `TICKETD_OWNER` (if it is not you, send a 6-digit code to the bot instead) → ⑤ optional user login for lark-cli (video uploads, document import) → ⑥ self-check, including a test DM from the daemon.
+
+- Options: `sh -s -- --profile <name> --workspace <dir> --app-id <existing app> --channel early|canary --no-setup`.
+- Internal users: use the command from the console's "add device" page (it adds `--console <url> --enroll <code>` and enrolls right after setup, no fingerprints to copy).
+- Safe to re-run: finished steps are skipped; existing `config.env` values and an existing workspace `CLAUDE.md` are left alone. If it stops halfway, run `~/.ticketd/app/current/bin/ticket setup` again.
+- Without a terminal (CI, remote scripts) it installs but asks nothing; run `ticket setup` in a terminal later.
+- Config changes are picked up without a restart.
+
+### Machines with a separately installed bridge (migration)
+
+Machines set up the old way (`npm i -g lark-channel-bridge`, then a Larkyard clone): once Larkyard is a managed install (if the service still runs the clone, `ticket update adopt` first) on a version that bundles the bridge (`ticket update status`), and no ticket is running, run **in your own terminal** (not from the bridge session: it runs on the bridge and would cut itself off; these commands refuse to run inside a bridge-driven session):
+
+```bash
+ticket bridge adopt --dry-run   # show which files would change
+ticket bridge adopt             # type yes; the bridge restarts once and the reply in progress is cut off
+ticket bridge adopt --undo      # restore exactly (service definition, secrets-getter, daily restart job, ticketd service)
+```
+
+Only the way the bridge is launched changes: the service name and everything in `~/.lark-channel` (profiles, sessions, credentials, logs) stay as they are, and `lark-channel-bridge status` still sees the same service. If the bridge does not reconnect within 90 seconds, the migration is undone automatically.
+
+### Install from a clone (developers)
+
+Without the one-line installer: install the bridge, Node and lark-cli yourself, then
+
+```bash
 git clone https://github.com/3396720182-tech/larkyard.git ~/larkyard && cd ~/larkyard
 scripts/install.sh                               # installs the daemon; creates ~/.ticketd/config.env on first run
 $EDITOR ~/.ticketd/config.env                    # set TICKETD_OWNER (your open_id) at minimum
@@ -130,11 +163,11 @@ scripts/setup-workspace.sh <bridge workspace>    # add --force if a CLAUDE.md al
 - Different service name (launchd label / systemd unit name) or data dir: `TICKETD_LABEL=... TICKETD_HOME=... scripts/install.sh` (use the same variables to uninstall).
 - Preview the generated plist (a systemd unit on Linux) without installing: `scripts/install.sh --print`.
 - `/usr/bin/python3` older than 3.9 or missing: `TICKETD_PYTHON=/path/to/python3 scripts/install.sh`.
-- Config changes are picked up without a restart.
+- When `~/.ticketd/runtime/node` and `~/.ticketd/bin/lark-cli` exist (from the one-line install or `ticket bridge adopt`), `scripts/install.sh` uses them first, so nvm version switches don't matter.
 
 ### Linux / WSL2
 
-On Linux `scripts/install.sh` installs a systemd user service (`~/.config/systemd/user/dev.larkyard.ticketd.service`); the other steps are the same as above. Prepare the host first:
+On Linux both ticketd and the bridge run as systemd user services (`~/.config/systemd/user/dev.larkyard.ticketd.service`, `lark-channel-bridge.bot.<profile>.service`; the daily restart window is `dev.larkyard.bridge-restart.timer`); the other steps are the same as above. Prepare the host first:
 
 ```bash
 # Worker sandbox: Claude Code needs bubblewrap and socat; Codex also prefers the system bubblewrap
@@ -164,9 +197,9 @@ sudo loginctl enable-linger "$USER"
 - On Linux lark-cli uses no OS keychain: its credentials and master key are files in `~/.local/share/lark-cli`. ticketd adds that directory to the worker sandbox's writable paths (token refreshes write there).
 - On Linux the repo, home and `TICKETD_HOME` paths must not contain whitespace or `%` `$` `"` `\` (systemd units treat them specially); the install script refuses them.
 
-**Check**: send the bot something that takes a few minutes. You should get the receipt, then a status card; `bin/ticket ls` lists the ticket. Daemon logs are in `~/.ticketd/logs/`.
+**Check**: send the bot something that takes a few minutes. You should get the receipt, then a status card; `ticket ls` lists the ticket (with the one-line install, `ticket` is in `~/.ticketd/app/current/bin/`). Daemon logs are in `~/.ticketd/logs/`, bridge logs in `~/.lark-channel/profiles/<profile>/logs/`. `ticket bridge status` shows the bridge, Node and lark-cli in use.
 
-**Uninstall**: `scripts/uninstall.sh` (removes the launchd agent on macOS, stops and removes the systemd user service on Linux; data and ticket directories are kept); restore the workspace `CLAUDE.md` from the backup made by `setup-workspace.sh`.
+**Uninstall**: `scripts/uninstall.sh` (removes the launchd agent on macOS, stops and removes the systemd user service on Linux; data and ticket directories are kept); remove the bridge service with the bundled bridge (`~/.ticketd/runtime/node/bin/node ~/.ticketd/bridge/current/bin/lark-channel-bridge.mjs unregister`) and the `dev.larkyard.bridge-restart` job; restore the workspace `CLAUDE.md` from the backup made by `setup-workspace.sh`.
 
 ## Configuration
 
@@ -215,7 +248,7 @@ bin/ticket doctor [--dm]                            # config check: environment 
 
 - Six orphan-sweep tests inspect real processes (`ps` on macOS, `/proc` on Linux); they fail inside sandboxes that forbid it (e.g. when run by a Larkyard worker).
 - The orphan sweep has one residual risk (always the case on macOS, the same on Linux): a background program you start yourself inside a ticket directory and detach from the terminal (an editor launched with `code .` there, a tmux server) is cleaned up as a leftover when that ticket's worker finishes.
-- Platform-specific code lives only in `ticketd/host.py`, `ticketd/procs.py`, `ticketd/perms.py` and `scripts/install.sh`; the unit tests mock the platform, so both branches are tested on either OS. GitHub Actions (`.github/workflows/tests.yml`) runs all unit tests on ubuntu-latest and macos-latest, and installs, reinstalls and uninstalls the systemd user service for real on Ubuntu.
+- Platform-specific code lives only in `ticketd/host.py`, `ticketd/procs.py`, `ticketd/perms.py`, `ticketd/bridge.py` (bridge service and restart window) and `scripts/install.sh`; the unit tests mock the platform, so both branches are tested on either OS. GitHub Actions (`.github/workflows/tests.yml`) runs all unit tests on ubuntu-latest and macos-latest, and installs, reinstalls and uninstalls the systemd user service for real on Ubuntu.
 - Read the matching section of `docs/spec.md` before changing behavior, and record the change there. Run `validate_cards.py` after touching card layouts (`--with-images` uploads two tiny images first so cards with images are validated too).
 - Keep personal data out of the repo: open_ids, chat_ids, message_ids, local paths, secrets, ticket history, databases. Personal things go in `config.env` and `CLAUDE.local.md`.
 - Leak check: `/usr/bin/python3 scripts/check_private.py --install-hooks` installs pre-commit / pre-push hooks in your clone that stop secrets, real Feishu ids, home-directory paths and non-noreply emails before they are committed or pushed (it prints locations only, never the matched text). Strings only you know (user name, company) go in `~/.ticketd/private-patterns`, one regex per line.
@@ -226,6 +259,9 @@ bin/ticket doctor [--dm]                            # config check: environment 
 - On Linux / WSL2 the only verification so far is the unit tests (mocking the platform) and CI (all unit tests plus a real systemd user-service install on ubuntu-latest); there has been no end-to-end run like on macOS (the sandbox findings in `docs/spec.md` §6 come from macOS). Not yet measured in particular: the read/write boundary of workers under Claude Code's and Codex's bubblewrap sandboxes, whether `.git` in granted repos is read-only under Codex (what `TICKETD_CODEX_GIT_WRITABLE` does on Linux), and read-only lark-cli calls inside the worker sandbox.
 - On Linux, commands in Claude Code's sandbox run in their own network namespace and can't reach services on the host's `localhost`; in WSL2 workers can't launch Windows programs (`cmd.exe`, exes under `/mnt/c/...`) by default either.
 - WSL2 may shut the whole distribution down some time after the last WSL terminal closes, taking ticketd and the bridge with it. To keep them running, keep a WSL terminal open or have Windows Task Scheduler start a long-running `wsl.exe` process at logon. This depends on the WSL version and has not been verified here.
+- The bundled bridge comes from a pinned fork commit (`vendor/bridge.lock.json`). Following upstream means rebasing the fork quarterly or when a fix is needed, running the tests, bumping the lock file and releasing; our general fixes are also sent upstream as PRs, without waiting for them to merge.
+- Larkyard's own auto-update restarts only ticketd, never the bridge; a new bundled bridge goes live in the daily 04:07 restart window (no restart if unchanged) or with `ticket bridge restart`. A bridge that doesn't reconnect within 90 seconds is switched back and you get a DM.
+- QR app creation in the wizard (the bridge's `profile create`) and looking up the app owner as the bot have not been run end to end on a fresh tenant (unit tests and a throwaway-HOME run with stand-ins cover the flow); if the owner can't be looked up, the 6-digit code is used.
 - Relies on the `<bridge_context>` fields injected by lark-channel-bridge (`chatId`, `messageIds`, `senderId`); if the bridge changes them, the dispatch command in the workspace conventions must follow.
 - The bridge session (the one that triages and dispatches) has only been written for and tested on Claude Code: the workspace conventions are a `CLAUDE.md`. A Codex bridge session (profile `agentKind: "codex"`) is untested; what can be routed to Codex is the worker.
 - The bridge session is managed by the bridge and resumed indefinitely (`--resume`), so its context keeps growing: one bridge session measured about USD 35 over a little more than a day, with every later message paying for the whole history and triage drifting toward old topics. ticketd has no control over that session; send `/new` in Feishu now and then (for example after a batch of work) to start fresh. Tickets are unaffected: ids and state live in ticketd, and quoting old messages still routes follow-ups.
@@ -240,4 +276,4 @@ bin/ticket doctor [--dm]                            # config check: environment 
 
 ## License
 
-[MIT](./LICENSE). The upstream lark-channel-bridge is also MIT, copyright its contributors; see [NOTICE.md](./NOTICE.md).
+[MIT](./LICENSE). The bundled lark-channel-bridge is also MIT, copyright its contributors; the licenses of its production dependencies (MIT, BSD-3-Clause, ISC, Apache-2.0) ship in `vendor/bridge/THIRD_PARTY_NOTICES.md` inside the package. See [NOTICE.md](./NOTICE.md).

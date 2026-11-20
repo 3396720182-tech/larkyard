@@ -8,7 +8,7 @@
 - `ticketd/`：派单服务（Python 3.9 标准库，零依赖）。`config.py` 是所有配置的唯一来源。
 - `bin/ticket`、`bin/ticketd`：入口脚本，默认用 `/usr/bin/python3`（`TICKETD_PYTHON` 可改）。
 - `launchd/`、`systemd/`：macOS / Linux 的服务模板，由 `scripts/install.sh` 渲染。
-- 平台差异只放在 `ticketd/host.py`、`ticketd/procs.py`、`ticketd/perms.py` 和 `scripts/install.sh` / `uninstall.sh`（spec §3.1）。改这些地方时两个平台的分支都要有单测：Python 里 mock `host.system()`，脚本用 `tests/test_install.py` 的假 `uname` / `launchctl` / `systemctl`。macOS 的行为不能顺带改掉。
+- 平台差异只放在 `ticketd/host.py`、`ticketd/procs.py`、`ticketd/perms.py`、`ticketd/bridge.py`（bridge 服务和重启窗口）和 `scripts/install.sh` / `uninstall.sh`（spec §3.1、§13）。改这些地方时两个平台的分支都要有单测：Python 里 mock `host.system()`，脚本用 `tests/test_install.py` 的假 `uname` / `launchctl` / `systemctl`。macOS 的行为不能顺带改掉。
 - `prompts/worker.md`：worker 的系统提示；`ticketd/worker.py` 里的 `ASSIGNMENT` 是每轮的任务卡。
 - `workspace/`：bridge 工作区的 `CLAUDE.md` 模板和个人覆盖示例。
 - `docs/spec.md`：设计规格。行为以它为准；改了行为要在对应章节写「调整」，说明改了什么、为什么。
@@ -26,7 +26,11 @@
 
 ## 上游边界
 
-Larkyard 基于 lark-channel-bridge 开发，但不 fork、不修改它。需要 bridge 改动的地方，在 README「已知限制」或 issue 里记下来，不要在本仓库里补丁上游代码。
+发版包里的 lark-channel-bridge 来自我们的 fork（`vendor/bridge.lock.json` 记录的固定提交，spec §13）。
+- bridge 的改动只进 fork 源码，带单测；不在本仓库里放 bridge 代码或补丁，也不再改 bridge 的编译产物。
+- 跟进上游：每季度或有需要的修复时，在 fork 上 rebase 到上游新版本、跑 fork 的测试，再改锁文件、`scripts/build_bridge.py` 构建、`release.py release --bridge` 发版。
+- 通用修复同时给上游提 PR，不等合并。
+- 只有 Larkyard 自己需要、上游不会要的改动（比如模型选项）留在 fork 的 `larkyard/vendor` 分支上。
 
 ## 去敏（每次提交前检查）
 

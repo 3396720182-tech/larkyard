@@ -13,7 +13,7 @@
 - **bridge 随发版包一起打包（vendoring）**：bridge 源码取自我们的 fork，固定在 `vendor/bridge.lock.json` 记录的提交上；补丁已移植进 fork 源码并有测试。`scripts/build_bridge.py` 按这个提交构建 bridge（JS 产物 + 按锁文件装的生产依赖 + 第三方许可证声明），`release.py release --bridge <目录>` 把它放进签名包的 `vendor/bridge/`。清单格式不变：bridge 被包的 SHA-256 一起覆盖。
 - **运行时固定目录**：`vendor/runtime.json`（跟随仓库、进签名包）写死 Node 和 lark-cli 的版本和各平台官方包的 SHA-256。Node 装到 `~/.ticketd/runtime/`，lark-cli 装到 `~/.ticketd/bin/`，不再依赖 nvm 和 npm。
 - **一行安装** `install.sh`（仓库根目录，发布到发布地址）：`curl -fsSL <发布地址>/install.sh | sh`。按内置的发版公钥指纹核对公钥、验签通道清单、核对包，装成受管安装（第一天就能自动更新），装 Node 和 lark-cli，然后进入 `ticket setup`。内部员工的命令多带 `--console <地址> --enroll <入网码>`，装完接着 `ticket enroll`，不用再手抄指纹。
-- **`ticket setup` 向导**：调用打包进来的 bridge 扫码建飞书应用（已有 profile 就跳过）→ 工作区（默认 `~/larkyard-workspace`，渲染工作区约定）→ 写 bridge 服务、ticketd 服务和每天 04:07 的 bridge 重启任务（路径全部指向 `~/.ticketd`，不写死 nvm）→ 自动认主人（用 bot 身份查应用 owner，显示名字让你确认；不对就在飞书里给 bot 发一个 4 位码）→ 可选的用户身份授权 → 自检。
+- **`ticket setup` 向导**：调用打包进来的 bridge 扫码建飞书应用（已有 profile 就跳过）→ 工作区（默认 `~/larkyard-workspace`，渲染工作区约定）→ 写 bridge 服务、ticketd 服务和每天 04:07 的 bridge 重启任务（路径全部指向 `~/.ticketd`，不写死 nvm）→ 自动认主人（用 bot 身份查应用 owner，显示名字让你确认；不对就在飞书里给 bot 发一个 6 位码）→ 可选的用户身份授权 → 自检。
 - **`ticket bridge`**：`status`；`restart [--if-stale]`（切到当前版本带的 bridge、确保运行时、重启、确认长连接已连上，失败就切回原来的 bridge）；`adopt [--dry-run] / --undo`（从现在分开安装的 bridge 迁移：服务名、profile、会话、凭据都不动，只换启动命令和 `secrets-getter`、把每天的重启任务改成 `ticket bridge restart`，改前备份，`--undo` 原样恢复）。
 - **bridge 什么时候重启**：Larkyard 自己更新时照旧只重启 ticketd，不打断主会话；新版本带的 bridge 由每天 04:07 的重启任务（`ticket bridge restart --if-stale`）换上，版本没变就不重启。`ticket doctor` 增加「bridge」一项。
 - 上游边界改为「基于我们的 fork，固定提交，每季度或有需要的修复时 rebase；通用修复同时给上游提 PR，不等合并」。

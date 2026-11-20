@@ -7,8 +7,8 @@
 [English](./README.en.md)
 
 > **Larkyard 基于 [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge) 开发。**
-> 飞书消息的收发、会话、`<bridge_context>`、bot 身份和 lark-cli 环境都来自 lark-channel-bridge（npm 包 `lark-channel-bridge`，MIT 协议）。
-> Larkyard 不 fork、不修改、也不内置它的代码，而是把它当作依赖，在它上面加一层：派单服务、状态卡和一套工作区约定。详见 [NOTICE.md](./NOTICE.md)。
+> 飞书消息的收发、会话、`<bridge_context>`、bot 身份和 lark-cli 环境都来自 lark-channel-bridge（MIT 协议）。
+> Larkyard 的发版包里打包了它（取自我们的 [fork](https://github.com/3396720182-tech/lark-coding-agent-bridge)，固定在 `vendor/bridge.lock.json` 记录的提交上），和 Larkyard 一起签名、一起安装、一起更新；在它上面加的一层是派单服务、状态卡和一套工作区约定。详见 [NOTICE.md](./NOTICE.md)。
 
 **两种 worker，一句话切换**：每张工单可以交给 **Claude Code** 或 **Codex CLI** 来做。在飞书里说「用 codex 做…」，这张单就派给 Codex；不说就走默认执行器（默认是 Claude Code，也可以配成 Codex）。两种 worker 共用同一套排队、状态卡、权限边界、追问续做和结果推送。见 [路由：Claude Code 还是 Codex](#路由claude-code-还是-codex)。
 
@@ -77,6 +77,8 @@ Codex worker 的几点细节：
 | 执行器 | `ticketd/executors.py` | 把「用哪个 agent CLI 跑一轮」从调度器里拆出来：Claude Code 和 Codex 各一个实现，Codex 的事件翻译成同一种格式，状态卡、卡死检测、重试两边共用 |
 | 工作区约定 | `workspace/CLAUDE.md.tmpl` | 放进 bridge 工作目录的 `CLAUDE.md`：注意力原则、派单规则、追问与控制命令、诚实交付 |
 | 个人覆盖 | `workspace/CLAUDE.local.example.md`、`config.example.env` | 只属于你自己的偏好和配置，不进仓库 |
+| 打包的 bridge | `vendor/bridge.lock.json`、`vendor/runtime.json`、`scripts/build_bridge.py`、`ticketd/bridge.py` | 发版包里带的 lark-channel-bridge（fork 的固定提交），以及 Node、lark-cli 的版本和 SHA-256；安装到 `~/.ticketd`，服务定义由 Larkyard 写，不依赖 nvm / npm |
+| 一行安装 | `install.sh`、`ticketd/bootstrap.py`、`ticketd/setup.py` | 核对发版公钥和签名 → 装成受管安装 → 装运行时 → `ticket setup` 向导（扫码建应用、工作区、服务、认主人） |
 | 设计规格 | `docs/spec.md` | 数据模型、权限与沙箱、状态卡、发件箱等设计和每次调整的原因 |
 
 ```
@@ -106,42 +108,66 @@ Codex worker 的几点细节：
 ## 环境要求
 
 - macOS，或 Linux（含 Windows 上的 WSL2）。macOS 用 launchd 托管服务、用 Seatbelt 沙箱限制 worker；Linux 用 systemd 用户服务托管、用 bubblewrap 沙箱限制 worker，额外要求见下面的「Linux / WSL2」。原生 Windows 不支持，请用 WSL2
-- Python 3.9+（只用标准库）：默认用 `/usr/bin/python3`，别的解释器用 `TICKETD_PYTHON` 指定
-- Node.js ≥ 20.12，已装好并能正常对话的 [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge)（在 0.7.0 上验证）
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart)（`claude` 已登录；在 2.1.300 上验证）：必需，主会话和默认 worker 都用它
-- lark-cli（`npm i -g @larksuite/cli`），在 PATH 上；稿子导入云文档、视频传云空间需要它以 user 身份登录过（可选，没登录时视频改为卡片后另发一条视频消息）
-- [Codex CLI](https://github.com/openai/codex)（`codex` 已登录或已配置 provider；在 codex-cli 0.134.0 上验证）：可选，要把工单路由给 Codex 时才需要。先装好再跑 `scripts/install.sh`，安装脚本会把它加进服务的 PATH
+- Python 3.9+（只用标准库）：默认用 `/usr/bin/python3`（macOS 没有就 `xcode-select --install`），别的解释器用 `TICKETD_PYTHON` 指定
+- `curl`、`tar`、`ssh-keygen`（系统自带；验签用）
+- 一个飞书账号（安装时扫码建 bot 应用）。公司租户要管理员审批应用权限的，按租户流程审批
+- [Codex CLI](https://github.com/openai/codex)（`codex` 已登录或已配置 provider；在 codex-cli 0.134.0 上验证）：可选，要把工单路由给 Codex 时才需要。装好后重新执行 `ticket setup`，服务的 PATH 会带上它
+
+不需要自己装 Node、npm、lark-channel-bridge 或 lark-cli：安装脚本按 `vendor/runtime.json` 下载官方的 Node 和 lark-cli（核对 SHA-256）放到 `~/.ticketd`，bridge 在发版包里。
 
 界面文案（回执、状态卡、提示）目前是中文。
 
 ## 安装
 
 ```bash
-# 0. 先按 lark-channel-bridge 的 README 装好 bridge，扫码绑定 bot，确认能在飞书里和本机 Claude Code 对话。
-#    记下 bridge 的工作目录（profile 的 workspaces.default，或你用 --workspace 指定的目录）。
+curl -fsSL <发布地址>/install.sh | sh
+```
 
-# 1. 取代码
+一条命令，加两个交互：**用飞书扫一次码**（建 bot 应用，权限和事件订阅一起带上），**确认一下主人名字**。脚本做的事：
+
+1. 按 `install.sh` 里写死的两把发版公钥指纹核对发布地址上的公钥，验签通道清单，下载并核对包；任何一步不对就停下，`~/.ticketd` 下不写任何东西。指纹和本仓库 [`install.sh`](./install.sh) 里的是同一份，可以互相比对。
+2. 装成受管安装（`~/.ticketd/app`，第一天就能自动更新），下载 Node 和 lark-cli 到 `~/.ticketd`（核对 SHA-256）。
+3. 进入 `ticket setup` 向导：① 扫码建飞书应用（已有就跳过；用已有应用加 `--app-id`）→ ② 工作区（默认 `~/larkyard-workspace`，写好工作区约定）→ ③ 装 bridge 服务、ticketd 服务和每天 04:07 的 bridge 重启窗口 → ④ 用 bot 身份查应用所有者，显示名字让你确认，写进 `TICKETD_OWNER`（不是你就在飞书里给 bot 发一个 6 位码）→ ⑤ 可选：用户身份授权（传视频、导入文档要用）→ ⑥ 自检，并让守护进程给你发一条测试私信。
+
+- 参数：`sh -s -- --profile <名字> --workspace <目录> --app-id <已有应用> --channel early|canary --no-setup`。
+- 内部员工：用控制台「添加设备」给的命令（多了 `--console <地址> --enroll <入网码>`，装完接着入网，不用手抄指纹）。
+- 可以重复执行：做过的步骤会跳过，`config.env` 里已有的值和工作区里已有的 `CLAUDE.md` 不动；中途断了重新执行 `~/.ticketd/app/current/bin/ticket setup` 接着做。
+- 没有终端（CI、远程脚本）时只装不问，之后在终端里执行 `ticket setup`。
+- 配置文件改了不用重启：服务和 `ticket` 命令读取时会发现文件变化。
+
+### 已经分开装过 bridge 的机器（迁移）
+
+以前按「先 `npm i -g lark-channel-bridge`、再 clone Larkyard」装的机器：先让 Larkyard 成为受管安装（服务还在直接跑克隆的，先 `ticket update adopt`）并更新到带 bridge 的版本（`ticket update status` 看版本），等没有正在运行的工单，然后**在你自己的终端里**（不要让主会话执行：它跑在 bridge 上，会把自己打断；这几条命令在 bridge 驱动的会话里会拒绝）：
+
+```bash
+ticket bridge adopt --dry-run   # 先看要改哪些文件
+ticket bridge adopt             # 输入 yes 后执行；bridge 会重启一次，正在进行的那一轮回复会中断
+ticket bridge adopt --undo      # 原样退回（服务定义、secrets-getter、每天的重启任务、ticketd 服务逐字节恢复）
+```
+
+迁移只改启动方式：bridge 的服务名、`~/.lark-channel` 里的 profile、会话、凭据和日志位置都不变，`lark-channel-bridge status` 照常能看到同一个服务。迁移后 90 秒内 bridge 没连上飞书会自动退回。
+
+### 从 clone 安装（开发者）
+
+不用一行安装也可以：自己装好 bridge、Node 和 lark-cli，然后
+
+```bash
 git clone https://github.com/3396720182-tech/larkyard.git ~/larkyard && cd ~/larkyard
-
-# 2. 安装 ticketd 服务（首次会生成 ~/.ticketd/config.env）
-scripts/install.sh
-
-# 3. 填写个人配置：至少填 TICKETD_OWNER（你的 open_id，见 config.env 里的说明）
-$EDITOR ~/.ticketd/config.env
-
-# 4. 把工作区约定装进 bridge 的工作目录（已有 CLAUDE.md 时需要加 --force，会先备份）
-scripts/setup-workspace.sh <bridge 工作目录>
+scripts/install.sh                               # 装 ticketd 服务，首次生成 ~/.ticketd/config.env
+$EDITOR ~/.ticketd/config.env                    # 至少填 TICKETD_OWNER（你的 open_id）
+scripts/setup-workspace.sh <bridge 工作目录>      # 已有 CLAUDE.md 时加 --force（会先备份）
 ```
 
 - bridge 用的不是默认 profile `claude` 时，安装前设置 `LARK_CHANNEL_PROFILE=<名字>`（和 `LARK_CHANNEL_HOME`，如果你改过）。
 - 想换服务名（launchd 标签 / systemd 服务名）或数据目录：`TICKETD_LABEL=... TICKETD_HOME=... scripts/install.sh`（卸载时用同样的变量）。
 - 只想看生成的 plist（Linux 上是 systemd unit）、不安装：`scripts/install.sh --print`。
 - `/usr/bin/python3` 低于 3.9 或不存在：`TICKETD_PYTHON=/path/to/python3 scripts/install.sh`。
-- 配置文件改了不用重启：服务和 `ticket` 命令读取时会发现文件变化。
+- `~/.ticketd/runtime/node`、`~/.ticketd/bin/lark-cli` 存在时（一行安装或 `ticket bridge adopt` 装的），`scripts/install.sh` 优先用它们，不跟着 nvm 切版本走。
 
 ### Linux / WSL2
 
-`scripts/install.sh` 在 Linux 上装成 systemd 用户服务（`~/.config/systemd/user/dev.larkyard.ticketd.service`），其余步骤和上面一样。先准备好：
+在 Linux 上 ticketd、bridge 都装成 systemd 用户服务（`~/.config/systemd/user/dev.larkyard.ticketd.service`、`lark-channel-bridge.bot.<profile>.service`，每天的重启窗口是 `dev.larkyard.bridge-restart.timer`），其余步骤和上面一样。先准备好：
 
 ```bash
 # worker 沙箱：Claude Code 要 bubblewrap 和 socat；Codex 也优先用系统装的 bubblewrap
@@ -171,9 +197,11 @@ sudo loginctl enable-linger "$USER"
 - Linux 上 lark-cli 不用系统钥匙串，凭据和主密钥是 `~/.local/share/lark-cli` 里的文件；ticketd 已把这个目录放进 worker 沙箱的可写范围（令牌刷新要写）。
 - Linux 上本仓库、家目录、`TICKETD_HOME` 等路径里不能有空白和 `%` `$` `"` `\`（systemd unit 会把它们当成特殊字符），安装脚本遇到会拒绝。
 
-**验证**：在飞书里给 bot 发一件要做几分钟的事。应该先收到开单回执，接着出现状态卡；在终端里 `bin/ticket ls` 能看到这张单。服务日志在 `~/.ticketd/logs/`。
+**验证**：在飞书里给 bot 发一件要做几分钟的事。应该先收到开单回执，接着出现状态卡；在终端里 `ticket ls` 能看到这张单（一行安装的 `ticket` 在 `~/.ticketd/app/current/bin/`）。服务日志在 `~/.ticketd/logs/`，bridge 的在 `~/.lark-channel/profiles/<profile>/logs/`。
 
-**卸载**：`scripts/uninstall.sh`（macOS 卸 launchd 服务，Linux 停掉并删除 systemd 用户服务；数据目录和工单目录保留）；工作区的 `CLAUDE.md` 用 `setup-workspace.sh` 留下的备份还原。
+**bridge**：`ticket bridge status` 看在用的 bridge、Node、lark-cli 版本和服务入口；Larkyard 自动更新只重启 ticketd，不打断主会话，新版本带的 bridge 在每天 04:07 的重启窗口换上（版本没变就不重启），急用可以 `ticket bridge restart`（会打断进行中的回复）。重启后 90 秒内没连上飞书会自动切回原来的 bridge 并私信你。
+
+**卸载**：`scripts/uninstall.sh`（macOS 卸 launchd 服务，Linux 停掉并删除 systemd 用户服务；数据目录和工单目录保留）；bridge 服务用打包的 bridge 卸：`~/.ticketd/runtime/node/bin/node ~/.ticketd/bridge/current/bin/lark-channel-bridge.mjs unregister`，每天的重启窗口删掉 `dev.larkyard.bridge-restart`；工作区的 `CLAUDE.md` 用 `setup-workspace.sh` 留下的备份还原。
 
 ## 配置
 
@@ -218,6 +246,8 @@ sudo loginctl enable-linger "$USER"
 
 ## 自动更新（默认关闭）
 
+一行安装装出来的就是受管安装，已经启用（更新源就是安装时的发布地址），下面的三步只适用于从 clone 安装的机器。
+
 不配置就什么都不做：不发请求，服务模板和工作区都不动。启用后，守护进程每小时检查一次更新源，只安装发布者签过名的版本，空闲时（没有 worker、没有沙箱外脚本、没有在传的媒体）安装，新版本 10 分钟内自检不过就自动切回上一个版本并私信你。规格见 `docs/spec.md` §11。
 
 启用（三步，都在你自己的终端里做；worker 做不了：命令在 worker 环境里会拒绝，真正挡住 worker 的是沙箱，`~/.ticketd` 对 worker 不可写）：
@@ -240,7 +270,7 @@ TICKETD_UPDATE_URL=https://updates.example.com/larkyard
 - 退回原来的就地运行：`~/.ticketd/app/current/bin/ticket update adopt --undo`（服务改回原克隆、工作区的 ticket 路径改回，原克隆要还在原来的位置），再删掉 `TICKETD_UPDATE_URL`。原克隆比正在运行的版本旧时会提示：退回后跑的是旧代码（数据库迁移只增不删，旧代码能照常读写）；要保持新版本先在克隆里 `git pull`。
 - 守护进程起不来、命令也用不了时：`ln -sfn versions/<旧版本> ~/.ticketd/app/current`，然后 `launchctl kickstart -k gui/$(id -u)/dev.larkyard.ticketd`（Linux：`systemctl --user restart dev.larkyard.ticketd`）。
 
-发布者：`scripts/release.py` 在你自己的电脑上从 git tag 打包、一次签齐 canary / early / stable 三份清单（`ssh-keygen -Y sign`，只接受 Ed25519），另能签回滚清单（最长 7 天有效）、按 7 天窗口预签 12 周暂停标记、用离线备份私钥签换钥清单；`release.py publish` 把签好的文件放到更新源。更新源上没有私钥。
+发布者：先 `scripts/build_bridge.py --out <目录>` 按 `vendor/bridge.lock.json` 构建要打包的 bridge（要 git、Node、pnpm），`release.py release --tag vX --key <主私钥> --bridge <目录>` 把它放进包的 `vendor/bridge/`（核对提交和内容摘要）；`release.py publish-installer --url <发布地址> --main <主公钥> --backup <备份公钥> --to <更新源>` 发布一行安装脚本和两把公钥（脚本里的指纹必须就是这两把，换钥后先改仓库里的 `install.sh`）。`scripts/release.py` 在你自己的电脑上从 git tag 打包、一次签齐 canary / early / stable 三份清单（`ssh-keygen -Y sign`，只接受 Ed25519），另能签回滚清单（最长 7 天有效）、按 7 天窗口预签 12 周暂停标记、用离线备份私钥签换钥清单；`release.py publish` 把签好的文件放到更新源。更新源上没有私钥。
 - 撤回：已下载、还没装的版本，用一份指回当前版本的回滚清单撤回（客户端丢掉待装的包）；只把通道清单撤下（404）和更新源暂时不可达区分不了，不算撤回。
 - 序号全局递增：回滚清单、暂停标记和发布清单共用一个序号。提前签好、晚些才放出去的发布清单，如果中间签过回滚清单，序号会比客户端见过的小而被当成重放拒绝，要重新签。
 - 主私钥泄露：先发布当前窗口的暂停标记，再用离线备份私钥 `release.py rekey` 签一份换钥清单并发布；客户端换成新主公钥，旧主私钥签的东西全部失效。
@@ -250,9 +280,11 @@ TICKETD_UPDATE_URL=https://updates.example.com/larkyard
 
 给团队管理员看设备状态用的可选功能。**只有本人在终端执行过 `ticket enroll` 才启用**：仓库里没有任何控制台地址，也没有配置项或环境变量能设置它；没入网的安装不发出任何到控制台的请求，卡片上也没有内部版标识。规格见 `docs/spec.md` §12。
 
+新机器用控制台给的一行安装命令（`curl … | sh -s -- --console <地址> --enroll <入网码>`），装完自动进入入网，指纹取 `install.sh` 里写死的。已经装好的机器：
+
 ```bash
-# 管理员给你：控制台地址、入网码，以及在控制台以外的渠道（当面、电话、另一个聊天）给你的两把发版公钥指纹
-bin/ticket enroll https://console.example.com LY-XXXX-XXXX-XXXX \
+# 管理员给你：控制台地址、入网码；两把发版公钥指纹和本仓库 install.sh 里的一致（在控制台以外的渠道核对）
+ticket enroll https://console.example.com LY-XXXX-XXXX-XXXX \
     --release-key SHA256:<主公钥指纹> --backup-key SHA256:<备份公钥指纹> [--hostname <上报的主机名>]
 ```
 
@@ -276,7 +308,7 @@ bin/ticket doctor [--dm]                            # 配置自检：和守护�
 
 - 有 6 个孤儿进程清理的用例要查看真实进程（macOS 用 `ps`，Linux 读 `/proc`），在禁止这样做的沙箱里（比如由 Larkyard worker 来跑）会失败，属环境限制。
 - 孤儿进程清理有一个残余风险（macOS 上一直如此，Linux 上一样）：你自己在工单目录里启动、又脱离了终端的后台程序（比如在工单目录里 `code .` 起的编辑器、tmux 服务端），在这张单的 worker 结束时会被当成残留进程清掉。
-- 平台相关的代码只在 `ticketd/host.py`、`ticketd/procs.py`、`ticketd/perms.py` 和 `scripts/install.sh`；单测 mock 平台分支，所以两个平台的分支在任一系统上都能测。GitHub Actions（`.github/workflows/tests.yml`）在 ubuntu-latest 和 macos-latest 上跑全部单测，并在 Ubuntu 上真装、重装、卸载一次 systemd 用户服务。
+- 平台相关的代码只在 `ticketd/host.py`、`ticketd/procs.py`、`ticketd/perms.py`、`ticketd/bridge.py`（bridge 服务和重启窗口）和 `scripts/install.sh`；单测 mock 平台分支，所以两个平台的分支在任一系统上都能测。GitHub Actions（`.github/workflows/tests.yml`）在 ubuntu-latest 和 macos-latest 上跑全部单测，并在 Ubuntu 上真装、重装、卸载一次 systemd 用户服务。
 - 改行为前先读 `docs/spec.md` 对应章节，改完把「调整」写回 spec；改卡片结构后跑 `validate_cards.py`（加 `--with-images` 会先传两张小图，把含图片的卡也一起校验）。
 - 仓库里不放任何个人信息：open_id、chat_id、message_id、本机路径、密钥、工单历史和数据库。个人的东西放 `config.env` 和 `CLAUDE.local.md`。
 - 去敏检查：`/usr/bin/python3 scripts/check_private.py --install-hooks` 给本克隆装上 pre-commit / pre-push 钩子，提交和推送前自动拦住密钥、真实飞书 id、本机用户目录和非 noreply 邮箱（只打印位置，不回显内容）。只有你知道的串（用户名、公司名）写进 `~/.ticketd/private-patterns`，一行一个正则。
@@ -287,6 +319,8 @@ bin/ticket doctor [--dm]                            # 配置自检：和守护�
 - Linux / WSL2 上的验证目前只有单测（mock 平台分支）和 CI（ubuntu-latest 上跑全部单测、真装一次 systemd 用户服务），还没有像 macOS 那样端到端实测过（`docs/spec.md` §6 的沙箱结论来自 macOS）。尤其没实测：Claude Code / Codex 的 bubblewrap 沙箱下 worker 的读写边界、Codex 授权仓库里 `.git` 是否只读（`TICKETD_CODEX_GIT_WRITABLE` 在 Linux 上的效果）、worker 沙箱里 lark-cli 的只读操作。
 - Linux 上 Claude Code 沙箱里的命令在独立的网络命名空间里，连不到宿主机 `localhost` 上的服务；WSL2 里 worker 默认也调不了 Windows 程序（`cmd.exe`、`/mnt/c/...` 下的 exe）。
 - WSL2 可能在所有 WSL 终端都关掉一段时间后停掉整个发行版，ticketd 和 bridge 也随之停止；要常驻就保持一个 WSL 终端开着，或用 Windows 任务计划在登录时启动一个常驻的 `wsl.exe` 进程。这一条随 WSL 版本变化，本仓库没有验证。
+- 打包的 bridge 来自 fork 的固定提交（`vendor/bridge.lock.json`）：跟进上游是每季度或有需要的修复时在 fork 上 rebase、跑测试、改锁文件再发版；我们的通用修复同时给上游提 PR，但不等合并。
+- 一行安装的扫码建应用（`ticket setup` 调 bridge 的 `profile create`）和「用 bot 身份查应用所有者」没在新租户上端到端实测过（单测和临时 HOME 里用替身走过全流程）；查不到所有者时会改用 6 位码。
 - 依赖 lark-channel-bridge 注入的 `<bridge_context>` 字段（`chatId`、`messageIds`、`senderId`）；bridge 改了格式时，工作区约定里的派单命令需要跟着改。
 - 主会话（bridge 里做判断和派单的那个会话）目前只在 Claude Code 上写过、验证过：工作区约定是 `CLAUDE.md`。bridge 的 Codex 主会话（profile `agentKind: "codex"`）还没验证；能路由给 Codex 的是 worker。
 - 主会话由 bridge 管理，同一个会话一直续用（`--resume`），聊得越久上下文越长：实测一个主会话用了一天多累计约 35 美元，后面每条消息都在为整段历史付费，判断也更容易被旧话题带偏。ticketd 管不到这个会话；隔一段时间（比如一批工作做完）在飞书里发 `/new` 重开即可，工单不受影响（工单号、状态都在 ticketd 里，引用旧消息照常能追问）。
@@ -301,4 +335,4 @@ bin/ticket doctor [--dm]                            # 配置自检：和守护�
 
 ## 许可
 
-[MIT](./LICENSE)。上游 lark-channel-bridge 同为 MIT，版权归其贡献者，见 [NOTICE.md](./NOTICE.md)。
+[MIT](./LICENSE)。打包的 lark-channel-bridge 同为 MIT，版权归其贡献者；它的生产依赖（MIT、BSD-3-Clause、ISC、Apache-2.0）的许可证文本随包附在 `vendor/bridge/THIRD_PARTY_NOTICES.md`。见 [NOTICE.md](./NOTICE.md)。

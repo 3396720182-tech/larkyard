@@ -17,3 +17,14 @@
 #### Scenario: 想退回 npm 安装
 - **WHEN** 迁移后执行 `ticket bridge adopt --undo`
 - **THEN** 服务文件、`secrets-getter`、每日重启任务、ticketd 服务文件和迁移前逐字节相同，bridge 由原来的 npm 安装运行
+
+### Requirement: 不在会被打断的地方动手
+会重启 bridge 的命令（`ticket bridge adopt`、`--undo`、`ticket bridge restart`、`ticket setup`）在环境里有 `LARK_CHANNEL=1`（bridge 驱动的会话）时 MUST 拒绝；`--dry-run` 和 `status` 不受限。`adopt` 在 ticketd 服务还在直接跑克隆、或有正在运行的工单时 MUST 拒绝并说明先做什么；认不出「每天一次」的重启任务时 MUST 拒绝。迁移中途失败时 SHALL 只重新加载已经改过的服务。
+
+#### Scenario: 主会话被要求迁移
+- **WHEN** 用户在飞书里让主会话执行 `ticket bridge adopt`
+- **THEN** 命令拒绝，提示在自己的终端里执行；没有任何文件被改，bridge 没有重启
+
+#### Scenario: ticketd 还在跑克隆
+- **WHEN** ticketd 服务的启动命令是克隆里的 `bin/ticketd`
+- **THEN** `adopt` 拒绝，提示先 `ticket update adopt`
