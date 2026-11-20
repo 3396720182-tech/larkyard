@@ -766,6 +766,12 @@ def prune(keep: int = KEEP_VERSIONS) -> list:
         return []
     st = read_state()
     protect = {current_version(), st.get("from"), st.get("to"), st.get("version"), st.get("previous")}
+    try:  # bridge 服务跑的是 bridge/current 指向的那个版本目录里的 bridge，不能删
+        from . import bridge
+        protect.add(bridge.bridge_version_dir())
+        protect.add(Path(bridge.read_state().get("previous") or "x").parent.parent.name)
+    except Exception:
+        pass
     dirs = sorted((p for p in vd.iterdir() if p.is_dir() and not p.name.startswith(".")),
                   key=lambda p: p.stat().st_mtime, reverse=True)
     keepset = {p.name for p in dirs[:keep]} | {v for v in protect if v}
@@ -896,7 +902,15 @@ def confirm(con, version: Optional[str] = None, now: Optional[float] = None) -> 
         _drop_pending(con)
     replaced = install_launcher(versions_dir() / version)
     prune()
-    event(con, "confirmed", "%s 自检通过%s" % (version, "，启动器已更新" if replaced else ""), dedupe=False)
+    pending_bridge = None
+    try:  # 新版本带的 bridge 和在用的不同：只记下待生效，等每天的重启窗口换上（Larkyard 更新不重启 bridge）
+        from . import bridge
+        pending_bridge = bridge.note_pending(con)
+    except Exception:
+        pass
+    event(con, "confirmed", "%s 自检通过%s%s" % (version, "，启动器已更新" if replaced else "",
+                                                "，新 bridge %s 待生效" % pending_bridge if pending_bridge else ""),
+          dedupe=False)
     return True
 
 

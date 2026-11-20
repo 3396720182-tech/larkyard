@@ -98,6 +98,17 @@ def build_parser() -> argparse.ArgumentParser:
     en.add_argument("--leave", action="store_true", help="退出控制台：通知控制台并删除本机的设备令牌和控制台配置")
     cs = sub.add_parser("console", help="控制台接入（只读）：status / show（下一次心跳的完整内容）")
     cs.add_argument("action", nargs="?", default="status", choices=("status", "show"))
+    se = sub.add_parser("setup", help="安装向导（只由本人在终端执行）：飞书应用、工作区、服务、认主人、用户授权、自检")
+    se.add_argument("--profile", default="", help="bridge 的 profile 名（默认 claude）")
+    se.add_argument("--workspace", default="", help="工作区目录（默认 ~/larkyard-workspace；已有 profile 时用它的）")
+    se.add_argument("--app-id", default="", help="用已有的飞书应用（App Secret 会在终端里不回显地问）")
+    se.add_argument("--user-auth", action="store_true", help="只做用户身份授权（lark-cli auth login）")
+    br = sub.add_parser("bridge", help="打包的 bridge：status / restart [--if-stale] / adopt [--dry-run | --undo]")
+    br.add_argument("action", nargs="?", default="status", choices=("status", "restart", "adopt"))
+    br.add_argument("--profile", default="", help="bridge 的 profile 名（默认按 ~/.lark-channel/active-profile）")
+    br.add_argument("--if-stale", action="store_true", help="restart：在用的已是当前版本带的 bridge 就不重启")
+    br.add_argument("--dry-run", action="store_true", help="adopt：只列出要改的文件")
+    br.add_argument("--undo", action="store_true", help="adopt：按备份原样退回")
     return p
 
 
@@ -317,7 +328,7 @@ def _status_lines(con, t) -> list:
 
 # ticket doctor 每一项的稳定英文 id（控制台心跳的 doctor.failed 用它，改名要同步控制台；格式 ^[a-z0-9_.-]{1,40}$）
 DOCTOR_IDS = ("config", "config.unknown", "workspace", "costs", "owner", "daemon", "dm", "update", "telemetry",
-              "console")
+              "console", "bridge")
 
 
 def doctor_checks(con, dm: bool = False, costs: bool = True) -> list:
@@ -374,6 +385,11 @@ def doctor_checks(con, dm: bool = False, costs: bool = True) -> list:
         lines.append(("console", console.doctor_line(con)))
     except Exception as e:
         lines.append(("console", "⚠️ 控制台状态读不出来：%r" % (e,)))
+    try:
+        from . import bridge
+        lines.append(("bridge", bridge.doctor_line()))
+    except Exception as e:
+        lines.append(("bridge", "⚠️ bridge 状态读不出来：%r" % (e,)))
     return lines
 
 
@@ -467,6 +483,47 @@ def cmd_console(con, a) -> str:
     return console.command_console(con, a.action)
 
 
+def cmd_setup(con, a) -> str:
+    from . import bridge, setup
+    try:
+        code = setup.run(a.profile, a.workspace, a.app_id, user_auth_only=a.user_auth)
+    except (setup.SetupError, bridge.BridgeError) as e:
+        raise core.TicketError(str(e))
+    except (KeyboardInterrupt, EOFError):
+        raise core.TicketError("已取消（重新执行 ticket setup 会从没做完的那一步接着做）")
+    if code:
+        raise core.TicketError("向导没有完成")
+    return ""
+
+
+def _confirm_yes(text: str) -> bool:
+    from . import setup
+    t = setup.Term()
+    if not t.interactive:
+        raise core.TicketError("要在终端里确认：不能在管道或脚本里执行")
+    t.say(text)
+    return t.ask("输入 yes 继续：") == "yes"
+
+
+def cmd_bridge(con, a) -> str:
+    from . import bridge
+    try:
+        if a.action == "status":
+            return "\n".join(bridge.status_lines(a.profile))
+        if a.action == "restart":
+            return "\n".join(bridge.restart(a.profile, if_stale=a.if_stale,
+                                             notify=lambda text: metrics.send_owner(con, text)))
+        if a.undo:
+            return "\n".join(bridge.undo_adopt())
+        if a.dry_run:
+            return "\n".join(bridge.adopt_plan_lines(bridge.adopt_plan(a.profile)) + ["（--dry-run：没有改任何东西）"])
+        return "\n".join(bridge.adopt(a.profile, confirm=_confirm_yes))
+    except bridge.BridgeError as e:
+        raise core.TicketError(str(e))
+    except (KeyboardInterrupt, EOFError):
+        raise core.TicketError("已取消")
+
+
 def cmd_stats(con, a) -> str:
     out = []
     if a.backfill:
@@ -517,6 +574,7 @@ COMMANDS = {
     "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "restart": cmd_restart, "approve": cmd_approve, "grant": cmd_grant,
     "ls": cmd_ls, "show": cmd_show, "stats": cmd_stats, "doctor": cmd_doctor,
     "telemetry": cmd_telemetry, "update": cmd_update, "enroll": cmd_enroll, "console": cmd_console,
+    "setup": cmd_setup, "bridge": cmd_bridge,
 }
 
 

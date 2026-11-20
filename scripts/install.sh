@@ -15,16 +15,31 @@ if [ -n "$APP" ]; then
   BINROOT="$APP/current"
 fi
 OS="$(uname -s)"
-case "$OS" in Darwin|Linux) ;; *) echo "install: 不支持 $OS（只支持 macOS 和 Linux / WSL2）" >&2; exit 1;; esac
+case "$OS" in Darwin|Linux) ;; *) echo "install: 不支持 ${OS}（只支持 macOS 和 Linux / WSL2）" >&2; exit 1;; esac
 LABEL="${TICKETD_LABEL:-dev.larkyard.ticketd}"
 TICKETD_HOME="${TICKETD_HOME:-$HOME/.ticketd}"
 LC_HOME="${LARK_CHANNEL_HOME:-$HOME/.lark-channel}"
 LC_PROFILE="${LARK_CHANNEL_PROFILE:-claude}"
 PY="${TICKETD_PYTHON:-/usr/bin/python3}"
 if [ -z "${TICKETD_PYTHON:-}" ] && [ ! -x "$PY" ]; then PY="$(command -v python3 || echo /usr/bin/python3)"; fi
-for t in node lark-cli claude; do command -v "$t" >/dev/null 2>&1 || { echo "install: missing $t on PATH" >&2; exit 1; }; done
-NODE_DIR="$(dirname "$(command -v node)")"
-LARK_DIR="$(dirname "$(command -v lark-cli)")"
+# 一行安装 / ticket bridge adopt 装好的固定目录（$TICKETD_HOME/runtime/node、$TICKETD_HOME/bin/lark-cli）优先：
+# 不跟着 nvm 切版本走。没有这两个目录时和以前一样从 PATH 上找，生成的文件不变
+NODE_DIR=""; LARK_DIR=""
+[ -x "$TICKETD_HOME/runtime/node/bin/node" ] && NODE_DIR="$TICKETD_HOME/runtime/node/bin"
+[ -x "$TICKETD_HOME/bin/lark-cli" ] && LARK_DIR="$TICKETD_HOME/bin"
+for t in node lark-cli claude; do
+  case "$t" in node) [ -n "$NODE_DIR" ] && continue;; lark-cli) [ -n "$LARK_DIR" ] && continue;; esac
+  command -v "$t" >/dev/null 2>&1 || { echo "install: missing $t on PATH" >&2; exit 1; }
+done
+[ -n "$NODE_DIR" ] || NODE_DIR="$(dirname "$(command -v node)")"
+[ -n "$LARK_DIR" ] || LARK_DIR="$(dirname "$(command -v lark-cli)")"
+# 用了固定目录的 Node 时，PATH 上原来那份 Node 的目录接在后面：worker 还要用 npm / npx 和 npm 全局装的工具
+case "$NODE_DIR" in
+  "$TICKETD_HOME"/runtime/*)
+    USER_NODE="$(command -v node 2>/dev/null || true)"
+    case "$USER_NODE" in /mnt/[a-z]/*) USER_NODE="";; esac  # WSL2：Windows 盘上的 node 不要
+    if [ -n "$USER_NODE" ] && [ "$(dirname "$USER_NODE")" != "$NODE_DIR" ]; then NODE_DIR="$NODE_DIR:$(dirname "$USER_NODE")"; fi;;
+esac
 CLAUDE_DIR="$(dirname "$(command -v claude)")"
 CODEX_DIR=""  # 可选：装了 codex 就把它所在目录也放进 PATH（Codex 执行器用）
 if command -v codex >/dev/null 2>&1; then CODEX_DIR="$(dirname "$(command -v codex)"):"; fi
@@ -82,7 +97,7 @@ if [ -n "$APP" ] && ! render | grep -q "$APP/launcher.py"; then
 fi
 if [ "${1:-}" = "--print" ]; then render; exit 0; fi
 "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null \
-  || { echo "install: 需要 Python 3.9+（当前：$PY）；用 TICKETD_PYTHON 指定解释器" >&2; exit 1; }
+  || { echo "install: 需要 Python 3.9+（当前：${PY}）；用 TICKETD_PYTHON 指定解释器" >&2; exit 1; }
 if [ "$OS" = Linux ]; then
   if ! command -v systemctl >/dev/null 2>&1 || ! systemctl --user show-environment >/dev/null 2>&1; then
     echo "install: 没有可用的 systemd 用户实例（systemctl --user 连不上）。" >&2
@@ -96,7 +111,7 @@ if [ "$OS" = Linux ]; then
   case "$XDG_CFG" in *[[:space:]]*|*'&'*|*'|'*) echo "install: systemd 的 XDG_CONFIG_HOME 路径不支持：$XDG_CFG" >&2; exit 1;; esac
   SERVICE_FILE="$XDG_CFG/systemd/user/$LABEL.service"
   for t in bwrap socat; do
-    command -v "$t" >/dev/null 2>&1 || echo "install: ⚠️ PATH 上没有 $t：worker 的沙箱要用它，没有时 worker 会起不来（Ubuntu/Debian：sudo apt-get install bubblewrap socat）" >&2
+    command -v "$t" >/dev/null 2>&1 || echo "install: ⚠️ PATH 上没有 ${t}：worker 的沙箱要用它，没有时 worker 会起不来（Ubuntu/Debian：sudo apt-get install bubblewrap socat）" >&2
   done
   if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ] \
      && [ ! -e /etc/apparmor.d/bwrap ] && [ ! -e /etc/apparmor.d/bwrap-userns-restrict ]; then

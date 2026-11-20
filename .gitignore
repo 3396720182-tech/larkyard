@@ -6,3 +6,6 @@ config.env
 CLAUDE.local.md
 # 测试替身 fake_codex 在当前目录留下的调用记录
 .fake_argv.jsonl
+
+# 打包的 bridge（scripts/build_bridge.py 的输出，发版时由 release.py --bridge 放进包，不进仓库）
+vendor/bridge/

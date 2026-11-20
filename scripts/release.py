@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Larkyard 的发版工具（openspec add-signed-self-update，格式见 docs/spec.md §11）。只在发布者自己的电脑上跑。
 
-  release.py release  --tag v0.3.0 --key <主私钥> [--min-from 0.2.0] [--notes ...]
-        从 tag 打出可复现的版本包，一次签齐 canary / early / stable 三份清单
+  release.py release  --tag v0.3.0 --key <主私钥> --bridge <build_bridge.py 的输出目录> [--min-from 0.2.0] [--notes ...]
+        从 tag 打出可复现的版本包（tag 带 vendor/bridge.lock.json 时必须给 --bridge，放进包的 vendor/bridge/），
+        一次签齐 canary / early / stable 三份清单
   release.py rollback --version 0.2.1 --channel stable --key <主私钥> [--hours 72]
         给已发布过的旧版本签一份回滚清单（有效期默认 72 小时，最长 7 天），不重新打包
   release.py pause    --key <主私钥> [--weeks 12] [--start 2026-12-01T00:00:00Z]
@@ -12,6 +13,8 @@
   release.py publish  <签好的 .json> --to <更新源目录>
         把一份预签文件放到更新源的对应位置（不需要私钥）：通道清单、暂停标记、换钥清单
   release.py unpublish-pause --to <更新源目录>
+  release.py publish-installer --url https://<发布地址> --main <主公钥.pub> --backup <备份公钥.pub> --to <更新源目录>
+        把一行安装脚本（填好默认发布地址）和两把公钥放到更新源根目录：install.sh、keys/main.pub、keys/backup.pub
 
 签名用 `ssh-keygen -Y sign -n larkyard-release`，只接受 Ed25519（含硬件密钥 ed25519-sk）；--key 给 .pub 时用 ssh-agent 里的私钥。
 本工具不读、不复制、不记录私钥内容，也没有在服务器上签名的模式。
@@ -38,6 +41,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+from ticketd import bridge as _bridge  # noqa: E402
 from ticketd import updsig  # noqa: E402
 
 DEFAULT_HOURS = 72
@@ -83,8 +87,50 @@ def check_clean(repo: Path) -> None:
         raise ReleaseError("工作树有未提交的改动，先提交或还原")
 
 
-def build_package(repo: Path, commit: str, version: str, mtime: int) -> bytes:
-    """只含该提交里被跟踪的文件；固定 mtime（提交时间）、属主、权限和排序，gzip 头不带时间：同一 tag 两次打包字节相同。"""
+def bridge_files(repo: Path, commit: str, bridge_dir) -> list:
+    """tag 带 vendor/bridge.lock.json 时：核对 --bridge 目录（BRIDGE.json 的提交 = 锁文件、tree_sha256 = 实际内容），
+    返回 [(包内相对路径, 权限, 内容)]，放到 vendor/bridge/ 下。tag 没有锁文件时不能给 --bridge。"""
+    try:
+        raw = _git(repo, "show", "%s:vendor/bridge.lock.json" % commit)
+    except ReleaseError:
+        raw = None
+    try:
+        lock = json.loads(raw) if raw is not None else None
+    except ValueError as e:
+        raise ReleaseError("vendor/bridge.lock.json 不是合法的 JSON：%s" % e)
+    if lock is None:
+        if bridge_dir:
+            raise ReleaseError("这个 tag 没有 vendor/bridge.lock.json，不能打包 bridge")
+        return []
+    if not bridge_dir:
+        raise ReleaseError("这个 tag 要打包 bridge：先 scripts/build_bridge.py --out <目录>，再加 --bridge <目录>")
+    d = Path(bridge_dir)
+    info = _bridge.bridge_info(d)
+    if not info:
+        raise ReleaseError("%s 里没有有效的 BRIDGE.json" % d)
+    if info.get("commit") != lock.get("commit"):
+        raise ReleaseError("bridge 目录是提交 %s 构建的，锁文件要的是 %s" % (info.get("commit"), lock.get("commit")))
+    try:
+        actual = _bridge.tree_digest(d)
+    except _bridge.BridgeError as e:
+        raise ReleaseError(str(e))
+    if actual != info.get("tree_sha256"):
+        raise ReleaseError("bridge 目录的内容和 BRIDGE.json 记的不一致（构建之后被改过？）")
+    if not (d / _bridge.BRIDGE_ENTRY).is_file():
+        raise ReleaseError("bridge 目录里缺 %s" % _bridge.BRIDGE_ENTRY)
+    out = []
+    for dirpath, dirnames, filenames in os.walk(str(d)):
+        for name in filenames:
+            p = Path(dirpath) / name
+            rel = p.relative_to(d).as_posix()
+            mode = "100755" if os.stat(str(p)).st_mode & 0o111 else "100644"
+            out.append(("vendor/bridge/" + rel, mode, p))
+    return out
+
+
+def build_package(repo: Path, commit: str, version: str, mtime: int, extra=()) -> bytes:
+    """只含该提交里被跟踪的文件（加上 extra：打包的 bridge）；固定 mtime（提交时间）、属主、权限和排序，
+    gzip 头不带时间：同一 tag、同一 bridge 两次打包字节相同。"""
     prefix = "larkyard-%s" % version
     entries = []
     for line in _git(repo, "ls-tree", "-r", "-z", "--full-tree", commit).split("\0"):
@@ -95,6 +141,11 @@ def build_package(repo: Path, commit: str, version: str, mtime: int) -> bytes:
         if typ != "blob" or mode not in ("100644", "100755"):
             raise ReleaseError("不支持打包链接或子模块：%s" % path)
         entries.append((path, mode, obj))
+    tracked = {e[0] for e in entries}
+    for path, mode, src in extra:
+        if path in tracked:
+            raise ReleaseError("仓库里已有 %s，和打包的 bridge 冲突" % path)
+        entries.append((path, mode, src))
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tf:
         dirs = set()
@@ -107,7 +158,7 @@ def build_package(repo: Path, commit: str, version: str, mtime: int) -> bytes:
                     ti = tarfile.TarInfo("%s/%s" % (prefix, d))
                     ti.type, ti.mode, ti.mtime = tarfile.DIRTYPE, 0o755, mtime
                     tf.addfile(ti)
-            data = _git(repo, "cat-file", "blob", obj, binary=True)
+            data = obj.read_bytes() if isinstance(obj, Path) else _git(repo, "cat-file", "blob", obj, binary=True)
             ti = tarfile.TarInfo("%s/%s" % (prefix, path))
             ti.size, ti.mtime = len(data), mtime
             ti.mode = 0o755 if mode == "100755" else 0o644
@@ -243,7 +294,11 @@ def cmd_release(a) -> list:
     version, commit, when = tag_version(repo, a.tag)
     updsig.version_tuple(a.min_from)
     lines = ["⚠️ " + w for w in migration_warnings(repo, a.tag)]
-    pkg = build_package(repo, commit, version, when)
+    extra = bridge_files(repo, commit, a.bridge)
+    if extra:
+        info = _bridge.bridge_info(Path(a.bridge))
+        lines.append("bridge：%s（%s），%d 个文件" % (info.get("version"), info.get("commit"), len(extra)))
+    pkg = build_package(repo, commit, version, when, extra)
     name = "larkyard-%s.tar.gz" % version
     pdir = out / "packages"
     pdir.mkdir(parents=True, exist_ok=True)
@@ -370,6 +425,38 @@ def cmd_publish(a) -> list:
     return ["已发布：%s → %s" % (src, dst)]
 
 
+def cmd_publish_installer(a) -> list:
+    """一行安装脚本 + 两把公钥。脚本里的指纹必须就是这两把公钥的：不一致说明仓库里的 install.sh 没跟上换钥。"""
+    url = a.url.rstrip("/")
+    # 会被填进 install.sh 的双引号里：$ ` " \\ 会被 shell 解释（比如 Azure 的 $web），一律拒绝
+    if not re.fullmatch(r"https://[A-Za-z0-9._~:/?#\[\]@!&'()*+,;=%-]+", url):
+        raise ReleaseError("发布地址要 https://，且不能含 $ ` \" \\ 和空白")
+    repo = Path(a.repo)
+    check_clean(repo)
+    # 发布的是提交里的 install.sh（和仓库里的可以逐字节比对），不是工作树里的
+    text = _git(repo, "show", "HEAD:install.sh")
+    if '"@RELEASE_URL@"' not in text:
+        raise ReleaseError("install.sh 里没有 @RELEASE_URL@ 占位")
+    keys = {}
+    for label, arg, var in (("主公钥", a.main, "RELEASE_KEY_FP"), ("备份公钥", a.backup, "BACKUP_KEY_FP")):
+        k = updsig.parse_pubkey(updsig.read_pubkey_arg(arg))
+        m = re.search(r'^%s="(SHA256:[^"]+)"' % var, text, re.M)
+        if not m or m.group(1) != updsig.fingerprint(k):
+            raise ReleaseError("install.sh 里的 %s 指纹（%s）和给的%s（%s）不一致：先改仓库里的 install.sh" % (
+                var, m.group(1) if m else "无", label, updsig.fingerprint(k)))
+        keys[var] = k
+    to = Path(a.to)
+    (to / "keys").mkdir(parents=True, exist_ok=True)
+    for name, k in (("main.pub", keys["RELEASE_KEY_FP"]), ("backup.pub", keys["BACKUP_KEY_FP"])):
+        (to / "keys" / (name + ".tmp")).write_text(k + "\n", encoding="utf-8")
+        os.replace(str(to / "keys" / (name + ".tmp")), str(to / "keys" / name))
+    (to / "install.sh.tmp").write_text(text.replace('"@RELEASE_URL@"', '"%s"' % url, 1), encoding="utf-8")
+    os.chmod(str(to / "install.sh.tmp"), 0o755)
+    os.replace(str(to / "install.sh.tmp"), str(to / "install.sh"))
+    return ["已发布：%s/install.sh、keys/main.pub、keys/backup.pub" % to,
+            "员工执行：curl -fsSL %s/install.sh | sh" % url]
+
+
 def cmd_unpublish_pause(a) -> list:
     to = Path(a.to)
     for p in (to / "pause.json", to / "pause.json.sig"):
@@ -390,6 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--min-from", default="0.0.0", help="最低可升级起点版本")
     r.add_argument("--notes", default="")
     r.add_argument("--repo", default=str(REPO))
+    r.add_argument("--bridge", help="scripts/build_bridge.py 的输出目录（tag 带 vendor/bridge.lock.json 时必须给）")
     rb = sub.add_parser("rollback")
     rb.add_argument("--version", required=True)
     rb.add_argument("--channel", required=True)
@@ -410,11 +498,17 @@ def build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--packages")
     up = sub.add_parser("unpublish-pause")
     up.add_argument("--to", required=True)
+    pi = sub.add_parser("publish-installer")
+    pi.add_argument("--url", required=True, help="发布地址（https://，员工 curl 的就是 <地址>/install.sh）")
+    pi.add_argument("--main", required=True, help="主公钥（.pub 文件或内容）")
+    pi.add_argument("--backup", required=True, help="备份公钥（.pub 文件或内容）")
+    pi.add_argument("--to", required=True, help="更新源目录（静态文件根）")
+    pi.add_argument("--repo", default=str(REPO))
     return p
 
 
 COMMANDS = {"release": cmd_release, "rollback": cmd_rollback, "pause": cmd_pause, "rekey": cmd_rekey,
-            "publish": cmd_publish, "unpublish-pause": cmd_unpublish_pause}
+            "publish": cmd_publish, "unpublish-pause": cmd_unpublish_pause, "publish-installer": cmd_publish_installer}
 
 
 def main(argv=None) -> int:

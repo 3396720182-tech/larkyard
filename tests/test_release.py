@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -274,3 +275,135 @@ class ReleaseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseBridgeTest(unittest.TestCase):
+    """tag 带 vendor/bridge.lock.json：必须给 --bridge，核对提交和内容，放进 vendor/bridge/，可复现。"""
+    run_tool = ReleaseTest.run_tool
+    release = ReleaseTest.release
+    write_version = ReleaseTest.write_version
+
+    def setUp(self):
+        ReleaseTest.setUp(self)
+        from ticketd import bridge
+        self.bridge_mod = bridge
+        (self.repo / "vendor").mkdir()
+        (self.repo / "vendor" / "bridge.lock.json").write_text(json.dumps({"repo": "x", "commit": "c" * 40,
+                                                                          "version": "0.7.1"}))
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "lock")
+        git(self.repo, "tag", "v0.3.1")
+        self.write_version("0.3.1")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "v")
+        git(self.repo, "tag", "-f", "v0.3.1")
+        self.bdir = self.tmp / "bridge-out"
+        (self.bdir / "bin").mkdir(parents=True)
+        (self.bdir / "bin" / "lark-channel-bridge.mjs").write_text("// entry\n")
+        (self.bdir / "node_modules" / "dep").mkdir(parents=True)
+        (self.bdir / "node_modules" / "dep" / "index.js").write_text("module.exports = 1\n")
+        self.stamp()
+
+    def stamp(self, commit="c" * 40):
+        info = {"repo": "x", "commit": commit, "version": "0.7.1",
+                "tree_sha256": self.bridge_mod.tree_digest(self.bdir)}
+        (self.bdir / "BRIDGE.json").write_text(json.dumps(info))
+
+    def test_bridge_required_and_packed(self):
+        code, out, err = self.release("v0.3.1")
+        self.assertEqual(code, 1)
+        self.assertIn("build_bridge.py", err)
+        code, out, err = self.release("v0.3.1", "--bridge", str(self.bdir))
+        self.assertEqual(code, 0, err)
+        pkg = self.out / "packages" / "larkyard-0.3.1.tar.gz"
+        with tarfile.open(str(pkg)) as tf:
+            names = {m.name for m in tf.getmembers() if m.isfile()}
+            self.assertFalse([m.name for m in tf.getmembers() if m.issym() or m.islnk()])
+        self.assertIn("larkyard-0.3.1/vendor/bridge/bin/lark-channel-bridge.mjs", names)
+        self.assertIn("larkyard-0.3.1/vendor/bridge/node_modules/dep/index.js", names)
+        self.assertIn("larkyard-0.3.1/vendor/bridge/BRIDGE.json", names)
+        a = pkg.read_bytes()
+        pkg.unlink()
+        self.assertEqual(self.release("v0.3.1", "--bridge", str(self.bdir))[0], 0)
+        self.assertEqual(a, pkg.read_bytes())
+        # 老客户端的解包规则能装带 bridge 的包
+        from ticketd import update
+        dest = self.tmp / "x"
+        update.extract(pkg, dest, "larkyard-0.3.1")
+        self.assertEqual(self.bridge_mod.tree_digest(dest / "vendor" / "bridge"),
+                         json.loads((self.bdir / "BRIDGE.json").read_text())["tree_sha256"])
+
+    def test_wrong_commit_or_modified_tree_refused(self):
+        self.stamp(commit="d" * 40)
+        code, out, err = self.release("v0.3.1", "--bridge", str(self.bdir))
+        self.assertEqual(code, 1)
+        self.assertIn("锁文件", err)
+        self.stamp()
+        (self.bdir / "node_modules" / "dep" / "index.js").write_text("evil\n")
+        code, out, err = self.release("v0.3.1", "--bridge", str(self.bdir))
+        self.assertEqual(code, 1)
+        self.assertIn("不一致", err)
+        self.assertFalse((self.out / "packages" / "larkyard-0.3.1.tar.gz").exists())
+
+    def test_bridge_for_tag_without_lock_refused(self):
+        code, out, err = self.release("v0.3.0", "--bridge", str(self.bdir))
+        self.assertEqual(code, 1)
+
+
+class PublishInstallerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ticketd-pi-")).resolve()
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.main = signing.keygen(self.tmp, "main")
+        self.backup = signing.keygen(self.tmp, "backup")
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        text = (REPO / "install.sh").read_text(encoding="utf-8")
+        text = re.sub(r'^RELEASE_KEY_FP=".*"$', 'RELEASE_KEY_FP="%s"' % signing.fp(self.main), text, flags=re.M)
+        text = re.sub(r'^BACKUP_KEY_FP=".*"$', 'BACKUP_KEY_FP="%s"' % signing.fp(self.backup), text, flags=re.M)
+        (self.repo / "install.sh").write_text(text, encoding="utf-8")
+        git(self.repo, "init", "-q")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "i")
+
+    def run_pi(self, *extra):
+        from io import StringIO
+        from contextlib import redirect_stdout, redirect_stderr
+        o, e = StringIO(), StringIO()
+        with redirect_stdout(o), redirect_stderr(e):
+            code = release.main(["publish-installer", "--repo", str(self.repo), "--to", str(self.tmp / "site")]
+                                + list(extra))
+        return code, o.getvalue(), e.getvalue()
+
+    def test_fills_url_and_keys(self):
+        code, out, err = self.run_pi("--url", "https://dl.example.com/ly/", "--main", str(self.main) + ".pub",
+                                     "--backup", str(self.backup) + ".pub")
+        self.assertEqual(code, 0, err)
+        site = self.tmp / "site"
+        self.assertIn('RELEASE_URL="https://dl.example.com/ly"', (site / "install.sh").read_text(encoding="utf-8"))
+        self.assertEqual((site / "keys" / "main.pub").read_text().strip(),
+                         " ".join(signing.pub(self.main).split()[:2]))
+        self.assertTrue(os.access(str(site / "install.sh"), os.X_OK))
+
+    def test_fingerprint_mismatch_refused(self):
+        code, out, err = self.run_pi("--url", "https://dl.example.com", "--main", str(self.backup) + ".pub",
+                                     "--backup", str(self.main) + ".pub")
+        self.assertEqual(code, 1)
+        self.assertIn("指纹", err)
+        self.assertFalse((self.tmp / "site" / "install.sh").exists())
+
+    def test_unsafe_url_and_dirty_tree_refused(self):
+        keys = ("--main", str(self.main) + ".pub", "--backup", str(self.backup) + ".pub")
+        code, out, err = self.run_pi("--url", "https://acct.blob.core.windows.net/$web", *keys)
+        self.assertEqual(code, 1)
+        (self.repo / "install.sh").write_text("echo changed\n", encoding="utf-8")
+        code, out, err = self.run_pi("--url", "https://dl.example.com", *keys)
+        self.assertEqual(code, 1)
+        self.assertIn("未提交", err)
+
+    def test_repo_install_sh_fingerprints_are_well_formed(self):
+        text = (REPO / "install.sh").read_text(encoding="utf-8")
+        for var in ("RELEASE_KEY_FP", "BACKUP_KEY_FP"):
+            m = re.search(r'^%s="(.*)"$' % var, text, re.M)
+            self.assertTrue(m and updsig.FINGERPRINT_RE.match(m.group(1)), var)
+        self.assertIn('RELEASE_URL="@RELEASE_URL@"', text)

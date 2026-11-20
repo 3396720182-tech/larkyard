@@ -11,4 +11,4 @@ else
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
   rm -f "$HOME/Library/LaunchAgents/$LABEL.plist"
 fi
-echo "uninstalled $LABEL（数据保留在 ${TICKETD_HOME:-$HOME/.ticketd} 和工单目录）"
+echo "uninstalled ${LABEL}（数据保留在 ${TICKETD_HOME:-$HOME/.ticketd} 和工单目录）"

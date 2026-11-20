@@ -307,3 +307,16 @@ class InstallTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShellVarBoundaryTest(unittest.TestCase):
+    def test_no_bare_var_before_non_ascii(self):
+        """macOS 的 /bin/sh（bash 3.2）在 UTF-8 环境里把紧跟变量名的中文字节当成变量名的一部分：
+        "$X（" 会报 X?: unbound variable。脚本里变量后面紧跟非 ASCII 字符时要写 ${X}。"""
+        import re
+        bad = []
+        for p in sorted(REPO.glob("**/*.sh")) + [REPO / "bin" / "ticket", REPO / "bin" / "ticketd"]:
+            for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+                if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7f])", line):
+                    bad.append("%s:%d" % (p.relative_to(REPO), i))
+        self.assertEqual(bad, [])
