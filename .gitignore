@@ -4,3 +4,5 @@ __pycache__/
 # 个人配置不进仓库
 config.env
 CLAUDE.local.md
+# 测试替身 fake_codex 在当前目录留下的调用记录
+.fake_argv.jsonl
