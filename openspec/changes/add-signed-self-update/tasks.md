@@ -50,6 +50,7 @@
 - [ ] 6.3 有工单在跑、有沙箱外脚本在跑时不安装，结束后再装，工单不丢 （替身：`test_waits_for_running_ticket_then_installs` 覆盖「有工单在跑」；沙箱外脚本只有单测 `IdleTest`）
 - [ ] 6.4 发一个启动就崩的版本、一个 `bin/ticketd` 有语法错误的版本，都在 10 分钟内自动切回并收到私信 （替身：`test_crash_on_start_rolls_back_and_dms`、`test_syntax_error_entry_rolls_back`、另加 `test_hung_new_version_rolled_back_by_watchdog`）
 - [ ] 6.3a `adopt` 改写工作区 `CLAUDE.md`，自动更新后主会话用的是新版本，`adopt --undo` 恢复原文和原服务 （替身：`test_adopt_rewrites_workspace_survives_update_and_undo_restores`，install.sh 用替身）
+- [ ] 6.4b 切换之后出错（如记安装事件失败）仍重启；旧进程切换后没重启成时下一拍补发重启，新版本照常确认 （替身：`test_installed_event_failure_still_restarts`（真实守护进程里注入记事件失败）、`test_switched_behind_running_daemon_heals`；单测 `SwitchCommitTest`）
 - [ ] 6.4a 用备份私钥换钥一次，之后旧主私钥签的清单被拒 （替身：`tests/test_update.py` RekeyTest，单测层面）
 - [ ] 6.5 签名暂停标记生效；过期的暂停标记被忽略 （替身：`tests/test_update.py` PauseTest，单测层面）
 - [ ] 6.6 未配置更新源的安装：抓包或日志确认没有更新请求，匿名统计行为不变 （替身：`EnableTest.test_default_install_is_disabled_and_sends_nothing`，mock 掉网络层确认没有调用）

@@ -40,6 +40,7 @@ CODES = {
     "confirmed": "已确认", "rolled_back": "更新失败已回滚", "rollback_failed": "更新失败且切不回",
     "manual_rollback": "手工切回", "rekey": "已换钥", "rekey_invalid": "换钥清单无效", "pause_invalid": "暂停标记无效",
     "install_failed": "安装失败", "withdrawn": "待装版本被撤回",
+    "stale_code": "已切换但还在跑旧代码",
 }
 MANIFEST_LIMIT = 64 * 1024
 PACKAGE_LIMIT = 200 * 1024 * 1024
@@ -48,6 +49,7 @@ DOWNLOAD_TIMEOUT = 600.0
 KEEP_VERSIONS = 3
 PAUSE_MAX = 7 * 86400 + 3600  # 一份暂停标记最长 7 天（发版工具按 7 天窗口签；留一小时余量）
 CONFIRM_AFTER = 60.0       # 新版本守护进程转满这么久（且不超过试用期的 1/3）算自检通过
+HEAL_TRIES = 3            # 补发重启前记状态连续失败这么多次就放弃补发（见 Updater._heal）
 EXIT_RESTART = 75          # 切换版本后守护进程用这个退出码退出，由服务管理器重新拉起
 EVENT_DEDUPE = 86400.0     # 同一种、同一原因的更新事件一天只记一条（每小时检查一次，不刷屏）
 WORKER_DENIED = ("trust", "hold", "resume", "rollback", "adopt")
@@ -147,6 +149,23 @@ def is_managed(repo: Optional[Path] = None) -> bool:
         return cur.is_symlink() and cur.resolve() == repo and repo.parent == versions_dir().resolve()
     except OSError:
         return False
+
+
+def stale_code(repo: Optional[Path] = None) -> Optional[str]:
+    """当前运行的是某个版本目录里的代码，current 却已经指向另一个版本目录（切换之后没重启成）：返回 current 指向的
+    版本，否则 None。从克隆就地运行、没有 current 的都不算（按 current 重启也跑不到那里，会反复重启）。"""
+    repo = Path(repo or config.REPO).resolve()
+    cur = current_link()
+    try:
+        vd = versions_dir().resolve()
+        if repo.parent != vd or not cur.is_symlink():
+            return None
+        target = cur.resolve()
+        if target == repo or target.parent != vd or not (target / "bin" / "ticketd").is_file():
+            return None
+        return target.name
+    except OSError:
+        return None
 
 
 def kv_json(con, key: str, default=None):
@@ -742,6 +761,42 @@ def confirm_deadline(start: float, probation: Optional[float] = None) -> float:
     return start + max(p - 120.0, p / 2.0)
 
 
+def restart_window(version: str, now: Optional[float] = None, mark: bool = True) -> bool:
+    """旧进程切换后没重启成（Updater._heal）：新版本一次都还没被拉起过（starts 为 0、看门狗没动手）时，试用期从现在
+    重新算——不然等空闲的这段时间算进新版本的试用期，旧进程这时退出（补发的重启、用户重启服务、崩溃），启动器一拉起
+    就按超时切回、把没跑过的新版本拉黑。mark=True（真要重启时）还记下这时的 starts，下一个进程据此判断这次重启
+    有没有经过启动器（heal_ineffective）。返回是否重算了试用期。"""
+    now = time.time() if now is None else now
+    with state_lock():
+        st = read_state()
+        if st.get("status") != "probation" or st.get("to") != version:
+            return False
+        try:
+            starts = int(st.get("starts") or 0)
+        except (TypeError, ValueError):
+            starts = 0
+        if mark:
+            st["healed_starts"] = starts
+        fresh = not starts and not st.get("timed_out")
+        if fresh:
+            deadline = confirm_deadline(now)
+            st.update(switched_at=now, deadline=deadline, window=deadline - now, boot=launcher.boot_time())
+        if mark or fresh:
+            write_state(st)
+    return fresh
+
+
+def heal_ineffective(st: dict) -> bool:
+    """上次补发重启之后 starts 没变：那次重启没经过启动器（服务没走启动器拉 current），再重启跑的也还是旧代码，
+    别反复重启。经过启动器的每次重启 starts 都加一，到上限启动器会切回，所以不会无限重启。"""
+    if "healed_starts" not in st:
+        return False
+    try:
+        return int(st.get("starts") or 0) <= int(st["healed_starts"])
+    except (TypeError, ValueError):
+        return True
+
+
 def after_rollback(con) -> Optional[str]:
     """守护进程启动时调用：启动器刚切回过就私信主用户一次、拉黑那个版本。返回私信内容（测试用）。"""
     st = read_state()
@@ -776,7 +831,7 @@ def confirm(con, version: Optional[str] = None, now: Optional[float] = None) -> 
             return False
         st.update(status="confirmed", version=version, previous=st.get("from"), confirmed_at=now)
         for k in ("from", "to", "deadline", "starts", "token", "window", "timed_out", "extended", "boot",
-                  "clean_exit"):
+                  "clean_exit", "healed_starts"):
             st.pop(k, None)
         write_state(st)
     metrics.kv_set(con, "update.installed_at", str(st.get("switched_at") or now))
@@ -824,6 +879,8 @@ class Updater:
         self.enabled_at = 0.0
         self.enabled = False
         self.restart = False
+        self.healing = False  # 发现「已切换、还在跑旧代码」，正在等空闲后重启
+        self.heal_failures = 0
         try:
             after_rollback(con)
         except Exception:
@@ -856,6 +913,13 @@ class Updater:
         """返回 True = 已切换版本，守护进程应按停机流程退出、由服务管理器重新拉起。"""
         now = self.clock()
         st = read_state()
+        stale = stale_code() if st.get("status") == "probation" and not heal_ineffective(st) else None
+        if self.healing and not stale:
+            self.healing = False  # 状态已经变了（比如被手工处理）：不再等重启，放开调度
+            if sched is not None:
+                sched.update_hold = False
+        if stale:
+            return self._heal(stale, st, sched, media)
         if st.get("status") == "probation":
             if st.get("to") == __version__ and healthy and \
                     now - self.started >= min(CONFIRM_AFTER, config.update_probation() / 3.0) and not self_check(self.con):
@@ -891,6 +955,11 @@ class Updater:
         try:
             install(self.con, pend, now=now)
         except Exception as e:
+            if self._switched(pend.get("version")):
+                # current 已经切到新版本（提交点之后才出的错）：照样重启，update_hold 不放开
+                print("update: 切换到 %s 之后出错（%r），照样重启" % (pend.get("version"), e), flush=True)
+                self.restart = True
+                return True
             if sched is not None:
                 sched.update_hold = False
             if isinstance(e, PendingDropped):
@@ -907,6 +976,53 @@ class Updater:
                     _drop_pending(self.con)
                 else:
                     kv_put(self.con, "update.pending", pend)
+            return False
+        self.restart = True
+        return True
+
+    @staticmethod
+    def _switched(version) -> bool:
+        """install 抛出之后核对：试用期已经写下、current 已经指向这个版本、本进程还在跑别的版本目录。"""
+        try:
+            st = read_state()
+            return bool(version) and st.get("status") == "probation" and st.get("to") == version \
+                and stale_code() == version
+        except Exception:
+            return False
+
+    def _heal(self, target: str, st: dict, sched, media) -> bool:
+        """试用期里 current 已经指向 target、本进程却还在跑旧版本（切换之后没退出成，比如当时记事件出错、
+        或者旧代码就没有请求重启）：CLI 和守护进程会分别跑新旧两份代码。不再接新活，空闲后按新的 current 重启。"""
+        if self.heal_failures >= HEAL_TRIES:
+            return False  # 记不下状态：放弃补发（tick 已放开调度），照旧跑，免得没有防循环标记就反复重启
+        if sched is not None:
+            sched.update_hold = True
+        if not self.healing:
+            self.healing = True
+            print("update: current 已切到 %s，本进程还在跑 %s：空闲后重启" % (target, __version__), flush=True)
+            try:
+                event(self.con, "stale_code", "current 已切到 %s，守护进程还在跑 %s，空闲后重启" % (target, __version__),
+                      dedupe=False)
+            except Exception:
+                pass
+        try:
+            # 等空闲期间新版本的试用期不能先过期：剩不到一半就重算（starts 为 0 时），旧进程随时退出都不会被判超时
+            left = float(st.get("deadline") or 0) - time.time()
+            if not st.get("starts") and left < float(st.get("window") or 0) / 2.0:
+                restart_window(target, mark=False)
+        except Exception:
+            pass
+        if busy_reasons(self.con, sched, media):
+            return False
+        try:
+            restart_window(target)
+        except Exception as e:
+            self.heal_failures += 1
+            print("update: 补发重启前记状态失败（第 %d 次）：%r" % (self.heal_failures, e), flush=True)
+            if self.heal_failures >= HEAL_TRIES:
+                self.healing = False
+                if sched is not None:
+                    sched.update_hold = False
             return False
         self.restart = True
         return True
@@ -982,7 +1098,13 @@ def install(con, pend: dict, now: Optional[float] = None) -> str:
     except Exception as e:
         event(con, "install_failed", "%s：%r" % (version, e), dedupe=False)
         raise
-    event(con, "installed", "%s → %s（%s，序号 %s）" % (cur, version, pend.get("kind"), pend.get("seq")), dedupe=False)
+    # current 切换成功就是提交点：之后哪一步出错都不能抛给调用方，不然它当成没装上、放开 update_hold 接着用旧代码接单，
+    # 磁盘上却已经是新版本的试用期（外部评测 P1；手工切回同理，见 Updater._manual_rollback）
+    try:
+        event(con, "installed", "%s → %s（%s，序号 %s）" % (cur, version, pend.get("kind"), pend.get("seq")),
+              dedupe=False)
+    except Exception as e:
+        print("update: 已切换到 %s，记安装事件失败：%r" % (version, e), flush=True)
     return version
 
 

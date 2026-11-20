@@ -2,7 +2,7 @@
 用一个模仿 launchd KeepAlive / systemd Restart=always 的小监督器反复拉起「解释器 + 版本目录外的启动器」。
 
 覆盖 tasks 6.1（正常升级）、6.3（等工单跑完再装）、6.4（启动就崩、bin/ticketd 有语法错误、活着但从不确认的版本
-都自动切回并私信）、验签失败 / 降级 / 重放旧清单被拒，以及 adopt（改写工作区 CLAUDE.md）→ 自动更新 → adopt --undo。
+都自动切回并私信）、切换后写事件失败仍重启、切换后没重启成的旧进程补发重启、验签失败 / 降级 / 重放旧清单被拒，以及 adopt（改写工作区 CLAUDE.md）→ 自动更新 → adopt --undo。
 慢（每个用例几十秒），默认跳过；TICKETD_E2E_UPDATE=1 时运行。"""
 from __future__ import annotations
 
@@ -198,6 +198,73 @@ class SelfUpdateE2E(unittest.TestCase):
         out = self.ticket("update", "status").stdout
         self.assertIn("当前版本：9.0.1", out)
         self.assertIn("已确认", out)
+
+    def restarts(self):
+        return (self.tmp / "supervisor.log").read_text().count("exit 75")
+
+    def codes(self):
+        import sqlite3
+        con = sqlite3.connect(str(self.th / "db" / "ticketd.db"))
+        rows = [r[0] for r in con.execute("SELECT code FROM events WHERE kind='update'")]
+        con.close()
+        return rows
+
+    # 故障注入：经 PYTHONPATH 上的 sitecustomize，在真实守护进程导入 ticketd.update 时把 event 换成记 installed 就抛错
+    FAULT = '''import importlib.util, sys
+class _Hook:
+    def find_spec(self, name, path, target=None):
+        if name != "ticketd.update":
+            return None
+        sys.meta_path.remove(self)
+        try:
+            spec = importlib.util.find_spec(name)
+        finally:
+            sys.meta_path.insert(0, self)
+        orig = spec.loader.exec_module
+        def exec_module(module):
+            orig(module)
+            real = module.event
+            def event(con, code, *a, **k):
+                if code == "installed":
+                    raise RuntimeError("injected: installed event")
+                return real(con, code, *a, **k)
+            module.event = event
+        spec.loader.exec_module = exec_module
+        return spec
+sys.meta_path.insert(0, _Hook())
+'''
+
+    def test_installed_event_failure_still_restarts(self):
+        """切换后写 installed 事件失败（真实守护进程里注入）：照样按重启码退出、新版本确认（P1）。"""
+        fault = self.tmp / "fault"
+        fault.mkdir()
+        (fault / "sitecustomize.py").write_text(self.FAULT)
+        self.env["PYTHONPATH"] = str(fault)
+        self.adopt()
+        self.supervise()
+        self.wait_for(lambda: (self.th / "heartbeat").exists(), 30, "启动")
+        self.tag("9.0.1")
+        self.force_check()
+        self.wait_for(lambda: self.current() == "9.0.1", 60, "切换到 9.0.1")
+        self.wait_for(lambda: self.state().get("status") == "confirmed", 120, "确认 9.0.1")
+        self.assertEqual(self.restarts(), 1)
+        self.assertNotIn("installed", self.codes())  # 注入确实生效了
+        self.assertIn("当前版本：9.0.1", self.ticket("update", "status").stdout)
+
+    def test_switched_behind_running_daemon_heals(self):
+        """另一个进程完成了切换、在跑的守护进程没退出（旧代码没请求重启的情形）：下一拍补发重启，新版本确认。"""
+        self.adopt()
+        self.supervise()
+        self.wait_for(lambda: (self.th / "heartbeat").exists(), 30, "启动")
+        self.ticket("update", "hold")  # 守护进程自己不装，由下面的进程装
+        self.tag("9.0.1")
+        self.force_check()
+        self.run_py(self.repo, "from ticketd import db\ncon = db.connect()\n"
+                               "out = update.install(con, update.kv_json(con, 'update.pending'))")
+        self.assertEqual(self.current(), "9.0.1")
+        self.wait_for(lambda: self.state().get("status") == "confirmed", 120, "确认 9.0.1")
+        self.assertEqual(self.restarts(), 1)
+        self.assertIn("stale_code", self.codes())
 
     def test_crash_on_start_rolls_back_and_dms(self):
         self.adopt()

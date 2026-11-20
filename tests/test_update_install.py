@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -564,6 +565,231 @@ class ManualRollbackTest(ManagedBase):
         with mock.patch.object(update, "is_managed", return_value=True):
             with self.assertRaises(update.UpdateError):
                 update.command(self.con, SimpleNamespace(action="rollback"))
+
+
+class SwitchCommitTest(ManagedBase):
+    """current 切换成功就是提交点：之后出错也要重启；切换之后没重启成的旧进程，下一拍补发重启（外部评测 P1）。
+    守护进程跑的是 versions/0.3.0（config.REPO 指过去），current 由安装切到 0.3.1。"""
+
+    def setUp(self):
+        super().setUp()
+        import hashlib
+        tgz = update.update_dir() / "pending" / "larkyard-0.3.1.tar.gz"
+        tgz.parent.mkdir(parents=True)
+        data = signing.package("0.3.1")
+        tgz.write_bytes(data)
+        self.pend = {"version": "0.3.1", "kind": "release", "seq": 5, "sha256": hashlib.sha256(data).hexdigest(),
+                     "package": tgz.name}
+        update.kv_put(self.con, "update.pending", self.pend)
+        for p in (mock.patch.object(config, "REPO", self.app / "versions" / "0.3.0"),
+                  mock.patch.object(update, "__version__", "0.3.0")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def sched(self):
+        class S:
+            running, runs, update_hold = {}, {}, False
+        return S()
+
+    def updater(self):
+        up = update.Updater(self.con)
+        up._enabled = lambda: True
+        up.next_check = float("inf")
+        return up
+
+    def fail_event(self, code):
+        """故障注入：记某一种更新事件时数据库报错（其余事件照常写）。"""
+        real = update.event
+
+        def ev(con, c, *a, **k):
+            if c == code:
+                raise sqlite3.OperationalError("database is locked")
+            return real(con, c, *a, **k)
+        return mock.patch.object(update, "event", side_effect=ev)
+
+    def codes(self):
+        return [r["code"] for r in self.con.execute("SELECT code FROM events WHERE kind='update' ORDER BY id")]
+
+    def test_install_does_not_raise_after_switch(self):
+        with self.fail_event("installed"):
+            self.assertEqual(update.install(self.con, self.pend), "0.3.1")
+        self.assertEqual(update.current_version(), "0.3.1")
+        self.assertEqual(update.read_state()["status"], "probation")
+
+    def test_installed_event_failure_still_restarts(self):
+        """切换后写 installed 事件失败：仍然请求重启、update_hold 不放开，待安装不记失败、不拉黑。"""
+        s, up = self.sched(), self.updater()
+        with self.fail_event("installed"):
+            self.assertTrue(up.tick(s, None))
+        self.assertTrue(up.restart)
+        self.assertTrue(s.update_hold)
+        self.assertEqual(update.current_version(), "0.3.1")
+        st = update.read_state()
+        self.assertEqual((st["status"], st["from"], st["to"]), ("probation", "0.3.0", "0.3.1"))
+        self.assertNotIn("0.3.1", update.blocked_versions(self.con))
+        self.assertNotIn("failures", update.kv_json(self.con, "update.pending"))
+        self.assertNotIn("install_failed", self.codes())
+
+    def test_any_failure_after_switch_still_restarts(self):
+        """提交点之后的其他意外（比如放锁时出错）：_maybe_install 按磁盘上的状态核对，照样重启。"""
+        real = update.install
+
+        def install_then_raise(con, pend, now=None):
+            real(con, pend, now=now)
+            raise OSError("unlock failed")
+        s = self.sched()
+        with mock.patch.object(update, "install", side_effect=install_then_raise):
+            self.assertTrue(self.updater().tick(s, None))
+        self.assertTrue(s.update_hold)
+        self.assertNotIn("0.3.1", update.blocked_versions(self.con))
+
+    def test_failure_before_switch_releases_hold(self):
+        """切换本身失败：状态改回、current 不动、放开 update_hold 接着用旧版本（不能误判成已切换）。"""
+        s = self.sched()
+        with mock.patch.object(launcher, "switch", side_effect=OSError("disk full")):
+            self.assertFalse(self.updater().tick(s, None))
+        self.assertFalse(s.update_hold)
+        self.assertEqual(update.current_version(), "0.3.0")
+        self.assertEqual(update.read_state()["status"], "confirmed")
+        self.assertEqual(update.kv_json(self.con, "update.pending")["failures"], 1)
+
+    def test_next_tick_reissues_restart(self):
+        """旧进程切换后没重启、已经恢复接单（不管什么原因）：下一拍看到试用期 + current 不是自己，补发重启。
+        新版本一次都没被拉起过，试用期从重启时重新算，等空闲的时间不算进去。"""
+        self.probation(deadline=time.time() - 5)  # 旧进程拖过了原来的 deadline
+        s = self.sched()
+        up = update.Updater(self.con)
+        self.assertTrue(up.tick(s, None))
+        self.assertTrue(up.restart)
+        self.assertTrue(s.update_hold)
+        st = update.read_state()
+        self.assertEqual((st["status"], st["to"], st["starts"]), ("probation", "0.3.1", 0))
+        self.assertGreater(st["deadline"], time.time())
+        self.assertIn("stale_code", self.codes())
+        # 启动器拉起时按新的 deadline 算：不会按超时切回
+        self.assertEqual(launcher.decide(str(self.app))["status"], "probation")
+        self.assertEqual(update.current_version(), "0.3.1")
+
+    def test_heal_waits_for_idle_and_holds_new_work(self):
+        self.probation()
+        tid = self.new_ticket()
+        self.con.execute("UPDATE tickets SET state='running' WHERE id=?", (tid,))
+        s = self.sched()
+        up = update.Updater(self.con)
+        self.assertFalse(up.tick(s, None))
+        self.assertTrue(s.update_hold)  # 不再启动新 worker
+        self.assertFalse(up.tick(s, None))
+        self.assertEqual(self.codes().count("stale_code"), 1)  # 只记一次
+        self.con.execute("UPDATE tickets SET state='idle' WHERE id=?", (tid,))
+        self.assertTrue(up.tick(s, None))
+
+    def test_waiting_keeps_trial_window_open(self):
+        """等空闲期间新版本的试用期快到了就续上：这时用户重启服务（正常退出），启动器不会按超时切回、拉黑没跑过的版本。"""
+        self.probation(deadline=time.time() + 10)
+        st = update.read_state()
+        st["window"] = 480
+        update.write_state(st)
+        tid = self.new_ticket()
+        self.con.execute("UPDATE tickets SET state='running' WHERE id=?", (tid,))
+        self.assertFalse(update.Updater(self.con).tick(self.sched(), None))
+        self.assertGreater(update.read_state()["deadline"], time.time() + 200)
+        self.assertNotIn("healed_starts", update.read_state())  # 还没真重启，不记防循环标记
+        update.mark_clean_exit()
+        self.assertEqual(self.run_launcher().stdout.strip(), "ran-0.3.1")
+        self.assertEqual(update.read_state()["status"], "probation")
+
+    def test_state_write_failure_gives_up_instead_of_blind_restart(self):
+        """真要重启时记不下状态（没有防循环标记）：不盲目重启，重试几拍后放弃补发、放开调度照旧跑。"""
+        self.probation()
+        real = update.restart_window
+
+        def rw(version, now=None, mark=True):
+            if mark:
+                raise OSError("No space left on device")
+            return real(version, now, mark)
+        s, up = self.sched(), update.Updater(self.con)
+        with mock.patch.object(update, "restart_window", side_effect=rw):
+            for _ in range(update.HEAL_TRIES - 1):
+                self.assertFalse(up.tick(s, None))
+                self.assertTrue(s.update_hold)
+            self.assertFalse(up.tick(s, None))
+            self.assertFalse(s.update_hold)
+            self.assertFalse(up.tick(s, None))
+            self.assertFalse(s.update_hold)
+        self.assertFalse(up.restart)
+
+    def test_heal_releases_hold_if_state_resolved(self):
+        self.probation()
+        tid = self.new_ticket()
+        self.con.execute("UPDATE tickets SET state='running' WHERE id=?", (tid,))
+        s = self.sched()
+        up = update.Updater(self.con)
+        self.assertFalse(up.tick(s, None))
+        self.assertTrue(s.update_hold)
+        launcher.switch(str(self.app), "0.3.0")  # 别处已经处理好（比如手工切回）
+        update.write_state({"status": "confirmed", "version": "0.3.0"})
+        self.assertFalse(up.tick(s, None))
+        self.assertFalse(s.update_hold)
+
+    def test_heal_event_failure_still_restarts(self):
+        self.probation()
+        s = self.sched()
+        with self.fail_event("stale_code"):
+            self.assertTrue(update.Updater(self.con).tick(s, None))
+
+    def test_window_not_reset_once_new_version_started(self):
+        """新版本已经被拉起过（starts ≥ 1）或看门狗动过手：不重置试用期，崩溃 / 超时照常切回。"""
+        for extra in ({"starts": 1}, {"timed_out": True}):
+            self.probation(deadline=time.time() - 5)
+            st = update.read_state()
+            st.update(extra)
+            update.write_state(st)
+            self.assertFalse(update.restart_window("0.3.1"))
+            self.assertLess(update.read_state()["deadline"], time.time())
+
+    def test_no_restart_loop_when_service_bypasses_launcher(self):
+        """补发的重启没经过启动器（重启后 starts 没变，拉起来的还是旧代码）：不再反复重启，放开调度照旧跑。
+        经过了启动器（starts 加一）还是旧代码，才允许再补发一次（starts 到上限时启动器会切回，有界）。"""
+        self.probation()
+        self.assertTrue(update.Updater(self.con).tick(self.sched(), None))
+        self.assertEqual(update.read_state()["healed_starts"], 0)
+        s = self.sched()
+        self.assertFalse(update.Updater(self.con).tick(s, None))  # 服务直接拉起了旧版本目录
+        self.assertFalse(s.update_hold)
+        launcher.decide(str(self.app))  # 这次经过了启动器
+        self.assertTrue(update.Updater(self.con).tick(self.sched(), None))
+        with mock.patch.object(update, "__version__", "0.3.1"):
+            self.assertTrue(update.confirm(self.con, version="0.3.1"))
+        self.assertNotIn("healed_starts", update.read_state())
+
+    def test_no_heal_for_new_version_or_clone(self):
+        """跑的就是 current（新版本自己），或从克隆就地运行：不算旧代码，不请求重启（不然会反复重启）。"""
+        self.probation()
+        for repo in (self.app / "versions" / "0.3.1", REPO):
+            with mock.patch.object(config, "REPO", repo):
+                self.assertIsNone(update.stale_code())
+                s = self.sched()
+                self.assertFalse(update.Updater(self.con).tick(s, None))
+                self.assertFalse(s.update_hold)
+        self.assertEqual(update.stale_code(), "0.3.1")
+
+    def test_daemon_exits_for_restart_when_stale(self):
+        """真实主循环：旧进程启动时（或某一拍）看到已切换，按停机流程用重启退出码退出。"""
+        from ticketd import daemon
+        self.probation()
+        import gc
+        import warnings
+        n = [0]
+
+        def sleep(_):
+            n[0] += 1
+            if n[0] > 20:  # 没有请求重启时主循环会一直转：报错而不是卡住测试
+                raise AssertionError("主循环 20 拍都没有请求重启")
+        with mock.patch.object(daemon.time, "sleep", side_effect=sleep), warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            self.assertEqual(daemon.main(), update.EXIT_RESTART)
+            gc.collect()
+        self.assertNotIn("clean_exit", update.read_state())  # 重启算新版本的一次启动
 
 
 class DaemonExitTest(TicketdTestCase):
