@@ -320,7 +320,7 @@ DOCTOR_IDS = ("config", "config.unknown", "workspace", "costs", "owner", "daemon
               "console")
 
 
-def doctor_checks(con, dm: bool = False) -> list:
+def doctor_checks(con, dm: bool = False, costs: bool = True) -> list:
     """守护进程由 launchd / systemd 启动，只读 config.env；ticket 命令在 Claude Code 会话里跑，会先读环境变量
     （如 ~/.claude/settings.json 的 env）。两边不一致时，派单正常但守护进程的私信、执行会用错的值（2026-11-09 实例：
     TICKETD_OWNER 在 config.env 里是迁移带来的旧 open_id，周报私信报 open_id cross app）。
@@ -339,7 +339,7 @@ def doctor_checks(con, dm: bool = False) -> list:
                                                               "TICKETD_RUN", "TICKETD_PYTHON"):
             lines.append(("config", "⚠️ %s：只在当前环境里有，config.env 没有，守护进程看不到" % k))
     lines += [("workspace", x) for x in _workspace_drift()]
-    checked, mismatched = metrics.reconcile_costs(con)
+    checked, mismatched = metrics.reconcile_costs(con) if costs else (0, [])
     if mismatched:
         lines.append(("costs", "❌ 成本账目有 %d 张单和原始记录对不上：%s" % (len(mismatched), "，".join(
             "%s 库里 $%.2f / 重算 $%.2f" % m for m in mismatched[:5]))))

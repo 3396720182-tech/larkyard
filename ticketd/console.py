@@ -128,6 +128,11 @@ def token_path() -> Path:
     return console_dir() / "device-token"
 
 
+def stopped_path() -> Path:
+    """心跳被拒（吊销 / 退出 / 未知设备）后写下的标记：更新源跟着失效。--leave 时随目录一起删。"""
+    return console_dir() / "stopped"
+
+
 def present() -> bool:
     """本机有控制台目录里的任何一个文件（含写了一半的）：算「入过网」，再入网要先 --leave。"""
     return info_path().exists() or token_path().exists()
@@ -183,7 +188,10 @@ def save(info: dict, token: str) -> None:
 
 
 def remove_local() -> None:
+    """删除 ~/.ticketd/console/。删不掉时抛 OSError（不能说「已删除」却还留着令牌）。"""
     shutil.rmtree(str(console_dir()), ignore_errors=True)
+    if console_dir().exists():
+        raise OSError("删不掉 %s" % console_dir())
 
 
 def _clear_kv(con) -> None:
@@ -207,6 +215,7 @@ def _ssl_context() -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     return ctx
 
 
@@ -233,28 +242,55 @@ def _open(method: str, url: str, headers: dict, body, timeout: float) -> tuple:
     deadline = time.monotonic() + timeout
     ctx = _ssl_context()
     raw = _connect(hostname, port, timeout)
+    # 整个请求的总时限：socket 的超时只管单次读写，控制台每隔几秒挤一个字节就能一直拖着；到点直接断开连接
+    cur = {"sock": raw, "late": False}
+
+    def _expire():
+        cur["late"] = True
+        try:
+            socket.socket.shutdown(cur["sock"], socket.SHUT_RDWR)
+        except (OSError, TypeError, ValueError):
+            pass
+    timer = threading.Timer(timeout, _expire)
+    timer.daemon = True
+    timer.start()
     try:
-        sock = ctx.wrap_socket(raw, server_hostname=hostname)
-    except BaseException:
-        raw.close()
+        try:
+            sock = ctx.wrap_socket(raw, server_hostname=hostname)
+        except BaseException:
+            raw.close()
+            raise
+        cur["sock"] = sock
+        conn = http.client.HTTPSConnection(hostname, port, timeout=timeout, context=ctx)
+        conn.sock = sock
+        try:
+            return _exchange(conn, method, path, body, headers, deadline, timeout)
+        except ssl.SSLError as e:
+            # 握手已经完成：这是连接中途的错误，不是证书校验失败（请求内容可能已经发出）
+            raise ConnectionError("TLS 连接中断：%s" % e)
+        finally:
+            conn.close()
+    except OSError:
+        if cur["late"]:
+            raise socket.timeout("整个请求超过 %d 秒" % timeout)
         raise
-    conn = http.client.HTTPSConnection(hostname, port, timeout=timeout, context=ctx)
-    conn.sock = sock
-    try:
-        conn.request(method, path, body=body, headers=headers)
-        resp = conn.getresponse()
-        cap, chunks, n = _read_cap() + 1, [], 0
-        while n < cap:
-            if time.monotonic() > deadline:
-                raise socket.timeout("读响应超过 %d 秒" % timeout)
-            chunk = resp.read(min(1 << 16, cap - n))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            n += len(chunk)
-        return resp.status, {k.lower(): v for k, v in resp.getheaders()}, b"".join(chunks)
     finally:
-        conn.close()
+        timer.cancel()
+
+
+def _exchange(conn, method, path, body, headers, deadline, timeout) -> tuple:
+    conn.request(method, path, body=body, headers=headers)
+    resp = conn.getresponse()
+    cap, chunks, n = _read_cap() + 1, [], 0
+    while n < cap:
+        if time.monotonic() > deadline:
+            raise socket.timeout("读响应超过 %d 秒" % timeout)
+        chunk = resp.read(min(1 << 16, cap - n))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        n += len(chunk)
+    return resp.status, {k.lower(): v for k, v in resp.getheaders()}, b"".join(chunks)
 
 
 def ca_problem(paths=None, ca_count=None) -> Optional[str]:
@@ -347,8 +383,8 @@ def request(method: str, path: str, body=None, *, base: Optional[str] = None, to
 def updates_base() -> Optional[str]:
     """入网后自动更新的更新源（控制台上的静态文件布局根）；没入网为 None。"""
     info = load()
-    if info is None or not token_path().is_file():
-        return None
+    if info is None or not token_path().is_file() or stopped_path().exists():
+        return None  # 被吊销 / 标为退出后，令牌已失效：自动更新也不再请求控制台
     return info["url"].rstrip("/") + UPDATES_PATH
 
 
@@ -536,7 +572,10 @@ def enroll(con, url: str, code: str, release_fp: str, backup_fp: str, hostname: 
         save({"url": url, "device_id": device_id, "enrolled_at": updsig.iso(now), "consent_version": CONSENT_VERSION},
              token)
     except Exception as e:
-        remove_local()
+        try:
+            remove_local()
+        except OSError:
+            pass
         raise ValueError("控制台已登记这台设备（设备 id：%s），但本机写入失败（%r）：请管理员在控制台吊销这台设备后重新入网"
                          % (device_id, e))
     _clear_kv(con)
@@ -562,6 +601,8 @@ def leave(con, out=print) -> list:
         raise PermissionError("worker 里不能执行 ticket enroll --leave：只能由用户本人在终端执行")
     if not present():
         return ["本机没有入网，不用退出"]
+    if not _stdin_is_tty():
+        raise PermissionError("ticket enroll --leave 要在终端里由本人执行，不能在管道或脚本里执行")
     note = ""
     info = load()
     try:
@@ -580,7 +621,10 @@ def leave(con, out=print) -> list:
             if not _stdin_is_tty() or _ask("仍然删除本机的设备令牌和控制台配置吗？输入 yes 删除：").strip() != "yes":
                 return ["没有删除本机文件，心跳照常。控制台恢复后再执行 ticket enroll --leave"]
             note = "没能通知控制台（请管理员在控制台把这台设备标为已退出或吊销）"
-    remove_local()
+    try:
+        remove_local()
+    except OSError as e:
+        raise ValueError("%s，但本机的控制台文件没删掉（%s）：请手工删除 %s" % (note, e, console_dir()))
     _clear_kv(con)
     _event(con, "left", note, dedupe=False)
     return ["已退出控制台：%s；本机的 %s 已删除，不再上报" % (note, console_dir()),
@@ -608,10 +652,28 @@ def _update_part(con, now: float) -> dict:
             "last_at": _iso(row["created_at"]) if last else None, "hold_until": _iso(update.hold_until(con, now))}
 
 
-def _doctor_part(con) -> dict:
+COSTS_EVERY = 3600.0
+_costs_cache = {"at": None, "bad": False}
+
+
+def _costs_bad(con, now: float) -> bool:
+    """成本对账要重读所有工单的过程记录：心跳里一小时最多做一次，其余时候用上次的结论。"""
+    if _costs_cache["at"] is None or now - _costs_cache["at"] >= COSTS_EVERY or now < _costs_cache["at"]:
+        try:
+            _costs_cache["bad"] = bool(metrics.reconcile_costs(con)[1])
+        except Exception:
+            _costs_cache["bad"] = True
+        _costs_cache["at"] = now
+    return _costs_cache["bad"]
+
+
+def _doctor_part(con, now: Optional[float] = None) -> dict:
     from . import cli
+    now = time.time() if now is None else now
     try:
-        checks = cli.doctor_checks(con)
+        checks = cli.doctor_checks(con, costs=False)
+        if _costs_bad(con, now):
+            checks.append(("costs", "❌ 成本账目和原始记录对不上"))
     except Exception:
         return {"ok": False, "failed": ["doctor"]}
     failed = []
@@ -633,7 +695,7 @@ def build_heartbeat(con, now: Optional[float] = None) -> dict:
         "sent_at": updsig.iso(now),
         "larkyard_version": __version__,
         "os": os_fields(),
-        "doctor": _doctor_part(con),
+        "doctor": _doctor_part(con, now),
         "tickets": {"running": count("running"), "queued": count("queued")},
         "update": _update_part(con, now),
     }
@@ -670,6 +732,10 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
         metrics.kv_set(con, "console.last_error", "%s %s" % (updsig.iso(now), e.text()[:300]))
         if e.status == 401 and e.code in STOP_CODES:
             metrics.kv_set(con, "console.state", "stopped:" + e.code)
+            try:
+                _write_private(stopped_path(), (e.code + "\n").encode("ascii"))
+            except OSError:
+                pass
             _event(con, "stopped", "%s，停止上报" % HINTS[e.code])
             return {"sent": True, "ok": False, "code": e.code, "next_in": None, "stopped": True}
         if st != "failing":

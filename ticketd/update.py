@@ -224,9 +224,15 @@ def event(con, code: str, detail: str = "", dedupe: bool = True) -> None:
 
 
 # ---------- 启用条件 ----------
+_pinned = threading.local()  # check() 进行中固定的更新源：中途 --leave 也不会改走普通连接去请求控制台
+
+
 def source() -> tuple:
     """(更新源, 是否经控制台)。本机配置了 TICKETD_UPDATE_URL 时以它为准；没配、但入网了控制台时是控制台上的
-    更新源（经 console 的连接、带设备令牌）；都没有为 ("", False)。"""
+    更新源（经 console 的连接、带设备令牌）；都没有为 ("", False)。check() 进行中返回开始时定下的那个。"""
+    pin = getattr(_pinned, "src", None)
+    if pin is not None:
+        return pin
     url = config.update_url()
     if url:
         return url, False
@@ -567,7 +573,17 @@ def _accept(con, m: dict, data: bytes) -> None:
 
 
 def check(con, version: Optional[str] = None, now: Optional[float] = None) -> str:
-    """检查一次。返回一行给人看的结论。调用方保证已启用（disabled_reasons 为空）。"""
+    """检查一次。返回一行给人看的结论。调用方保证已启用（disabled_reasons 为空）。
+    这一次检查里的所有请求走同一条路：开始时经控制台，中途退出控制台后剩下的请求失败，不会改走普通连接。"""
+    _pinned.src = None
+    _pinned.src = source()
+    try:
+        return _check(con, version, now)
+    finally:
+        _pinned.src = None
+
+
+def _check(con, version: Optional[str] = None, now: Optional[float] = None) -> str:
     now = time.time() if now is None else now
     version = version or __version__
     base = source()[0].rstrip("/")

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import http.client as http_client
 import io
 import json
 import os
@@ -579,9 +580,12 @@ class LeaveTest(ConsoleBase):
             lines = console.leave(self.con, out=self.say)
         self.assertIn("没有删除本机文件", lines[0])
         self.assertTrue(console.enrolled())
+        n = len(self.fake.calls)
         with mock.patch.object(console, "_stdin_is_tty", return_value=False):
-            console.leave(self.con, out=self.say)
+            with self.assertRaises(PermissionError):  # --leave 也只能在终端里由本人执行，不发请求
+                console.leave(self.con, out=self.say)
         self.assertTrue(console.enrolled())
+        self.assertEqual(len(self.fake.calls), n)
         with mock.patch.object(console, "_ask", return_value="yes"):
             lines = console.leave(self.con, out=self.say)
         self.assertFalse(console.console_dir().exists())
@@ -1023,3 +1027,93 @@ class ConsentTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixesTest(ConsoleBase):
+    """对抗审查（T0046）后补的用例。"""
+
+    def test_whole_request_deadline(self):
+        """控制台每隔一会儿挤一个字节：整个请求到点就断开，不会一直拖着。"""
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+
+        class Ctx:
+            def wrap_socket(self, raw, server_hostname=None):
+                return raw
+        stop = threading.Event()
+
+        def trickle():
+            b.recv(65536)
+            b.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+            while not stop.is_set():
+                try:
+                    b.sendall(b"x")
+                except OSError:
+                    return
+                time.sleep(0.2)
+        t = threading.Thread(target=trickle, daemon=True)
+        t.start()
+        self.addCleanup(stop.set)
+        start = time.monotonic()
+        with mock.patch.object(console, "_connect", return_value=a), \
+                mock.patch.object(console, "_ssl_context", return_value=Ctx()), \
+                mock.patch.object(http_client.HTTPSConnection, "__init__",
+                                  lambda self, h, p, timeout=None, context=None:
+                                  http_client.HTTPConnection.__init__(self, h, p, timeout=timeout)):
+            with self.assertRaises(OSError):
+                ORIGINAL_OPEN("GET", URL + "/x", {}, None, 1.0)
+        self.assertLess(time.monotonic() - start, 3.0)
+
+    def test_tls_minimum_12(self):
+        self.assertEqual(console._ssl_context().minimum_version, ssl.TLSVersion.TLSv1_2)
+
+    def test_mid_stream_ssl_error_is_network_not_cert(self):
+        self.enrolled_state()
+        self.fake.routes[("POST", "/api/v1/heartbeat")] = ConnectionError("TLS 连接中断：bad record mac")
+        res = console.send_heartbeat(self.con)
+        self.assertEqual(res["code"], "Network")
+
+    def test_revoked_stops_updates_via_console(self):
+        self.enrolled_state()
+        self.assertTrue(console.updates_base())
+        self.fake.routes[("POST", "/api/v1/heartbeat")] = err("DeviceRevoked", 401)
+        console.send_heartbeat(self.con)
+        self.assertIsNone(console.updates_base())
+        self.assertEqual(update.source(), ("", False))
+
+    def test_leave_reports_undeletable_files(self):
+        self.enrolled_state()
+        with mock.patch.object(console.shutil, "rmtree", lambda *a, **k: None):
+            with self.assertRaises(ValueError) as cm:
+                console.leave(self.con, out=self.say)
+        self.assertIn("没删掉", str(cm.exception))
+
+    def test_update_check_pins_route(self):
+        """更新检查进行中退出控制台：剩下的请求失败，不会改走普通连接去请求控制台。"""
+        self.enrolled_state()
+        plain = []
+        with mock.patch.object(update, "_open", side_effect=lambda *a, **k: plain.append(a) or (_ for _ in ()).throw(
+                AssertionError("不该走普通连接"))):
+            def leave_then_404(body, headers):
+                console.remove_local()
+                return 404, b""
+            self.fake.routes[("GET", "/api/v1/updates/rekey.json")] = leave_then_404
+            update._pinned.src = None
+            update._pinned.src = update.source()
+            try:
+                self.assertIsNone(update.fetch(update.source()[0] + "/rekey.json"))
+                with self.assertRaises(update.FetchError):
+                    update.fetch(update.source()[0] + "/pause.json")
+            finally:
+                update._pinned.src = None
+        self.assertEqual(plain, [])
+
+    def test_heartbeat_reconciles_costs_at_most_hourly(self):
+        console._costs_cache.update({"at": None, "bad": False})
+        calls = []
+        with mock.patch.object(metrics, "reconcile_costs", side_effect=lambda con: calls.append(1) or (0, [])):
+            console.build_heartbeat(self.con, now=1000.0)
+            console.build_heartbeat(self.con, now=1300.0)
+            console.build_heartbeat(self.con, now=1000.0 + 3600)
+        self.assertEqual(len(calls), 2)
