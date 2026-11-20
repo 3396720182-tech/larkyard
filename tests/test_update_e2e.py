@@ -120,7 +120,15 @@ class SelfUpdateE2E(unittest.TestCase):
         return json.loads(p.stdout.strip().splitlines()[-1])
 
     def adopt(self, workspace=""):
-        """不跑真的 install.sh：直接调 adopt，服务换成下面的监督器。"""
+        """不跑真的 install.sh：直接调 adopt，服务换成下面的监督器。临时 HOME 里放一份替身服务文件（像装过服务一样）。"""
+        import plistlib
+        env = {"TICKETD_HOME": str(self.th), "LARK_CHANNEL_HOME": str(self.tmp / "lc"), "LARK_CHANNEL_PROFILE": "claude"}
+        sf = self.home / "Library" / "LaunchAgents" / "dev.larkyard.ticketd.plist"
+        sf.parent.mkdir(parents=True, exist_ok=True)
+        sf.write_bytes(plistlib.dumps({"Label": "dev.larkyard.ticketd", "EnvironmentVariables": env}))
+        unit = self.home / ".config" / "systemd" / "user" / "dev.larkyard.ticketd.service"
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text("".join('Environment="%s=%s"\n' % kv for kv in env.items()))
         r = self.run_py(self.repo, "out = update.adopt(%r, repo=Path(%r), run_install=fake)" % (workspace, str(self.repo)))
         self.assertEqual(r["calls"][0][:2], [str(self.th / "app" / "versions" / self.base), str(self.th / "app")])
         fp = lambda n: subprocess.run(["ssh-keygen", "-lf", str(self.keys / (n + ".pub"))], capture_output=True,
