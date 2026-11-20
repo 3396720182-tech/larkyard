@@ -427,3 +427,21 @@ cp <工作区>/CLAUDE.md.bak-<时间> <工作区>/CLAUDE.md
 **序号和预签**：回滚清单、暂停标记、发布清单共用 `release.py` 的一个序号计数。签过回滚清单之后，早先预签、还没放出去的发布清单序号更小，客户端会按旧清单拒绝，要重新签。
 
 **没做的**（后续变更）：控制台、入网、心跳上报、按心跳对比版本来发现冻结攻击（这一期只在 `ticket doctor` 里对超过 `TICKETD_UPDATE_STALE_DAYS` 天没换过的清单标黄）。
+
+## 12. 控制台接入（2026-11-20，T0046）
+
+行为以 `openspec/changes/add-console-enrollment/specs/console-enrollment/spec.md`（入网、退出、连接）和 `specs/console-heartbeat/spec.md`（心跳）为准，设计取舍见同目录的 `design.md`。控制台服务端不在本仓库。这里记实现上的约定（`ticketd/console.py`）。
+
+**默认关闭**：没有配置项、没有环境变量、仓库里没有地址。只有 `~/.ticketd/console/console.json`（地址、设备 id、入网时间、同意的清单版本）和 `device-token` 都在时才算入网；守护进程每拍只看一眼这两个文件，不在就不发请求。`ticket doctor` 发现环境里有 `TICKETD_CONSOLE*` 时提示「没有这个配置项」。
+
+**连接**：所有到控制台的请求（入网、心跳、退出、入网后的自动更新）只经过 `console._open(method, url, headers, body, timeout) -> (status, headers, bytes)`：`ssl.create_default_context()`（系统 CA + 主机名校验，不可关闭），先在 TCP socket 上做完 TLS 握手再交给 `HTTPSConnection` 写请求，所以证书校验失败时一个请求字节都没写出；不跟随重定向，不重试。`https://` 检查、响应体上限（64KB；自动更新的包按清单里的大小）、JSON 解析和错误码映射在 `_open` 之外。错误按响应里的 `error.code` 判断，不按 HTTP 状态码；401 + `DeviceRevoked` / `DeviceLeft` / `DeviceUnknown` 停止上报（`kv console.state = stopped:<code>`），之后不再发心跳，直到 `--leave` 后重新入网。
+
+**入网**（`ticket enroll <地址> <入网码> --release-key SHA256:… --backup-key SHA256:… [--hostname 名字]`）：worker 环境（`TICKETD_TICKET` / `TICKETD_SPOOL`）和非终端标准输入都拒绝；已有 `~/.ticketd/console/` 时拒绝（先 `--leave`）。打印清单 `c1` 和它的 SHA-256（清单文本 UTF-8、`\n` 换行、最后一行也以 `\n` 结尾，打印的就是参与哈希的文本）→ 输入 `yes` → `GET /api/v1/release-keys` 按指纹核对两把公钥（本机已信任另一对时中止）→ `POST /api/v1/enroll/start` → 输入 6 位确认码 → `POST /api/v1/enroll/confirm`（`ConfirmWrong` 和网络失败可以重输，其余错误退出）→ 先写公钥（复用 `update.trust`，已信任同一对时跳过），再写令牌、最后写 `console.json`（目录 700、文件 600、临时文件 + rename）。确认之前任何一步失败，本机都不写任何文件。
+
+**退出**（`ticket enroll --leave`）：`POST /api/v1/device/leave` 后删除 `~/.ticketd/console/` 和 `kv` 里的 `console.*`；控制台不可达时问一句是否仍然删除；本机文件不完整（本来就发不出请求）时直接删除。信任的发版公钥保留。
+
+**心跳**：`console.build_heartbeat(con)` 是唯一的负载来源（`ticket console show` 打印的就是它），字段见 `design.md` D5。`doctor.failed` 用 `cli.DOCTOR_IDS` 里的稳定 id（改名要同步控制台）。守护进程主循环里的 `console.Heartbeat.tick()`：入网后先在 0～30 秒内报第一次，之后每 300 秒 + 0～30 秒抖动；控制台回的 `next_in` 只在 300～570 之间才采用；发送在后台线程（超时 15 秒），同一时间只有一个。结果写 `kv`（`console.last_ok_at`、`console.last_error`、`console.state`），状态变化记 `events`（`kind=console`，属于细分事件，不进匿名统计）。设备令牌不进任何输出、日志和事件。
+
+**显示**：`ticket console status`；`ticket doctor` 的控制台一项（未入网是 ℹ️，不算问题；吊销、30 分钟没有成功上报、本机文件不完整、找不到 CA 证书是 ❌）。入网的机器在状态卡页脚、结果卡的收起详情里多一行「内部版 v<版本> · 已连接控制台 / 控制台未连接」（最近 30 分钟有成功心跳 = 已连接）。
+
+**自动更新**：本机没配 `TICKETD_UPDATE_URL`、但已入网时，更新源是 `<控制台地址>/api/v1/updates`（静态文件布局和 §11 相同），经 `console._open` 带 `Authorization: Bearer <设备令牌>` 取清单和包；配了 `TICKETD_UPDATE_URL` 时以它为准。启用条件（信任公钥、受管安装、验签工具）不变。
