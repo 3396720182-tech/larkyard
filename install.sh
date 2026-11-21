@@ -70,7 +70,13 @@ done
 
 [ -n "$FROM" ] || die "没有发布地址：用 --from https://<发布地址>"
 FROM="${FROM%/}"
-case "$FROM" in https://*) ;; file://*) say "install: ⚠️ 用的是本地发布目录 ${FROM}（测试用）";; *) die "发布地址只接受 https://";; esac
+case "$FROM" in
+  https://*) ;;
+  file://*)
+    FROM="$(printf '%s' "$FROM" | sed 's/ /%20/g')"  # curl 不收带空格的 file:// 地址
+    say "install: ⚠️ 用的是本地发布目录 ${FROM}（测试用）";;
+  *) die "发布地址只接受 https://";;
+esac
 case "$CHANNEL" in stable|early|canary) ;; *) die "通道只能是 stable / early / canary";; esac
 if [ -n "$ENROLL" ] && [ -z "$CONSOLE" ]; then die "--enroll 要和 --console <控制台地址> 一起用"; fi
 if [ "$DRY" = 1 ] && [ "$UPGRADE" = 0 ]; then die "--dry-run 只和 --upgrade-existing 一起用"; fi
@@ -170,7 +176,7 @@ if [ "$UPGRADE" = 1 ]; then
   [ "$ANSWER" = yes ] || die "没有改任何东西"
   INSTALLED_NOW=1
   if [ -L "$TH/app/current" ]; then INSTALLED_NOW=0; fi
-  NOURL=--no-update-url
+  NOURL=--upgrade-existing
 fi
 say "install: 安装到 ${TICKETD_HOME:-$HOME/.ticketd}"
 ( cd "$TMP/x/larkyard-$VERSION" && "$PY" -m ticketd.bootstrap --package "$TMP/$PACKAGE" \
@@ -181,11 +187,14 @@ say "install: 安装到 ${TICKETD_HOME:-$HOME/.ticketd}"
 TICKET="${TICKETD_HOME:-$HOME/.ticketd}/app/current/bin/ticket"
 
 if [ "$UPGRADE" = 1 ]; then
-  # 更新源由 migrate 写（先备份，--undo 能撤）
-  set -- migrate --yes --update-url "$FROM" --channel "$CHANNEL"
+  # 更新源由 migrate 写（先备份，--undo 能撤）。本地发布目录（比如「下载」里）不写：守护进程读不到也可能被删，
+  # 改写内置的正式发布地址（有的话），以后从那里自动更新
+  UPDATE_URL="$FROM"
+  case "$FROM" in file://*) UPDATE_URL="$RELEASE_URL";; esac
+  set -- migrate --yes --update-url "$UPDATE_URL" --channel "$CHANNEL"
   if [ "$INSTALLED_NOW" = 1 ]; then set -- "$@" --installed-now; fi
   if [ -n "$PROFILE" ]; then set -- "$@" --profile "$PROFILE"; fi
-  "$TICKET" "$@" </dev/tty || die "升级没有完成（原因见上）。退回：$TICKET migrate --undo"
+  "$TICKET" "$@" </dev/tty || die "升级没有完成（原因和要做的事见上）"
   say "install: 完成。自检：$TICKET doctor"
   exit 0
 fi

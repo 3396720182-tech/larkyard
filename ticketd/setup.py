@@ -243,8 +243,8 @@ class Wizard:
             raise SetupError("渲染工作区约定失败：%s" % (p.stderr or p.stdout).strip()[-300:])
         self.t.say("② 工作区 %s：已写入 CLAUDE.md 和 CLAUDE.local.md" % workspace)
 
-    def step_services(self, profile: str) -> bool:
-        """返回 bridge 服务是否由 Larkyard 管理（分开安装的不动）。"""
+    def check_existing(self) -> None:
+        """在扫码、写工作区、写服务之前：已有直接跑旧代码的 ticketd（可能是别的服务名）就停。"""
         from . import migrate
         old = [s for s in migrate.find_ticketd_services() if "launcher.py" not in " ".join(s["program"])]
         if old:
@@ -252,6 +252,9 @@ class Wizard:
             raise SetupError("这台已经有在跑的 ticketd（服务 %s 直接跑 %s）：用 ticket migrate --dry-run 看看、再 ticket migrate"
                              "（或 install.sh --upgrade-existing）升级，不要用 setup 重装" % (
                                  old[0]["label"], " ".join(old[0]["program"])))
+
+    def step_services(self, profile: str) -> bool:
+        """返回 bridge 服务是否由 Larkyard 管理（分开安装的不动）。"""
         sf = bridge.bridge_service_file(profile)
         managed = True
         if sf.exists() and not bridge.is_managed_service(sf):
@@ -383,6 +386,7 @@ def run(profile: str = "", workspace: str = "", app_id: str = "", user_auth_only
         w.t.say("不在终端里：装好的部分已就绪。请在终端里执行 %s setup 完成扫码和认主人" %
                 (update.current_link() / "bin" / "ticket"))
         return 2
+    w.check_existing()
     out = bridge.ensure_runtime(update.current_link().resolve())
     for line in out:
         w.t.say(line)

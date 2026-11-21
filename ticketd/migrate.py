@@ -31,6 +31,7 @@ from . import bridge, config, updsig, update
 COMPARED = (("TICKETD_OWNER", "owner"), ("TICKETD_WORKROOT", "workroot"))
 SKIP_ENV = set(update.SERVICE_KEYS) | {"TICKETD_APP", "TICKETD_LABEL"}
 DAEMON_WAIT = 90.0
+ACTIVE = ("applying", "ticketd-done", "done")  # 迁移记录的这些状态算「迁移过」；rolled-back（自动退回了）、undone 可以重来
 STOP_WAIT = 90.0
 
 
@@ -82,9 +83,27 @@ def _service_dir() -> tuple:
 def _ticketd_arg(prog: list) -> str:
     """启动命令里指向 ticketd 的那一项：克隆的 <目录>/bin/ticketd，或受管安装的 launcher.py。"""
     for a in prog:
-        if a.endswith("/bin/ticketd") or a.endswith("/launcher.py"):
+        if any(c.isspace() for c in a):
+            continue  # sh -c "…" 这类包装不认
+        if a.endswith("/bin/ticketd"):
+            return a
+        if a.endswith("/launcher.py") and os.path.normpath(os.path.expanduser(a)) == os.path.normpath(
+                str(update.app_dir() / "launcher.py")):
             return a
     return ""
+
+
+def _label_of(p: Path) -> str:
+    """plist 里的 Label（文件名可能和它不一样；bootout 要用真正的 Label）。systemd 用单元名。"""
+    if p.suffix == ".plist":
+        try:
+            import plistlib
+            label = plistlib.loads(p.read_bytes()).get("Label")
+            if isinstance(label, str) and label:
+                return label
+        except Exception:
+            pass
+    return p.stem
 
 
 def find_ticketd_services() -> list:
@@ -104,7 +123,7 @@ def find_ticketd_services() -> list:
                 continue
         except OSError:
             continue
-        found.append({"label": p.stem, "path": str(p), "program": prog, "env": env})
+        found.append({"label": _label_of(p), "path": str(p), "program": prog, "env": env})
     return found
 
 
@@ -118,7 +137,7 @@ def old_effective(repo: Path, env: dict, python: str = "") -> dict:
     e.update({k: str(v) for k, v in env.items() if k not in ("PATH",)})
     py = python or env.get("TICKETD_PYTHON") or sys.executable
     try:
-        p = subprocess.run([py, "-I", "-c", code, str(repo), json.dumps(COMPARED)], env=e, capture_output=True,
+        p = subprocess.run([py, "-I", "-B", "-c", code, str(repo), json.dumps(COMPARED)], env=e, capture_output=True,
                            text=True, timeout=30, cwd=str(config.home()) if config.home().is_dir() else None)
         if p.returncode != 0:
             return {}
@@ -156,13 +175,13 @@ def config_changes(repo: Optional[Path], env: dict) -> tuple:
             changes.append((key, old[key], have, why))
     for k, v in sorted(env.items()):
         if k.startswith("TICKETD_") and k not in SKIP_ENV and k not in [c[0] for c in changes] and \
-                config.file_value(k) is None:
+                config.file_value(k) in (None, ""):
             changes.append((k, str(v), None, "原来写在服务环境里，新服务只读 config.env"))
     return changes, notes
 
 
-def _running_tickets() -> list:
-    """只读打开数据库（不建表、不迁移：旧守护进程可能还在跑）。"""
+def _running_tickets() -> Optional[list]:
+    """只读打开数据库（不建表、不迁移：旧守护进程可能还在跑）。读不了返回 None（当作挡路）。"""
     p = config.db_path()
     if not p.is_file():
         return []
@@ -173,7 +192,17 @@ def _running_tickets() -> list:
         finally:
             con.close()
     except sqlite3.Error:
-        return []
+        return None
+
+
+def _busy_reason() -> str:
+    running = _running_tickets()
+    if running is None:
+        return "读不了工单数据库（%s），确认不了有没有正在运行的工单" % config.db_path()
+    if running:
+        return "有 %d 张工单正在运行（%s）：要重启 ticketd，等它们结束（或 ticket hold）再执行" % (
+            len(running), "、".join(running[:5]))
+    return ""
 
 
 def _workspace(profile: str) -> str:
@@ -216,7 +245,7 @@ def plan(profile: str = "", target: str = "") -> dict:
     p = {"blockers": [], "warnings": [], "notes": [], "ticketd": None, "bridge": None, "config": [],
          "workspace_md": "", "workspace_root": "", "others": []}
     rec = read_record()
-    if rec.get("status") in ("applying", "ticketd-done", "done"):
+    if rec.get("status") in ACTIVE:
         p["blockers"].append("已经迁移过（%s，备份 %s）；要退回用 ticket migrate --undo" % (
             time.strftime("%Y-%m-%d %H:%M", time.localtime(rec.get("at", 0))), rec.get("backup", "")))
         return p
@@ -251,6 +280,10 @@ def plan(profile: str = "", target: str = "") -> dict:
                     "指向发布目录后执行 ticket update check）；装好后再执行 ticket migrate 迁移 bridge" % (cur_v, target))
             p["notes"].append("ticketd 服务 %s：已经经启动器运行（受管安装 %s），不用改" % (svc["label"], cur_v or "?"))
         else:
+            if cur_v and target and updsig.cmp_version(cur_v, target) < 0:
+                # bootstrap 不会切换已有的 current（交给守护进程），可这台的守护进程跑的是克隆、不会去更新它
+                p["blockers"].append("%s 指向旧的版本目录 %s，但服务还在直接跑克隆：确认服务没在用它后删掉这个链接"
+                                     "（rm %s），再执行" % (cur, cur_v, cur))
             arg_path = Path(arg)
             repo_logical = arg_path.parent.parent
             repo = repo_logical.resolve() if repo_logical.exists() else repo_logical
@@ -262,7 +295,7 @@ def plan(profile: str = "", target: str = "") -> dict:
             if label_new != svc["label"] and update.service_file(label_new).exists():
                 p["blockers"].append("%s 已经存在（另一个服务文件）：先确认它是什么" % update.service_file(label_new))
             svc_env = update.read_service_env(Path(svc["path"]))
-            svc_env.setdefault("TICKETD_HOME", str(config.home()))
+            svc_env["TICKETD_HOME"] = str(config.home())  # 服务里可能写的是 ~/…：install.sh 要绝对路径
             if "LARK_CHANNEL_PROFILE" not in svc_env and env.get("LARK_CHANNEL_PROFILE") is None:
                 svc_env["LARK_CHANNEL_PROFILE"] = profile
             changes, notes = config_changes(repo_ok, env)
@@ -271,10 +304,9 @@ def plan(profile: str = "", target: str = "") -> dict:
             p["ticketd"] = {"label_old": svc["label"], "service_old": svc["path"], "program": svc["program"],
                             "repo": str(repo), "repo_logical": str(repo_logical), "label_new": label_new,
                             "service_new": str(update.service_file(label_new)), "env": svc_env}
-            running = _running_tickets()
-            if running:
-                p["blockers"].append("有 %d 张工单正在运行（%s）：迁移要重启 ticketd，等它们结束（或 ticket hold）再执行"
-                                     % (len(running), "、".join(running[:5])))
+            busy = _busy_reason()
+            if busy:
+                p["blockers"].append(busy)
             ws = _workspace(profile)
             if ws:
                 md = Path(ws) / "CLAUDE.md"
@@ -317,7 +349,8 @@ def plan(profile: str = "", target: str = "") -> dict:
         p["bridge"] = b
     owner = (config.file_value("TICKETD_OWNER") or "").strip()
     if p["ticketd"] is not None and not owner and not any(c[0] == "TICKETD_OWNER" and c[1].strip() for c in p["config"]):
-        p["warnings"].append("⚠️ 迁移后 config.env 里没有 TICKETD_OWNER：派单会被拒绝。之后执行 ticket setup 认主人")
+        p["blockers"].append("定不出主用户（旧代码里读不出，config.env 里也没有 TICKETD_OWNER）：迁移后新服务会拒绝所有派单。"
+                             "先在 %s 里写一行 TICKETD_OWNER=<你在这个飞书应用下的 open_id>，再执行" % config.config_file())
     if p["ticketd"] is None and (p["bridge"] is None or p["bridge"]["skip"]) and not p["blockers"]:
         p["nothing"] = True
     return p
@@ -457,8 +490,12 @@ def apply(p: dict, update_url: str = "", channel: str = "", installed_now: bool 
     run_install = run_install or update._install_sh
     bridge_adopt = bridge_adopt or bridge.adopt
     out = []
+    from . import bootstrap
     td = p.get("ticketd")
     if td:
+        busy = _busy_reason()  # 确认可能停了很久：停服务前再看一次
+        if busy:
+            raise MigrateError(busy)
         ts = time.strftime("%Y%m%d-%H%M%S")
         backup = root_dir() / "backup" / ts
         backup.mkdir(parents=True, exist_ok=False)
@@ -499,6 +536,7 @@ def apply(p: dict, update_url: str = "", channel: str = "", installed_now: bool 
                 write_record(rec)
                 _config_set(k, v)
                 out.append("config.env：%s=%s" % (k, _mask(v) if k == "TICKETD_OWNER" else v))
+            out += bootstrap.finish_db()  # 一行安装推迟的「信任公钥、记下清单」：旧守护进程停了、快照拍完才动库
             mark("service")
             if td["label_new"] != td["label_old"]:
                 Path(td["service_old"]).unlink()
@@ -526,7 +564,10 @@ def apply(p: dict, update_url: str = "", channel: str = "", installed_now: bool 
                 back = _undo_ticketd(rec, services)
             except Exception as e2:  # noqa: BLE001
                 back = ["自动退回也失败了：%s；备份在 %s，按 ticket migrate --undo 再试" % (e2, backup)]
-            raise MigrateError("迁移失败：%s\n已自动退回：\n%s" % (e, "\n".join(back)))
+            rec["status"] = "rolled-back"
+            write_record(rec)
+            raise MigrateError("迁移失败：%s\n已自动退回（旧服务照原样在跑；修好原因后可以直接重新执行升级）：\n%s"
+                               % (e, "\n".join(back)))
         rec["status"] = "ticketd-done"
         write_record(rec)
         out.append("备份：%s" % backup)
@@ -536,12 +577,15 @@ def apply(p: dict, update_url: str = "", channel: str = "", installed_now: bool 
         rec = read_record() if td else {"status": "applying", "at": time.time(), "backup": "", "done": [],
                                         "installed_now": False, "config": {}, "bridge": False}
         try:
+            if not td:
+                out += bootstrap.finish_db()
             out += bridge_adopt(p.get("profile", ""), confirm=lambda text: True, services=services,
                                 run_install=run_install)
             rec["bridge"] = True
-        except bridge.BridgeError as e:
-            out.append("❌ bridge 迁移没成（已自动退回原来的 bridge）：%s" % e)
-            out.append("   ticketd 已升级好，照常可用；之后可以单独执行 ticket bridge adopt，或 ticket migrate --undo 全部退回")
+        except (Exception, KeyboardInterrupt) as e:  # bridge.adopt 失败时自己退回；它动手之前被打断就什么都没改
+            out.append("❌ bridge 迁移没成（原来的 bridge 照常在跑）：%s" % (e or type(e).__name__))
+            if td:
+                out.append("   ticketd 已升级好，照常可用；之后可以单独执行 ticket bridge adopt，或 ticket migrate --undo 全部退回")
         rec["status"] = "done"
         write_record(rec)
     elif td:
@@ -582,12 +626,7 @@ def _undo_ticketd(rec: dict, services: bridge.Services) -> list:
         services.load(rec["label_old"], old)
         out.append("已恢复并重新加载 %s（直接跑 %s）" % (rec["label_old"], rec.get("repo")))
     if rec.get("installed_now"):
-        for f in (cur, update.app_dir() / "launcher.py"):
-            try:
-                f.unlink()
-            except FileNotFoundError:
-                pass
-        update.write_state({"status": "unmigrated", "migrated_from": rec.get("repo"), "at": time.time()})
+        _drop_fresh_install()
         out.append("已撤掉受管安装的 current（版本目录留在 %s）" % update.versions_dir())
     return out
 
@@ -595,14 +634,16 @@ def _undo_ticketd(rec: dict, services: bridge.Services) -> list:
 def undo(services: Optional[bridge.Services] = None) -> list:
     _refuse("ticket migrate --undo")
     rec = read_record()
-    if not rec or rec.get("status") not in ("applying", "ticketd-done", "done"):
+    if not rec or rec.get("status") not in ACTIVE:
         raise MigrateError("没有迁移记录，不用退回")
     if rec.get("service_old_backup") and not Path(rec["service_old_backup"]).is_file():
         raise MigrateError("备份文件不见了：%s；没有改任何文件" % rec["service_old_backup"])
-    running = _running_tickets()
-    if running:
-        raise MigrateError("有 %d 张工单正在运行（%s）：退回要重启 ticketd，等它们结束（或 ticket hold）再执行；没有改任何文件"
-                           % (len(running), "、".join(running[:5])))
+    busy = _busy_reason()
+    if busy:
+        raise MigrateError("%s；没有改任何文件" % busy)
+    if rec.get("service_old") and not (Path(rec.get("repo") or "/nonexistent") / "bin" / "ticketd").is_file():
+        raise MigrateError("原来的代码目录 %s 不在了（退回后旧服务要跑它）：先把它放回原处再退回；没有改任何文件"
+                           % rec.get("repo"))
     services = services or bridge.Services()
     out = []
     if rec.get("bridge") and bridge.read_state().get("adopted"):
@@ -639,13 +680,29 @@ def run(a) -> str:
         if p.get("blockers"):
             raise MigrateError("\n".join(lines))
         return "\n".join(lines + ["（--dry-run：没有改任何东西）"])
-    if p.get("blockers"):
-        raise MigrateError("\n".join(lines))
-    if p.get("nothing"):
-        return "\n".join(lines)
-    if not a.yes and not _confirm("\n".join(lines)):
-        return "没有改任何东西"
-    return "\n".join(apply(p, update_url=a.update_url or "", channel=a.channel or "", installed_now=a.installed_now))
+    try:
+        if p.get("blockers"):
+            raise MigrateError("\n".join(lines))
+        if p.get("nothing"):
+            return "\n".join(lines)
+        if not a.yes and not _confirm("\n".join(lines)):
+            raise MigrateError("没有改任何东西")
+        return "\n".join(apply(p, update_url=a.update_url or "", channel=a.channel or "",
+                               installed_now=a.installed_now))
+    except BaseException:
+        if a.installed_now and read_record().get("status") not in ACTIVE:
+            _drop_fresh_install()  # 这次 install.sh 才装的受管安装：迁移没开始或已退回，撤掉，机器回到原样
+        raise
+
+
+def _drop_fresh_install() -> None:
+    from . import bootstrap
+    for f in (update.current_link(), update.app_dir() / "launcher.py", bootstrap.pending_db_path()):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+    update.write_state({"status": "unmigrated", "at": time.time()})
 
 
 def add_args(ap) -> None:

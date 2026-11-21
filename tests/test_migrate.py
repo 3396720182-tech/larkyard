@@ -223,6 +223,40 @@ class EarlyLayoutDarwinTest(MigrateBase):
         self.assertFalse(update.service_file(update.DEFAULT_LABEL).exists())
         self.assertTrue(update.current_link().exists())  # 本来就有的 current 不撤
         self.assertFalse(bridge.is_managed_service(bridge.bridge_service_file("claude")))
+        self.assertEqual(migrate.read_record()["status"], "rolled-back")
+        self.assertEqual(migrate.plan()["blockers"], [])  # 自动退回之后可以直接重来
+
+    def test_fresh_install_is_removed_when_migration_fails(self):
+        with self.assertRaises(migrate.MigrateError):
+            self.apply(wait=lambda since: False, installed_now=True)
+        self.assertFalse(update.current_link().exists())
+        self.assertEqual(update.read_state()["status"], "unmigrated")
+
+    def test_owner_unknown_blocks(self):
+        (self.repo / "ticketd" / "config.py").write_text("raise ImportError('broken')\n", encoding="utf-8")
+        p = migrate.plan()
+        self.assertTrue(any("定不出主用户" in b for b in p["blockers"]))
+
+    def test_undo_needs_old_code(self):
+        self.apply()
+        import shutil
+        shutil.move(str(self.repo), str(self.tmp / "moved"))
+        with self.assertRaises(migrate.MigrateError) as cm:
+            migrate.undo(services=self.svc)
+        self.assertIn("不在了", str(cm.exception))
+        self.assertTrue(update.service_file(update.DEFAULT_LABEL).exists())
+
+    def test_label_comes_from_plist(self):
+        sf = update.service_file(self.label_old)
+        renamed = sf.with_name("my-ticketd.plist")
+        sf.rename(renamed)
+        self.files[renamed] = self.files.pop(sf)
+        p = migrate.plan()
+        self.assertEqual(p["ticketd"]["label_old"], "com.example.ticketd")
+        self.apply(p)
+        self.assertIn(("unload", "com.example.ticketd", False), self.svc.calls)
+        migrate.undo(services=self.svc)
+        self.assertTrue(renamed.exists())
 
     def test_old_daemon_not_stopping_rolls_back(self):
         before = self.snapshot()
@@ -292,7 +326,7 @@ class EarlyLayoutDarwinTest(MigrateBase):
         w = setup.Wizard(term=setup.Term(fin=None, fout=devnull), services=self.svc,
                          run_install=self.run_install)
         with self.assertRaises(setup.SetupError) as cm:
-            w.step_services("claude")
+            w.check_existing()
         self.assertIn("ticket migrate", str(cm.exception))
         self.assertEqual(self.installs, [])
 

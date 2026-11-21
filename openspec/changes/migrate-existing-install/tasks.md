@@ -6,7 +6,7 @@
 
 - [x] 2.1 `ticketd/migrate.py`：认服务、对照旧代码配置、只读计划、动手（备份、停服务等锁、库快照、配置、服务、主会话约定、等心跳、失败自动退回）、bridge 衔接、`--undo`
 - [x] 2.2 `ticket migrate [--dry-run | --undo]`，在打开数据库之前处理
-- [x] 2.3 `install.sh --upgrade-existing [--dry-run]`：检查 → 确认 → `bootstrap --no-update-url` → `ticket migrate --yes --update-url`
+- [x] 2.3 `install.sh --upgrade-existing [--dry-run]`：检查 → 确认 → `bootstrap --upgrade-existing`（推迟数据库和配置） → `ticket migrate --yes --update-url`
 - [x] 2.4 `ticket setup` 发现直接跑旧代码的 ticketd 服务时拒绝
 
 ## 3. 测试

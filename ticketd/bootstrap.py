@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import sys
@@ -69,6 +70,8 @@ def verify(manifest: bytes, sig: bytes, main_key: str, main_fp: str, backup_key:
 def _set_config(values: dict) -> list:
     """config.env 不存在就从示例生成；只补没写过的键，已有的值不覆盖。返回改了哪些键。"""
     p = config.home() / "config.env"
+    if not any(values.values()):
+        return []  # 没有要写的：不为此新建 config.env
     p.parent.mkdir(parents=True, exist_ok=True)
     if not p.exists():
         example = update.current_link() / "config.example.env"
@@ -93,7 +96,10 @@ def _set_config(values: dict) -> list:
 
 
 def install(package: Path, manifest: bytes, sig: bytes, main_key: str, main_fp: str, backup_key: str,
-            backup_fp: str, source: str, channel: str, fetch=bridge.fetch_verified, update_url: bool = True) -> list:
+            backup_fp: str, source: str, channel: str, fetch=bridge.fetch_verified, update_url: bool = True,
+            upgrade_existing: bool = False) -> list:
+    """upgrade_existing（install.sh --upgrade-existing）：不写 config.env、不打开数据库——旧守护进程还在跑，
+    库要等 ticket migrate 停了它、拷完快照再动；信任公钥和记下清单记进 bootstrap-db.json，由 migrate 调 finish_db 做。"""
     if os.environ.get("TICKETD_TICKET") or os.environ.get("TICKETD_SPOOL"):
         raise BootstrapError("worker 里不能安装")
     m = verify(manifest, sig, main_key, main_fp, backup_key, backup_fp, channel, package)
@@ -134,11 +140,28 @@ def install(package: Path, manifest: bytes, sig: bytes, main_key: str, main_fp: 
         switched = True
         out.append("已安装 Larkyard %s（%s）" % (version, vd))
 
-    added = _set_config({"TICKETD_UPDATE_URL": source if update_url else "",
-                         "TICKETD_UPDATE_CHANNEL": channel if channel != "stable" else ""})
-    if added:
-        out.append("config.env：写入 %s" % "、".join(added))
+    if upgrade_existing:
+        pending = {"manifest": manifest.decode("utf-8"), "main_key": main_key, "main_fp": main_fp,
+                   "backup_key": backup_key, "backup_fp": backup_fp, "channel": channel, "switched": switched}
+        update._atomic_copy(json.dumps(pending).encode("utf-8"), pending_db_path(), 0o600)
+    else:
+        added = _set_config({"TICKETD_UPDATE_URL": source if update_url else "",
+                             "TICKETD_UPDATE_CHANNEL": channel if channel != "stable" else ""})
+        if added:
+            out.append("config.env：写入 %s" % "、".join(added))
+        out += _db_steps(m, manifest, main_key, main_fp, backup_key, backup_fp, channel, switched)
 
+    if (vd / "vendor" / "runtime.json").is_file() and not switched:
+        out += bridge.ensure_runtime(vd, fetch=fetch)
+    if (vd / "vendor" / "bridge" / bridge.BRIDGE_ENTRY).is_file() and not bridge.bridge_link().exists():
+        bridge.link_bridge(vd)
+        out.append("bridge/current → %s" % vd.name)
+    return out
+
+
+def _db_steps(m: dict, manifest: bytes, main_key: str, main_fp: str, backup_key: str, backup_fp: str, channel: str,
+              switched: bool) -> list:
+    out = []
     con = db.connect()
     try:
         main_now = updsig.signer_key(update.main_signers())
@@ -153,12 +176,24 @@ def install(package: Path, manifest: bytes, sig: bytes, main_key: str, main_fp: 
                 config.update_channel(), channel, config.update_channel()))
     finally:
         con.close()
+    return out
 
-    if (vd / "vendor" / "runtime.json").is_file() and not switched:
-        out += bridge.ensure_runtime(vd, fetch=fetch)
-    if (vd / "vendor" / "bridge" / bridge.BRIDGE_ENTRY).is_file() and not bridge.bridge_link().exists():
-        bridge.link_bridge(vd)
-        out.append("bridge/current → %s" % vd.name)
+
+def pending_db_path() -> Path:
+    return update.app_dir() / "bootstrap-db.json"
+
+
+def finish_db() -> list:
+    """install.sh --upgrade-existing 推迟的数据库步骤（ticket migrate 停掉旧守护进程、拷完快照后调用）。没有就什么都不做。"""
+    p = pending_db_path()
+    if not p.is_file():
+        return []
+    d = json.loads(p.read_text(encoding="utf-8"))
+    manifest = d["manifest"].encode("utf-8")
+    m = update._load(manifest, ("release", "rollback"))
+    out = _db_steps(m, manifest, d["main_key"], d["main_fp"], d["backup_key"], d["backup_fp"], d["channel"],
+                    bool(d.get("switched")))
+    p.unlink()
     return out
 
 
@@ -174,11 +209,12 @@ def main(argv=None) -> int:
     ap.add_argument("--from", dest="source", required=True)
     ap.add_argument("--channel", default="stable")
     ap.add_argument("--no-update-url", action="store_true", help="不写 TICKETD_UPDATE_URL（要入网的机器从控制台更新）")
+    ap.add_argument("--upgrade-existing", action="store_true", help="升级已有安装：不写 config.env、不打开数据库（交给 ticket migrate）")
     a = ap.parse_args(argv)
     try:
         lines = install(Path(a.package), _read(a.manifest), _read(a.sig), _read(a.main_key).decode("utf-8"),
                         a.main_fp, _read(a.backup_key).decode("utf-8"), a.backup_fp, a.source, a.channel,
-                        update_url=not a.no_update_url)
+                        update_url=not a.no_update_url, upgrade_existing=a.upgrade_existing)
     except (BootstrapError, update.UpdateError, bridge.BridgeError, OSError) as e:
         print("install: %s" % e, file=sys.stderr)
         return 1

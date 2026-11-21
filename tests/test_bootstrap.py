@@ -76,6 +76,25 @@ class BootstrapTest(TicketdTestCase):
                          self.con.execute("SELECT value FROM kv WHERE key='update.accepted'").fetchone()["value"],
                          hashlib.sha256(data).hexdigest())
 
+    def test_upgrade_existing_defers_database_and_config(self):
+        # install.sh --upgrade-existing：旧守护进程还在跑，不动库、不建 config.env；ticket migrate 停了它之后再 finish_db
+        doc, pkg, data, sig = self.publish("0.3.0", 7)
+        cfg = config.home() / "config.env"
+        if cfg.exists():
+            cfg.unlink()
+        bootstrap.install(pkg, data, sig, pub(self.main), fp(self.main), pub(self.backup), fp(self.backup),
+                          self.src.url, "stable", fetch=self.fetch, upgrade_existing=True)
+        self.assertEqual(update.current_version(), "0.3.0")
+        self.assertFalse(cfg.exists())
+        self.assertFalse(update.main_signers().exists())
+        self.assertEqual(update.max_seq(self.con), 0)
+        self.assertTrue(bootstrap.pending_db_path().is_file())
+        bootstrap.finish_db()
+        self.assertEqual(updsig.signer_key(update.main_signers()), " ".join(pub(self.main).split()[:2]))
+        self.assertEqual(update.max_seq(self.con), 7)
+        self.assertFalse(bootstrap.pending_db_path().exists())
+        self.assertEqual(bootstrap.finish_db(), [])
+
     def test_rerun_skips_and_keeps_config(self):
         doc, pkg, data, sig = self.publish("0.3.0", 7)
         self.install(pkg, data, sig)

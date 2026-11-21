@@ -23,7 +23,7 @@
 - **THEN** 主用户和工单根目录不重复写
 
 ### Requirement: 只读检查
-`ticket migrate --dry-run` 和 `python3 -m ticketd.migrate --check` SHALL 只读：不建表、不迁移数据库（只用 `mode=ro` 打开查 running 的工单），不写 `~/.ticketd` 和服务文件，不停服务。有挡路的情况（多个服务、正在运行的工单、受管安装版本比要装的旧、已经迁移过、新服务名的文件已被别的服务占用）SHALL 列出并以非零退出。
+`ticket migrate --dry-run` 和 `python3 -m ticketd.migrate --check` SHALL 只读：不建表、不迁移数据库（只用 `mode=ro` 打开查 running 的工单），不写 `~/.ticketd` 和服务文件，不停服务。有挡路的情况（多个服务、正在运行的工单或读不了数据库、受管安装版本比要装的旧、服务跑克隆但已有更旧的 `current`、定不出主用户、已经迁移过且没退回、新服务名的文件已被别的服务占用）SHALL 列出并以非零退出。
 
 #### Scenario: 先看再做
 - **WHEN** 用户执行 `install.sh --upgrade-existing --dry-run`
@@ -41,14 +41,14 @@
 - **THEN** 拒绝，提示在自己的终端里执行
 
 ### Requirement: 退回
-`ticket migrate --undo` SHALL 先退回 bridge 迁移（如果做过），再卸掉新服务、恢复旧服务文件并重新加载、把写过的配置键改回原值或删掉、改回主会话约定；这次安装才建的 `current` 和启动器 SHALL 撤掉（版本目录保留）。数据库不改回（只增不删，旧代码照常读写），说明快照位置。没有迁移记录或备份缺失时 MUST 不改任何文件。
+`ticket migrate --undo` SHALL 先退回 bridge 迁移（如果做过），再卸掉新服务、恢复旧服务文件并重新加载、把写过的配置键改回原值或删掉、改回主会话约定；这次安装才建的 `current` 和启动器 SHALL 撤掉（版本目录保留）。数据库不改回（只增不删，旧代码照常读写），说明快照位置。没有迁移记录、备份缺失、有正在运行的工单、或原来的代码目录不在了时 MUST 不改任何文件。
 
 #### Scenario: 退回早期版本
 - **WHEN** 迁移后执行 `ticket migrate --undo`
 - **THEN** 旧服务文件、bridge 服务、重启任务、`secrets-getter`、`config.env`、主会话约定和迁移前逐字节相同，旧代码在迁移过的数据库上照常运行
 
 ### Requirement: 一行安装的升级模式
-`install.sh --upgrade-existing` SHALL 在核对公钥、签名和包之后、写 `~/.ticketd` 之前用包里的代码执行只读检查，不通过就停；`--dry-run` 到此为止。否则 SHALL 从 `/dev/tty` 读 `yes`，然后按一行安装装受管安装（不写更新源），再执行 `ticket migrate --yes --update-url <发布地址>`（由它在备份之后写更新源）。`--dry-run` 不和 `--upgrade-existing` 一起用、`--upgrade-existing` 和 `--enroll` 一起用时 MUST 拒绝；`LARK_CHANNEL=1` 时（非 `--dry-run`）MUST 在核对之前拒绝。
+`install.sh --upgrade-existing` SHALL 在核对公钥、签名和包之后、写 `~/.ticketd` 之前用包里的代码执行只读检查，不通过就停；`--dry-run` 到此为止。否则 SHALL 从 `/dev/tty` 读 `yes`，然后按一行安装装受管安装，但 MUST NOT 写 `config.env`、MUST NOT 打开数据库（推迟到 `ticket migrate` 停掉旧守护进程、拷完快照之后）；再执行 `ticket migrate --yes --update-url <地址>`（由它在备份之后写更新源；发布地址是本地目录时用内置的正式地址或不写）。迁移没开始就失败、或自动退回时，这次装上的 `current` SHALL 撤掉。`--dry-run` 不和 `--upgrade-existing` 一起用、`--upgrade-existing` 和 `--enroll` 一起用时 MUST 拒绝；`LARK_CHANNEL=1` 时（非 `--dry-run`）MUST 在核对之前拒绝。
 
 ### Requirement: setup 不装第二个服务
-`ticket setup` 在写任何服务之前发现直接跑旧代码的 ticketd 服务（任何服务名）时 MUST 拒绝，提示用 `ticket migrate`。
+`ticket setup` 在扫码建应用、写工作区和任何服务之前发现直接跑旧代码的 ticketd 服务（任何服务名）时 MUST 拒绝，提示用 `ticket migrate`。

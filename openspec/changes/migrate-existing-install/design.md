@@ -18,7 +18,7 @@
 
 **ticketd 失败全退，bridge 失败只退 bridge。** ticketd 这段没成功，机器上不能留半个受管安装；bridge 这段失败时 ticketd 已经升级好、照常可用（和「先 `update adopt`、过几天再 `bridge adopt`」是同一个中间状态），全退反而多打断一次。
 
-**`install.sh` 里先检查、再确认、再安装。** 检查用包里的代码（`python3 -m ticketd.migrate --check`），只解出了 `ticketd/` 也够用；检查不过就什么都不装。更新源改由 `migrate` 在备份之后写（`bootstrap --no-update-url`），退回时能撤掉。确认在 `install.sh` 里读 `/dev/tty`，之后 `ticket migrate --yes` 不再问。
+**`install.sh` 里先检查、再确认、再安装。** 检查用包里的代码（`python3 -m ticketd.migrate --check`），只解出了 `ticketd/` 也够用；检查不过就什么都不装。`bootstrap --upgrade-existing` 不写 `config.env`、不打开数据库（旧守护进程还在跑；审查发现原来的写法会在快照之前就改了库结构），信任公钥和记下清单留到 `migrate` 停服务、拍完快照之后（`bootstrap.finish_db`）；更新源由 `migrate` 在备份之后写，退回时能撤掉。本地发布目录不当更新源（launchd 下的守护进程读「下载」会被隐私权限拦），改写内置的正式地址。确认在 `install.sh` 里读 `/dev/tty`，之后 `ticket migrate --yes` 不再问。
 
 **`--dry-run` 不打开数据库读写。** `cli.main` 平时第一步就 `db.connect()`（建表、加列）；`migrate` 在这之前处理。
 
