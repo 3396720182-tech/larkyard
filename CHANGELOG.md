@@ -2,7 +2,7 @@
 
 ## 0.3.1 — 2026-11-21
 
-- 升级已经在跑的旧安装（`openspec/changes/migrate-existing-install/`，规格见 `docs/spec.md` §14）：新命令 `ticket migrate [--dry-run | --undo]` 和 `install.sh --upgrade-existing [--dry-run]`，把早期版本（自定义服务名、主用户和工单根目录写在代码里）或从 clone 装的 Larkyard 一条命令转成受管安装 + 打包的 bridge。按启动命令认出在跑的 ticketd 服务；用旧代码自己算出它实际在用的主用户和工单根目录，和新版本默认值不同才写进 `config.env`（服务环境里的其他 `TICKETD_*` 也搬过去）；停旧服务、等数据库锁放开、拷数据库快照、服务统一成 `dev.larkyard.ticketd` 经启动器运行、主会话约定里的 `ticket` 路径改到 `current`、等新守护进程的心跳，任何一步失败自动退回；bridge 是 Homebrew / npm 装的就接着 `ticket bridge adopt`（这一步失败只退回 bridge）。`--dry-run` 只读，不打开数据库读写；动手和 `--undo` 在 bridge 驱动的会话里拒绝；有正在运行的工单时不动手。`--undo` 按备份恢复服务文件、配置、主会话约定和 bridge。
+- 升级已经在跑的旧安装（`openspec/changes/migrate-existing-install/`，规格见 `docs/spec.md` §14）：新命令 `ticket migrate [--dry-run | --undo]` 和 `install.sh --upgrade-existing [--dry-run]`，把早期版本（自定义服务名、主用户和工单根目录写在代码里）或从 clone 装的 Larkyard 一条命令转成受管安装 + 打包的 bridge。按启动命令认出在跑的 ticketd 服务；用旧代码自己算出它实际在用的主用户和工单根目录，和新版本默认值不同才写进 `config.env`（服务环境里的其他 `TICKETD_*` 也搬过去）；停旧服务、等数据库锁放开、拷数据库快照、服务统一成 `dev.larkyard.ticketd` 经启动器运行、主会话约定里的 `ticket` 路径改到 `current`、等新守护进程的心跳，任何一步失败自动退回；bridge 是 Homebrew / npm 装的就接着 `ticket bridge adopt`（这一步失败只退回 bridge）。`--dry-run` 只读，不打开数据库读写，并打出旧代码目录的版本、最后一次提交和本地改动（`git log -1`、`git status -s`；有本地改动时提醒迁移后不含这些改动）；动手和 `--undo` 在 bridge 驱动的会话里拒绝；有正在运行的工单时不动手。`--undo` 按备份恢复服务文件、配置、主会话约定和 bridge。
 - `ticket setup` 发现直接跑旧代码的 ticketd 服务（任何服务名）时拒绝并提示 `ticket migrate`：以前服务名不是 `dev.larkyard.ticketd` 的机器会被装出第二个服务，两个服务抢同一个数据库锁，写死在旧代码里的主用户也不会搬进 `config.env`。
 
 ## 0.3.0 — 2026-11-21

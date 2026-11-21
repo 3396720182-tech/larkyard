@@ -147,6 +147,59 @@ def old_effective(repo: Path, env: dict, python: str = "") -> dict:
         return {}
 
 
+CODE_STATUS_MAX = 40
+
+
+def code_info(repo: Path) -> tuple:
+    """只读：旧代码目录的版本、最后一次提交和本地改动（git log -1、git status -s），给 --dry-run 看。
+    返回 (行列表, 有没有本地改动)。不用 git 也不报错：没装 git（macOS 没装命令行工具时 /usr/bin/git 只是个会弹窗的
+    占位程序）或不是 git 目录就只给版本号。GIT_OPTIONAL_LOCKS=0：git status 不回写索引。"""
+    lines, dirty = [], False
+    try:
+        m = re.search(r"""__version__\s*=\s*['"]([^'"]+)['"]""",
+                      (repo / "ticketd" / "__init__.py").read_text(encoding="utf-8", errors="replace"))
+        lines.append("版本：%s" % (m.group(1) if m else "代码里没写版本号（早期版本）"))
+    except OSError:
+        pass
+    g = shutil.which("git")
+    if not g or not (repo / ".git").exists():
+        return lines, dirty
+    if sys.platform == "darwin" and os.path.realpath(g) == "/usr/bin/git":
+        try:
+            if subprocess.run(["/usr/bin/xcode-select", "-p"], capture_output=True, timeout=10).returncode != 0:
+                return lines, dirty
+        except (OSError, subprocess.SubprocessError):
+            return lines, dirty
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", LC_ALL="C")
+
+    def git(*a) -> Optional[str]:
+        try:
+            r = subprocess.run([g, "-C", str(repo)] + list(a), env=env, capture_output=True, timeout=20,
+                               stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout.decode("utf-8", "replace").rstrip("\n") if r.returncode == 0 else None
+
+    last = git("log", "-1", "--format=%h %ad %s", "--date=short")
+    if last:
+        lines.append("最后一次提交（git log -1）：%s" % last)
+    st = git("status", "-s", "-b")
+    if st is not None:
+        rows = st.splitlines()
+        head = rows.pop(0)[3:] if rows and rows[0].startswith("## ") else ""
+        if head:
+            lines.append("分支：%s" % head)
+        dirty = bool(rows)
+        if rows:
+            lines.append("本地改动（git status -s，%d 处）：" % len(rows))
+            lines += ["    %s" % r for r in rows[:CODE_STATUS_MAX]]
+            if len(rows) > CODE_STATUS_MAX:
+                lines.append("    …还有 %d 处" % (len(rows) - CODE_STATUS_MAX))
+        else:
+            lines.append("本地改动（git status -s）：没有")
+    return lines, dirty
+
+
 def _new_default(key: str) -> str:
     return {"TICKETD_WORKROOT": str(Path.home() / "larkyard-tickets")}.get(key, "")
 
@@ -292,6 +345,10 @@ def plan(profile: str = "", target: str = "") -> dict:
                 repo_ok = None
             else:
                 repo_ok = repo
+            code, dirty = code_info(repo) if repo_ok else ([], False)
+            if dirty:
+                p["warnings"].append("⚠️ 旧代码目录有本地改动（上面列的）：迁移后跑的是 %s 的发布版，不含这些改动；"
+                                     "旧目录原样保留，要的改动之后另外处理" % (target or "新"))
             if label_new != svc["label"] and update.service_file(label_new).exists():
                 p["blockers"].append("%s 已经存在（另一个服务文件）：先确认它是什么" % update.service_file(label_new))
             svc_env = update.read_service_env(Path(svc["path"]))
@@ -303,7 +360,7 @@ def plan(profile: str = "", target: str = "") -> dict:
             p["warnings"] += notes
             p["ticketd"] = {"label_old": svc["label"], "service_old": svc["path"], "program": svc["program"],
                             "repo": str(repo), "repo_logical": str(repo_logical), "label_new": label_new,
-                            "service_new": str(update.service_file(label_new)), "env": svc_env}
+                            "service_new": str(update.service_file(label_new)), "env": svc_env, "code": code}
             busy = _busy_reason()
             if busy:
                 p["blockers"].append(busy)
@@ -365,6 +422,7 @@ def plan_lines(p: dict) -> list:
     step = 0
     if td:
         out.append("ticketd：服务 %s 在直接跑 %s（不是受管安装）" % (td["label_old"], td["repo_logical"]))
+        out += ["   %s" % line for line in td.get("code", [])]
         step += 1
         out.append("%d. 停掉服务 %s，拷一份数据库快照（新版本启动时自动加列加表，只增不删，旧代码仍能读）" % (step, td["label_old"]))
         for key, val, have, why in p["config"]:

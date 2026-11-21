@@ -23,7 +23,7 @@
 - **THEN** 主用户和工单根目录不重复写
 
 ### Requirement: 只读检查
-`ticket migrate --dry-run` 和 `python3 -m ticketd.migrate --check` SHALL 只读：不建表、不迁移数据库（只用 `mode=ro` 打开查 running 的工单），不写 `~/.ticketd` 和服务文件，不停服务。有挡路的情况（多个服务、正在运行的工单或读不了数据库、受管安装版本比要装的旧、服务跑克隆但已有更旧的 `current`、定不出主用户、已经迁移过且没退回、新服务名的文件已被别的服务占用）SHALL 列出并以非零退出。
+`ticket migrate --dry-run` 和 `python3 -m ticketd.migrate --check` SHALL 只读：不建表、不迁移数据库（只用 `mode=ro` 打开查 running 的工单），不写 `~/.ticketd` 和服务文件，不停服务。有挡路的情况（多个服务、正在运行的工单或读不了数据库、受管安装版本比要装的旧、服务跑克隆但已有更旧的 `current`、定不出主用户、已经迁移过且没退回、新服务名的文件已被别的服务占用）SHALL 列出并以非零退出。服务直接跑旧代码目录时，计划 SHALL 打出该目录的版本号、`git log -1` 和 `git status -s`（只读：`GIT_OPTIONAL_LOCKS=0`；没有 git 或不是 git 目录时只给版本号），有本地改动时 SHALL 提醒迁移后跑的是发布版、不含这些改动（只提醒，不挡）。
 
 #### Scenario: 先看再做
 - **WHEN** 用户执行 `install.sh --upgrade-existing --dry-run`

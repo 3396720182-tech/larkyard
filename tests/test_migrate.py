@@ -7,7 +7,9 @@ import functools
 import json
 import os
 import plistlib
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -402,6 +404,38 @@ class CloneLayoutDarwinTest(MigrateBase):
         self.assertIn("TICKETD_OWNER=ou_old_owner", cfg)
         migrate.undo(services=self.svc)
         self.assertEqual(self.snapshot(), before)
+
+    def test_plan_shows_old_code_version_commit_and_local_changes(self):
+        # 不知道旧克隆是哪个版本、有没有本地改动：--dry-run 打出 git log -1 和 git status -s
+        (self.repo / "ticketd" / "__init__.py").write_text('__version__ = "0.2.0"\n', encoding="utf-8")
+        p = migrate.plan()
+        text = "\n".join(migrate.plan_lines(p))
+        self.assertIn("版本：0.2.0", text)
+        self.assertNotIn("git log -1", text)  # 不是 git 目录：只给版本号
+        if not shutil.which("git"):
+            self.skipTest("没有 git")
+        g = ["git", "-c", "init.templateDir=", "-c", "core.hooksPath=/dev/null", "-c", "user.name=t",
+             "-c", "user.email=t@example.com", "-C", str(self.repo)]
+        for a in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-qm", "old clone"]):
+            subprocess.run(g + a, check=True, capture_output=True)
+        p = migrate.plan()
+        text = "\n".join(migrate.plan_lines(p))
+        self.assertRegex(text, r"最后一次提交（git log -1）：[0-9a-f]{7,} \d{4}-\d\d-\d\d old clone")
+        self.assertIn("分支：main", text)
+        self.assertIn("本地改动（git status -s）：没有", text)
+        self.assertNotIn("本地改动（上面列的）", text)
+        (self.repo / "ticketd" / "config.py").write_text(OLD_CONFIG_CLONE + "# 本地改动\n", encoding="utf-8")
+        (self.repo / "ticketd" / "mine.py").write_text("", encoding="utf-8")
+        index = self.repo / ".git" / "index"
+        before = (index.read_bytes(), index.stat().st_mtime_ns)
+        p = migrate.plan()
+        text = "\n".join(migrate.plan_lines(p))
+        self.assertIn("本地改动（git status -s，2 处）", text)
+        self.assertIn(" M ticketd/config.py", text)
+        self.assertIn("?? ticketd/mine.py", text)
+        self.assertIn("旧代码目录有本地改动", text)
+        self.assertEqual(p["blockers"], [])  # 只提醒，不挡
+        self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), before)  # 只读：不回写索引
 
 
 class ConfigSetTest(TicketdTestCase):
