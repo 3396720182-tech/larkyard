@@ -130,8 +130,9 @@ def test_sandbox(env, claude, model, tmp: Path):
 
 # ---------- 凭据目录 ----------
 SECRET_PROBE = r'''
-import os, sys
-token, cdir, control, wsecret, wcontrol = sys.argv[1:6]
+import json, os, sys
+# 路径从探针旁边的 JSON 读：命令行里出现被禁读的路径时，Claude Code 在权限层就拦下整条命令，测不到沙箱本身
+token, cdir, control, wsecret, wcontrol = json.load(open(sys.argv[1]))
 def t(name, f):
     try:
         f(); print(name, "OK")
@@ -174,7 +175,10 @@ def test_secrets(claude, model, tmp: Path):
     probe.write_text(SECRET_PROBE)
     wd = tmp / "sec-wd"
     wd.mkdir()
-    args = [str(probe), str(token), str(cdir), str(control), str(cdir / "console.json"), str(config.home() / "w.txt")]
+    paths = tmp / "secret_probe_paths.json"
+    paths.write_text(json.dumps([str(token), str(cdir), str(control), str(cdir / "console.json"),
+                                 str(config.home() / "w.txt")]))
+    args = [str(probe), str(paths)]
     want = {"token_read": "DENIED", "dir_list": "DENIED", "control_read": "OK"}
     for name, grants, extra in (("凭据：Bash 读不到令牌", [], {"secret_write": "DENIED"}),
                                 ("凭据：授权上级目录也读写不了", [str(config.home())],
@@ -191,7 +195,10 @@ def test_secrets(claude, model, tmp: Path):
         exp = dict(want, **extra)
         bad = {k: got.get(k) for k, v in exp.items() if got.get(k) != v}
         leaked = secret in out
-        check(name, not bad and not leaked, "不符：%s" % bad if bad else ("令牌出现在输出里" if leaked else ""))
+        note = "令牌出现在输出里" if leaked else ""
+        if bad:
+            note = "不符：%s；输出末尾：%s" % (bad, out[-300:].replace("\n", " ⏎ "))
+        check(name, not bad and not leaked, note)
         if (cdir / "console.json").exists():
             (cdir / "console.json").unlink()
     settings = tmp / "settings-sec-tools.json"
