@@ -123,6 +123,64 @@ class PermsTest(TicketdTestCase):
         self.assertTrue(json.loads(p.read_text(encoding="utf-8"))["sandbox"]["enabled"])
 
 
+class SecretDirTest(TicketdTestCase):
+    """spec §12「凭据不进 worker」：控制台目录（设备令牌、以后的网关令牌）worker 读不到、写不了。"""
+
+    def console_dir(self):
+        from ticketd import console
+        return str(console.console_dir())
+
+    def check(self, s, d):
+        fs = s["sandbox"]["filesystem"]
+        self.assertIn(d, fs["denyRead"])  # Bash 和它起的子进程
+        self.assertIn(d, fs["denyWrite"])
+        deny = s["permissions"]["deny"]
+        for tool in ("Read", "Edit", "Write", "NotebookEdit"):  # 内置文件工具（Grep / Glob 跟 Read 规则走）
+            self.assertIn("%s(/%s/**)" % (tool, d), deny)
+        self.assertIn("Bash(lark-cli im +messages-send:*)", deny)  # 原有护栏还在
+
+    def test_denied_on_both_platforms(self):
+        from ticketd import perms
+        work = self.tmp / "w"
+        work.mkdir()
+        for system in ("darwin", "linux"):
+            with on(system):
+                self.check(perms.build_settings(str(work), []), self.console_dir())
+
+    def test_denied_even_when_home_is_granted(self):
+        # 授权目录很宽（整个 TICKETD_HOME 的上级）也不放开控制台目录
+        from ticketd import perms
+        work = self.tmp / "w"
+        work.mkdir()
+        s = perms.build_settings(str(work), [str(self.tmp)])
+        self.assertIn(str(self.tmp), s["sandbox"]["filesystem"]["allowWrite"])
+        self.check(s, self.console_dir())
+
+    def test_symlinked_home_lists_real_path_too(self):
+        from ticketd import perms
+        real = self.tmp / "real-home"
+        real.mkdir()
+        link = self.tmp / "link-home"
+        link.symlink_to(real)
+        os.environ["TICKETD_HOME"] = str(link)
+        s = perms.build_settings(str(self.tmp), [])
+        self.check(s, str(link / "console"))
+        self.check(s, str(real / "console"))
+
+    def test_write_settings_creates_private_console_dir(self):
+        # Linux 的 bubblewrap 只能遮住已存在的路径：每轮写设置时先建好（空目录不算入网）
+        from ticketd import console, perms
+        work = self.tmp / "w"
+        work.mkdir()
+        self.assertFalse(console.console_dir().exists())
+        perms.write_settings("T0001", str(work), [])
+        d = console.console_dir()
+        self.assertTrue(d.is_dir())
+        self.assertEqual(d.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(console.present())
+        self.assertFalse(console.enrolled())
+
+
 class NetGrantSettingsTest(TicketdTestCase):
     """issue #20：字段名和语义在 Claude Code 2.1.316 上实测过（默认四项全 EPERM；
     allowLocalBinding 放开连本机端口和本机 bind；allowUnixSockets 放开路径下 socket 的连接和 bind）。"""

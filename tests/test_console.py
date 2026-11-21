@@ -851,6 +851,19 @@ class NotEnrolledTest(ConsoleBase):
 
 
 class DoctorTest(ConsoleBase):
+    def test_worker_does_not_touch_console_files(self):
+        # worker 的沙箱禁读控制台目录（stat 也会被拒）：worker 里的 doctor / console 不碰这些文件
+        self.enrolled_state()
+        os.environ["TICKETD_TICKET"] = "T0001"
+        try:
+            with mock.patch.object(console, "present", side_effect=PermissionError("denied")), \
+                    mock.patch.object(console, "load", side_effect=PermissionError("denied")):
+                self.assertTrue(console.doctor_line(self.con).startswith("ℹ️ 控制台：worker 的沙箱禁读"))
+                for action in ("status", "show"):
+                    self.assertIn("沙箱禁读控制台目录", console.command_console(self.con, action))
+        finally:
+            os.environ.pop("TICKETD_TICKET")
+
     def test_ids_are_stable_and_valid(self):
         for i in cli.DOCTOR_IDS:
             self.assertRegex(i, console.DOCTOR_ID_RE)

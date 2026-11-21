@@ -921,8 +921,13 @@ def show_text(con) -> str:
     return "下一次心跳发往 %s/api/v1/heartbeat，内容：\n%s" % (info["url"], payload)
 
 
+IN_WORKER_NOTE = "worker 的沙箱禁读控制台目录，这里看不到入网状态（在终端里执行可以看到）"
+
+
 def doctor_line(con, now: Optional[float] = None) -> str:
     """ticket doctor 的控制台一项。未入网不算不通过。"""
+    if _in_worker():
+        return "ℹ️ 控制台：" + IN_WORKER_NOTE
     now = time.time() if now is None else now
     ca = ca_problem()
     if not present():
@@ -951,6 +956,8 @@ def doctor_line(con, now: Optional[float] = None) -> str:
 
 
 def command_console(con, action: str) -> str:
+    if _in_worker():
+        return "控制台：" + IN_WORKER_NOTE
     if action == "show":
         return show_text(con)
     return "\n".join(status_lines(con))

@@ -147,7 +147,8 @@ def _sandbox_line(ticket) -> str:
     if executor_of(ticket) != "claude":
         return ""
     return ("\n- 沙箱：只能写可写目录和临时目录；出网放开；连本机端口、unix socket（如 docker.sock）、"
-            "在本机 bind socket 默认被拒，用户可以逐单放开（本机网络、某个 socket 路径）。完整设置：%s"
+            "在本机 bind socket 默认被拒，用户可以逐单放开（本机网络、某个 socket 路径）；"
+            "ticketd 的控制台目录（放凭据）禁读禁写，不能授权。完整设置：%s"
             % (config.settings_dir() / ("%s.json" % ticket["id"])))
 
 

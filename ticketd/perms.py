@@ -34,12 +34,39 @@ def _existing_on_linux(paths: List[str], keep: int) -> List[str]:
     return paths[:keep] + [p for p in paths[keep:] if os.path.isdir(p)]
 
 
+def secret_dirs() -> List[str]:
+    """worker 读不到也写不了的目录（spec §12「凭据不进 worker」）：控制台目录里放设备令牌，以后 ticketd 代持的
+    网关令牌也放这里。路径和 console.console_dir() 一致；解析后的真实路径和字面路径不同时两个都写。"""
+    d = config.home() / "console"
+    out = [str(d.absolute())]
+    real = str(d.resolve())
+    if real not in out:
+        out.append(real)
+    return out
+
+
+def ensure_secret_dirs() -> None:
+    """先把控制台目录建好（700、空目录，不算入网）：Linux 的 bubblewrap 只能遮住已经存在的路径，
+    这一轮中途才入网时，令牌也落在已被遮住的目录里。建不了就算了，macOS 的规则不依赖目录存在。"""
+    d = config.home() / "console"
+    try:
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        pass
+
+
 def build_settings(workdir: str, grant_paths: List[str], net: Optional[dict] = None) -> dict:
     paths = writable_paths(workdir, grant_paths)
     allow = list(BASE_ALLOW)
     for p in paths:
         # 规则格式是 Tool(//绝对路径/**)：p 自带开头的 "/"
         allow += ["Edit(/%s/**)" % p, "Write(/%s/**)" % p, "NotebookEdit(/%s/**)" % p]
+    secrets = secret_dirs()
+    # 内置文件工具（Read / Grep / Glob / Edit 等）按 permissions 拦，Bash 及其子进程按 sandbox 拦，两边都要写。
+    # 写也禁：授权目录很宽（比如整个家目录）时，worker 也不能改 console.json 把令牌引到别的地址
+    deny = list(DENY)
+    for s in secrets:
+        deny += ["%s(/%s/**)" % (tool, s) for tool in ("Read", "Edit", "Write", "NotebookEdit")]
     sandbox_write = paths + [host.lark_cli_data_dir(), host.shared_tmp()]
     tmpdir = os.environ.get("TMPDIR")
     if tmpdir:
@@ -59,14 +86,14 @@ def build_settings(workdir: str, grant_paths: List[str], net: Optional[dict] = N
     if net and net.get("sockets"):
         network["allowUnixSockets"] = list(net["sockets"])
     return {
-        "permissions": {"allow": allow, "deny": list(DENY)},
+        "permissions": {"allow": allow, "deny": deny},
         "sandbox": {
             "enabled": True,
             "autoAllowBashIfSandboxed": True,
             "allowUnsandboxedCommands": False,
             # Linux / WSL2 上沙箱靠 bubblewrap + socat：没装时宁可让 worker 起不来，也不裸跑
             "failIfUnavailable": True,
-            "filesystem": {"allowWrite": sandbox_write},
+            "filesystem": {"allowWrite": sandbox_write, "denyRead": list(secrets), "denyWrite": list(secrets)},
             "network": network,
         },
     }
@@ -121,6 +148,7 @@ def write_codex_rules() -> None:
 
 
 def write_settings(ticket_id: str, workdir: str, grant_paths: List[str], net: Optional[dict] = None) -> Path:
+    ensure_secret_dirs()
     d = config.settings_dir()
     d.mkdir(parents=True, exist_ok=True)
     p = d / ("%s.json" % ticket_id)

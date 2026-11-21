@@ -310,6 +310,7 @@ ticket enroll https://console.example.com LY-XXXX-XXXX-XXXX \
 - `ticket console status`：入网状态、最后一次成功上报、最近的错误
 - `ticket enroll --leave`：通知控制台并删除本机的设备令牌和控制台配置（`~/.ticketd/console/`）；信任的发版公钥保留
 - 被管理员吊销后停止上报、`ticket doctor` 会提示，派单不受影响
+- worker 读不到也写不了 `~/.ticketd/console/`（设备令牌只在 worker 之外用）。Codex 的沙箱还禁不了读，所以入网的机器上派给 Codex 的单不会启动，会提示改用 Claude Code 或先退出控制台
 
 ## 开发
 
