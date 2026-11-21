@@ -213,7 +213,7 @@ def _validate_report(status: str, summary: str, run: Optional[dict] = None) -> N
 
 
 RUN_MAX_BYTES = 8 * 1024
-RUN_DEFAULT_ASK = "要我在沙箱外执行上面这段脚本吗？同意就回复「执行」；不同意或要改，直接说怎么改"
+RUN_DEFAULT_ASK = "要我在沙箱外执行这段脚本吗？同意就回复「执行」；不同意或要改，直接说怎么改"
 
 
 def read_run_script(workdir: str, path: str) -> dict:

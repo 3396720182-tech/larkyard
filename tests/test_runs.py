@@ -54,7 +54,7 @@ class RunRequestTest(TicketdTestCase):
         self.assertEqual((run["path"], run["status"]), ("push.sh", "pending"))
         row = self.con.execute("SELECT text, card_json FROM outbox").fetchone()
         self.assertIn("git push origin x", row["card_json"])
-        self.assertIn("申请在沙箱外执行（R%d" % run["id"], row["card_json"])
+        self.assertIn("查看完整脚本（R%d · push.sh" % run["id"], row["card_json"])  # 脚本默认收起（T0057）
         self.assertIn("回复「执行」", row["card_json"])
         self.assertIn("git push origin x", row["text"])  # 卡片发不出去时的文字兜底也有脚本
         self.assertEqual(self.core.last_report(self.con, tid)["ask"], self.core.RUN_DEFAULT_ASK)

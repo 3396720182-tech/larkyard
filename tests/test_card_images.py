@@ -222,7 +222,7 @@ class ResultLayoutTest(TicketdTestCase):
         self.assertEqual(els[2]["text"]["content"], "4 张好了")  # 只留一行结论
         self.assertEqual(els[2]["text"]["lines"], 2)
         panel = els[4]  # 其余文字和本机文件收进「详情」
-        self.assertEqual((panel["expanded"], panel["header"]["title"]["content"]), (False, "详情"))
+        self.assertEqual((panel["expanded"], panel["header"]["title"]["content"]), (False, "详情 · 完整内容见文档"))
         self.assertEqual(panel["elements"][0]["text"]["content"], "推荐第 2 张")
 
     def test_gallery_single_image_hero(self):

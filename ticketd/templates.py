@@ -154,6 +154,59 @@ def image_artifacts(artifacts: List[str]) -> List[str]:
 
 _SENTENCE_END = re.compile(r"[。！？!?；;\n]")
 
+# 卡片正文只放「结论 + 需要你做的那一步」（T0057）：worker 的补充说明、问题写长了或带了代码 / 命令 / 路径，
+# 卡片上只露第一句，全文收进默认收起的「详情」，技术细节以结果文档为准。
+DETAIL_MAX = 80        # 结论之外的补充（最多一句）直接显示的上限
+ASK_MAX = 120          # 「需要你」直接显示的上限（最多两句）
+_CODE = re.compile(
+    r"```"                                              # 代码块
+    r"|`[^`\n]+`"                                      # 行内代码
+    r"|(?:^|\s)--[A-Za-z]"                              # 命令行参数
+    r"|^\s*[$#>] \S"                                    # 命令提示符开头的行
+    r"|(?<![0-9A-Za-z])(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![0-9A-Za-z])",  # 提交号
+    re.M)
+_PATH = re.compile(
+    r"(?:^|[\s(（：:「“\"'=])(?:~|\.{1,2})?/[^\s/]+/"                        # /Users/…、~/x/、./a/；网址的 // 不算
+    r"|(?<![\w/.:])[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*\.[A-Za-z]{1,5}(?![A-Za-z])")  # src/auth/login.ts
+_FENCED = re.compile(r"```.*?(?:```|$)", re.S)
+_FULL_STOP = re.compile(r"[。！？!?\n]")
+
+
+def technical(s: str, paths: bool = True) -> bool:
+    """是不是带了代码、命令、路径这类技术细节（这些该写进结果文档，不进卡片正文）。
+    paths=False 时路径不算：「需要你」里要授权的目录本身就是问题的一部分。"""
+    s = str(s or "")
+    return bool(_CODE.search(s) or (paths and _PATH.search(s)))
+
+
+def _sentences(s: str) -> List[str]:
+    return [x for x in (p.strip() for p in re.split(r"(?<=[。！？!?\n])", s)) if x]
+
+
+def prose(s: str) -> str:
+    """去掉代码块后的文字（代码块之外一句话都没有时为空串）。"""
+    return _FENCED.sub(" ", str(s or "")).strip()
+
+
+def brief(s, limit: int, max_sentences: int = 2, paths: bool = True):
+    """卡片正文里显示的短版，返回 (显示的文字, 是否有内容被收起)。
+    短（≤limit 字、≤max_sentences 句）且不含代码 / 命令（paths=True 时还有路径）：原样显示；
+    否则只显示去掉代码块后的第一句，超长截断，全文由调用方放进收起的详情。"""
+    s = clip(s, 1200)
+    if len(s) <= limit and len(_sentences(s)) <= max_sentences and not technical(s, paths):
+        return s, False
+    first = prose(s) or "（内容是代码，见下方「详情」）"
+    m = _FULL_STOP.search(first)
+    if m:
+        first = first[:m.end()].strip()
+    shown = short(first, limit)
+    return shown, shown != s
+
+
+def _has_docs(artifacts: List[str]) -> bool:
+    from .publish import DOC_TYPES  # publish 依赖发件箱，发件箱依赖本模块：用到时再导入
+    return any(not _URL.match(a) and Path(a).suffix.lower() in DOC_TYPES for a in artifacts)
+
 
 def split_summary(summary: str):
     """摘要拆成「结论」（第一句，卡片里放大显示）和「细节」（其余，正常字号）。"""
@@ -208,15 +261,18 @@ def image_grid(paths: List[str], grid: bool = False) -> list:
     return rows
 
 
-def details_panel(rest: str, files: List[str], workdir: Optional[str]) -> dict:
-    """收起的「详情」：摘要里结论以外的话 + 本机文件路径（在飞书里点不开，只给需要时看）。"""
+def details_panel(rest: str, files: List[str], workdir: Optional[str], ask: str = "", docs: bool = False) -> dict:
+    """收起的「详情」：摘要里结论以外的话、收起的完整问题 + 本机文件路径（在飞书里点不开，只给需要时看）。
+    docs=True（有稿子会变成文档按钮）时标题提示完整内容见文档。"""
     els = []
     if rest:
         els.append(text(rest))
+    if ask:
+        els.append(text("👉 需要你（完整说明）：\n" + ask))
     if files:
         els.append(note("📎 本机文件\n" + "\n".join(short(nice_path(a, workdir), 120) for a in files[:8])
                         + ("\n…" if len(files) > 8 else "")))
-    title = "详情" if rest else "📎 本机文件（%d）" % len(files)
+    title = ("详情 · 完整内容见文档" if docs else "详情") if rest or ask else "📎 本机文件（%d）" % len(files)
     return {"tag": "collapsible_panel", "expanded": False, "vertical_spacing": "4px",
             "header": {"title": {"tag": "plain_text", "content": title, "text_size": "notation",
                                  "text_color": "grey"}},
@@ -230,7 +286,7 @@ def with_badge(card: dict, badge: Optional[str]) -> dict:
         return card
     els = card["body"]["elements"]
     for e in els:
-        if e.get("tag") == "collapsible_panel" and not e.get("expanded"):
+        if e.get("tag") == "collapsible_panel" and not e.get("expanded") and e.get("element_id") != RUN_PANEL_ID:
             e["elements"].append(note(badge))
             return card
     els.insert(max(len(els) - 1, 0), {
@@ -240,21 +296,50 @@ def with_badge(card: dict, badge: Optional[str]) -> dict:
     return card
 
 
+RUN_PANEL_ID = "run_script"  # 脚本面板的 element_id：和「详情」面板区分（徽标、稿子按钮都不放进它）
+
+
+def run_purpose(script: str) -> str:
+    """脚本要做什么：取开头第一行说明注释（跳过 #! 和编码声明，遇到命令就停）。worker 提示词要求开头写这句说明。"""
+    out = []
+    for line in str(script).splitlines():
+        s = line.strip()
+        if not s or s.startswith("#!"):
+            continue
+        if not s.startswith("#"):
+            break
+        s = s.lstrip("#").strip()
+        if s and not re.match(r"-\*-|shellcheck\b", s):
+            out.append(s)
+            break
+    return short(out[0].rstrip("。；;"), 80) if out else ""
+
+
 def run_elements(run: dict) -> list:
-    """沙箱外执行申请：完整脚本（worker 写的，plain_text）放在默认展开的面板里，用户看过再批准。"""
-    head = "🖥️ 申请在沙箱外执行（R%s · %s）" % (run["id"], short(run["path"], 60))
-    return [{"tag": "collapsible_panel", "expanded": True, "vertical_spacing": "4px",
-             "header": {"title": {"tag": "plain_text", "content": head, "text_size": "notation"}},
-             "elements": [text(run["script"].rstrip()[:9000]),  # 原样显示（含缩进），汇报时已限制在 8KB 以内
-                          note("回复「执行」才会执行：由 ticketd 在工单目录里、沙箱外运行这段脚本（最长 %d 分钟），"
-                               "输出交回 worker 接着做。脚本里调用的其他文件以批准时工单目录里的为准。"
-                               % max(1, int(run.get("timeout", 1800) // 60)))]}]
+    """沙箱外执行申请（T0057 调整）：只露一句「要做什么」（脚本开头的注释）和批准后会发生什么；
+    完整脚本（worker 写的，plain_text，原样含缩进）收进默认收起的面板，想看的人点开看。"""
+    script = run["script"].rstrip()
+    purpose = run_purpose(script) or "脚本开头没写说明，批准前请展开看完整脚本"
+    lines = len(script.splitlines())
+    head = "查看完整脚本（R%s · %s · %d 行）" % (run["id"], short(run["path"], 40), lines)
+    return [text("🖥️ 申请在沙箱外执行：" + purpose),
+            note("批准后由 ticketd 在工单目录里、沙箱外运行（最长 %d 分钟），输出交回 worker 接着做；"
+                 "脚本调用的其他文件以批准时工单目录里的为准。"
+                 % max(1, int(run.get("timeout", 1800) // 60))),
+            {"tag": "collapsible_panel", "element_id": RUN_PANEL_ID, "expanded": False, "vertical_spacing": "4px",
+             "header": {"title": {"tag": "plain_text", "content": head, "text_size": "notation",
+                                  "text_color": "grey"}},
+             "elements": [text(script[:9000])]}]  # 汇报时已限制在 8KB 以内
 
 
-def _ask_element(status: str, ask: str) -> dict:
+def _ask_element(status: str, ask: str):
+    """「需要你」色块（dropped 是一行灰字说明）。返回 (元素, 收起的完整文字或空串)。"""
+    shown, folded = brief(ask, ASK_MAX, paths=False)
     if status == "dropped":
-        return text("说明：%s。不引用直接发我即可开新单。" % clip(ask, 400).rstrip("。"), color="grey")
-    return callout("👉 需要你", clip(ask, 600), "orange" if status == "blocked" else "blue")
+        return text("说明：%s。不引用直接发我即可开新单。" % shown.rstrip("。"), color="grey"), \
+            (clip(ask, 1200) if folded else "")
+    body = shown + ("（完整说明见下方「详情」）" if folded else "")
+    return callout("👉 需要你", body, "orange" if status == "blocked" else "blue"), (clip(ask, 1200) if folded else "")
 
 
 def _link_buttons(links: List[str]) -> list:
@@ -272,38 +357,49 @@ def result_elements(status: str, summary: str, artifacts: List[str], ask: Option
     有图片/视频（images=True，只用于推送的结果卡）→ 画廊：媒体占主体在最上面 → 一行结论 → 需要你（色块）
       → 链接 → 收起的详情（其余文字 + 本机文件）。
     没有媒体 → 文档：结论（放大）→ 需要你 → 细节 → 链接 → 收起的本机文件。
-    状态卡原地 PATCH 不经发件箱，不能带待上传的占位，所以 images=False 时不显示媒体。"""
+    状态卡原地 PATCH 不经发件箱，不能带待上传的占位，所以 images=False 时不显示媒体。
+    T0057：正文只留结论和需要你做的那一步。补充细节超过一句、过长或带代码 / 命令 / 路径时收进「详情」；
+    「需要你」同理只露第一句，完整说明也收进「详情」。"""
     head, rest = split_summary(summary)
     files = [a for a in artifacts if not _URL.match(a)]
     links = [a for a in artifacts if _URL.match(a)]
     videos = video_artifacts(artifacts) if images else []
     pics = image_artifacts(artifacts) if images else []
-    if videos or pics:
+    ask = (ask or "").strip()
+    ask_el, ask_full = _ask_element(status, ask) if ask else (None, "")
+    gallery = bool(videos or pics)
+    if "```" in summary:  # 摘要里带代码块：结论取代码块之外的第一句，全文进「详情」
+        head, rest = split_summary(prose(summary))[0] or "结果见下方「详情」", clip(summary, 1200)
+    inline_rest = (rest and not gallery and len(rest) <= DETAIL_MAX and not technical(rest)
+                   and not _SENTENCE_END.search(rest.rstrip("。！？!?；;")))
+    folded_rest = "" if inline_rest else rest
+    if gallery:
         els = [dict(note("🎬 " + short(Path(v).name, 60)), **{VIDEO_KEY: v}) for v in videos]
         if pics:
             els += image_grid(pics, grid=bool(videos))
         headline = text(head, size="heading-4")
         headline["text"]["lines"] = 2
         els.append(headline)
-        if ask:
-            els.append(_ask_element(status, ask))
-        if run:
-            els += run_elements(run)
-        els += _link_buttons(links)
-        if rest or files:
-            els.append(details_panel(rest, files, workdir))
-        return els
-    els = [text(head, size="heading-4")]
-    if ask:
-        els.append(_ask_element(status, ask))
+    else:
+        els = [text(head, size="heading-4")]
+    if ask_el:
+        els.append(ask_el)
     if run:
         els += run_elements(run)
-    if rest:
+    if inline_rest:
         els.append(text(rest))
     els += _link_buttons(links)
-    if files:
-        els.append(details_panel("", files, workdir))
+    if folded_rest or ask_full or files:
+        els.append(details_panel(folded_rest, files, workdir, ask=ask_full,
+                                 docs=bool(folded_rest or ask_full) and _has_docs(files)))
     return els
+
+
+def _tail_at(els: list) -> int:
+    """稿子按钮 / 导入失败说明插在哪：收起的详情面板（不算沙箱外执行的脚本面板）之前；
+    没有面板时在页脚（最后一行过程轨迹）或分割线之前。"""
+    return next((i for i, e in enumerate(els) if e.get("tag") == "hr" or (
+        e.get("tag") == "collapsible_panel" and e.get("element_id") != RUN_PANEL_ID)), max(len(els) - 1, 0))
 
 
 def doc_buttons(links: List[tuple]) -> list:
@@ -317,7 +413,7 @@ def doc_buttons(links: List[tuple]) -> list:
 def with_doc_links(card: dict, links: List[tuple]) -> dict:
     """把稿子按钮插到结果卡片的链接按钮之后：收起的详情面板之前；没有面板时在页脚（最后一行过程轨迹）之前。"""
     els = card["body"]["elements"]
-    at = next((i for i, e in enumerate(els) if e.get("tag") in ("collapsible_panel", "hr")), max(len(els) - 1, 0))
+    at = _tail_at(els)
     els[at:at] = doc_buttons(links)
     return card
 
@@ -329,7 +425,7 @@ def with_doc_failures(card: dict, fails: List[tuple], workdir: Optional[str] = N
     lines = ["📄 %s 没能导入云文档：%s。本机文件：%s" % (short(name, 30), short(reason, 80), short(nice_path(path, workdir), 80))
              for name, path, reason in fails]
     els = card["body"]["elements"]
-    at = next((i for i, e in enumerate(els) if e.get("tag") in ("collapsible_panel", "hr")), max(len(els) - 1, 0))
+    at = _tail_at(els)
     els[at:at] = [note("\n".join(lines))]
     return card
 
@@ -417,13 +513,15 @@ def report_message(ticket_id: str, status: str, summary: str,
 
 def ping_message(ticket_id: str, status: str, summary: str, ask: Optional[str]) -> Optional[str]:
     """结果已覆盖到状态卡上（编辑不推送提醒）时的一行提醒：只在需要用户回答时发（blocked，或带 --ask 且不是 dropped）。"""
+    ask = (ask or "").strip()
     if status == "dropped" or not (ask or status == "blocked"):
         return None
     emoji, word = LABELS[status].split(" ", 1)
     if status == "blocked":
-        head = "%s %s 需要你决定：%s" % (emoji, ticket_id, short(ask or summary, 300))
+        q = brief(ask or split_summary(prose(summary) or summary)[0], ASK_MAX, paths=False)[0]
+        head = "%s %s 需要你决定：%s" % (emoji, ticket_id, q)
     else:
-        head = "%s %s %s · 👉 需要你：%s" % (emoji, ticket_id, word, short(ask, 300))
+        head = "%s %s %s · 👉 需要你：%s" % (emoji, ticket_id, word, brief(ask, ASK_MAX, paths=False)[0])
     return head + "\n详情已更新在上方状态卡，引用这条回复即可"
 
 
