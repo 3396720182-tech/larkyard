@@ -52,3 +52,11 @@
 
 ### Requirement: setup 不装第二个服务
 `ticket setup` 在扫码建应用、写工作区和任何服务之前发现直接跑旧代码的 ticketd 服务（任何服务名）时 MUST 拒绝，提示用 `ticket migrate`。
+
+### Requirement: 离线升级包放在任何路径都能用
+
+`release.py bundle` SHALL 只从验签通过、包摘要和 `install.sh` 内置指纹都对得上的更新源打包。升级包的入口 `upgrade.sh` MUST NOT 因为所在路径含空格、非 ASCII 字符或 `# % ?` 而拒绝执行，SHALL 把同目录的 `feed/` 经 `install.sh --from-dir` 交给安装脚本；`install.sh --from-dir` SHALL 把整条路径按 RFC 3986 转义成 `file://` 地址。
+
+#### Scenario: 升级包在含空格和中文的目录里
+- **WHEN** 升级包解压在 `~/Downloads/下载 含空格/` 下，用户执行 `sh upgrade.sh --dry-run`
+- **THEN** 照常核对公钥、验签、下载包并做只读检查，输出和放在纯英文路径下相同

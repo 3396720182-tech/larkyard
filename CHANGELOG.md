@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2 — 2026-11-21
+
+- 离线升级包放在任何路径都能用：
+  - `install.sh` 新增 `--from-dir <目录>`：本地发布目录的整条路径按 RFC 3986 转义成 `file://` 地址，空格、中文、`# % ?` 都不会被 curl 误解。原来的 `--from file://…` 照旧，只转空格。
+  - `install.sh` 里的变量统一写成 `${VAR}`：变量名后面紧跟中文时，bash 会把中文的字节读成变量名的一部分。
+  - 新增 `scripts/upgrade-offline.sh`，作为升级包的入口 `upgrade.sh`：不再拒绝带空格或中文的路径，把同目录的 `feed/` 交给 `install.sh --from-dir`；没有参数时也能正确转发（macOS 的 `/bin/sh` 是 bash 3.2，`set -u` 下 `"${@}"` 会报错）。
+  - `release.py bundle --feed <更新源> --out <目录>`：从更新源里一个通道的当前版本做出离线升级包和 zip。打包前用 feed 里的主公钥验签，核对包的摘要、`install.sh` 内置的指纹和发布地址；写进升级包的就是核对过的字节；通道写进 `feed/CHANNEL`，由 `upgrade.sh` 带上。
+  - `install.sh` 里的内联 Python 一律 `-I`：在「下载」里执行时，那里的 `pathlib.py` 之类顶替不了标准库。
+- `ticket migrate`：
+  - 旧代码目录本身带空格也认（含空白的启动参数只要是存在的文件就认，`sh -c "…"` 包装照旧不认）；
+  - 只读打开数据库时用转义过的 `file:` 地址，路径里有 `# ?` 也对。
+
 ## 0.3.1 — 2026-11-21
 
 - 升级已经在跑的旧安装（`openspec/changes/migrate-existing-install/`，规格见 `docs/spec.md` §14）：新命令 `ticket migrate [--dry-run | --undo]` 和 `install.sh --upgrade-existing [--dry-run]`，把早期版本（自定义服务名、主用户和工单根目录写在代码里）或从 clone 装的 Larkyard 一条命令转成受管安装 + 打包的 bridge。按启动命令认出在跑的 ticketd 服务；用旧代码自己算出它实际在用的主用户和工单根目录，和新版本默认值不同才写进 `config.env`（服务环境里的其他 `TICKETD_*` 也搬过去）；停旧服务、等数据库锁放开、拷数据库快照、服务统一成 `dev.larkyard.ticketd` 经启动器运行、主会话约定里的 `ticket` 路径改到 `current`、等新守护进程的心跳，任何一步失败自动退回；bridge 是 Homebrew / npm 装的就接着 `ticket bridge adopt`（这一步失败只退回 bridge）。`--dry-run` 只读，不打开数据库读写，并打出旧代码目录的版本、最后一次提交和本地改动（`git log -1`、`git status -s`；有本地改动时提醒迁移后不含这些改动）；动手和 `--undo` 在 bridge 驱动的会话里拒绝；有正在运行的工单时不动手。`--undo` 按备份恢复服务文件、配置、主会话约定和 bridge。

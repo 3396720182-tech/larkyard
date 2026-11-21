@@ -83,8 +83,8 @@ def _service_dir() -> tuple:
 def _ticketd_arg(prog: list) -> str:
     """启动命令里指向 ticketd 的那一项：克隆的 <目录>/bin/ticketd，或受管安装的 launcher.py。"""
     for a in prog:
-        if any(c.isspace() for c in a):
-            continue  # sh -c "…" 这类包装不认
+        if any(c.isspace() for c in a) and not os.path.isfile(os.path.expanduser(a)):
+            continue  # sh -c "…" 这类包装不认；路径本身带空格（存在的文件）照认
         if a.endswith("/bin/ticketd"):
             return a
         if a.endswith("/launcher.py") and os.path.normpath(os.path.expanduser(a)) == os.path.normpath(
@@ -239,7 +239,7 @@ def _running_tickets() -> Optional[list]:
     if not p.is_file():
         return []
     try:
-        con = sqlite3.connect("file:%s?mode=ro" % p, uri=True, timeout=5)
+        con = sqlite3.connect(Path(p).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
         try:
             return [r[0] for r in con.execute("SELECT id FROM tickets WHERE state='running'")]
         finally:
@@ -522,7 +522,7 @@ def _backup_db(dest: Path) -> bool:
     src = config.db_path()
     if not src.is_file():
         return False
-    a = sqlite3.connect("file:%s?mode=ro" % src, uri=True, timeout=10)
+    a = sqlite3.connect(Path(src).resolve().as_uri() + "?mode=ro", uri=True, timeout=10)  # as_uri：路径里有 # ? % 空格也对
     try:
         b = sqlite3.connect(str(dest))
         try:

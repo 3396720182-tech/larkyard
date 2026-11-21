@@ -15,6 +15,9 @@
   release.py unpublish-pause --to <更新源目录>
   release.py publish-installer --url https://<发布地址> --main <主公钥.pub> --backup <备份公钥.pub> --to <更新源目录>
         把一行安装脚本（填好默认发布地址）和两把公钥放到更新源根目录：install.sh、keys/main.pub、keys/backup.pub
+  release.py bundle   --feed <更新源目录> --out <目录> [--channel stable] [--readme <说明文件>]...
+        从更新源里取一个通道的当前版本，做成离线升级包 larkyard-<版本>-upgrade/（feed/ + upgrade.sh + 说明）和同名 .zip：
+        发布地址打不开时，把 zip 拷到旧机器上，sh upgrade.sh [--dry-run] 升级已经在跑的旧安装（放在任何路径都行）
 
 签名用 `ssh-keygen -Y sign -n larkyard-release`，只接受 Ed25519（含硬件密钥 ed25519-sk）；--key 给 .pub 时用 ssh-agent 里的私钥。
 本工具不读、不复制、不记录私钥内容，也没有在服务器上签名的模式。
@@ -457,6 +460,96 @@ def cmd_publish_installer(a) -> list:
             "员工执行：curl -fsSL %s/install.sh | sh" % url]
 
 
+OFFLINE_ENTRY = Path(__file__).resolve().parent / "upgrade-offline.sh"
+
+
+def cmd_bundle(a) -> list:
+    """离线升级包：更新源里一个通道当前的发版清单、签名、包，加上 install.sh、两把公钥、feed/CHANNEL 和入口 upgrade.sh。
+    打包前核对：清单用 feed 里的主公钥验签、包的大小和摘要对得上清单、install.sh 内置的指纹就是这两把公钥的、
+    install.sh 填好了发布地址。只打发版清单（回滚清单有有效期，离线包放几天就过期）。
+    升级包里的 install.sh 本身也在 zip 里，所以 zip 的完整性要靠传递渠道（自己 AirDrop、核对打印出来的 zip 摘要）。"""
+    import tempfile
+    import zipfile
+    feed, ch = Path(a.feed), a.channel
+    m, sig = feed / "channels" / ch / "manifest.json", feed / "channels" / ch / "manifest.json.sig"
+    try:
+        data, sigb = m.read_bytes(), sig.read_bytes()
+        doc = json.loads(data.decode("utf-8"))
+        text = (feed / "install.sh").read_text(encoding="utf-8")
+        keys = {n: updsig.parse_pubkey((feed / "keys" / ("%s.pub" % n)).read_text(encoding="utf-8")) for n in ("main", "backup")}
+    except (OSError, ValueError) as e:
+        raise ReleaseError("更新源 %s 不完整（要有 install.sh、keys/main.pub、keys/backup.pub、channels/%s/manifest.json(.sig)）：%s"
+                           % (feed, ch, e))
+    if doc.get("kind") != "release" or doc.get("channel") != ch:
+        raise ReleaseError("%s 不是 %s 通道的发版清单（kind=%s）" % (m, ch, doc.get("kind")))
+    with tempfile.TemporaryDirectory() as d:
+        signers = Path(d) / "allowed_signers"
+        updsig.write_signers(signers, updsig.MAIN_PRINCIPAL, keys["main"])
+        if not updsig.verify(data, sigb, signers, updsig.MAIN_PRINCIPAL):
+            raise ReleaseError("%s 的签名和 keys/main.pub 对不上" % m)
+    for var, n in (("RELEASE_KEY_FP", "main"), ("BACKUP_KEY_FP", "backup")):
+        mm = re.search(r'^%s="(SHA256:[^"]+)"' % var, text, re.M)
+        if not mm or mm.group(1) != updsig.fingerprint(keys[n]):
+            raise ReleaseError("install.sh 里的 %s 和 keys/%s.pub 不一致" % (var, n))
+    if '"@RELEASE_URL@"' in text:
+        raise ReleaseError("%s/install.sh 还没填发布地址（用 publish-installer 发布的那份）：升级后机器会没有自动更新源" % feed)
+    version, package = str(doc["version"]), str(doc["package"])
+    if not re.fullmatch(r"\d+(\.\d+){1,3}", version) or package != "larkyard-%s.tar.gz" % version:
+        raise ReleaseError("清单里的版本或包名不对：%s / %s" % (version, package))
+    pkg = feed / "packages" / package
+    blob = pkg.read_bytes() if pkg.is_file() else b""
+    if len(blob) != doc.get("size") or hashlib.sha256(blob).hexdigest() != doc.get("sha256"):
+        raise ReleaseError("%s 的大小或摘要和清单不一致" % pkg)
+    name = "larkyard-%s-upgrade" % version
+    out = Path(a.bundle_out)
+    dest, zpath = out / name, out / (name + ".zip")
+    for x in (dest, zpath):
+        if x.exists():
+            raise ReleaseError("%s 已经存在：先挪走" % x)
+    # 放进去的就是上面核对过的这几份字节（不再从更新源重读：同时有 publish 也不会混进别的版本）
+    files = {"feed/install.sh": (text.encode("utf-8"), 0o755),
+             "feed/keys/main.pub": ((feed / "keys/main.pub").read_bytes(), 0o644),
+             "feed/keys/backup.pub": ((feed / "keys/backup.pub").read_bytes(), 0o644),
+             "feed/channels/%s/manifest.json" % ch: (data, 0o644), "feed/channels/%s/manifest.json.sig" % ch: (sigb, 0o644),
+             "feed/packages/%s" % package: (blob, 0o644), "feed/CHANNEL": (("%s\n" % ch).encode(), 0o644),
+             "upgrade.sh": (OFFLINE_ENTRY.read_bytes(), 0o755)}
+    for k in ("main", "backup"):
+        if updsig.parse_pubkey(files["feed/keys/%s.pub" % k][0].decode("utf-8")) != keys[k]:
+            raise ReleaseError("keys/%s.pub 在核对之后变了" % k)
+    for r in a.readme or []:
+        rn = Path(r).name
+        if rn in files or rn == "feed":
+            raise ReleaseError("说明文件不能叫 %s" % rn)
+        files[rn] = (Path(r).read_bytes(), 0o644)
+    tmp, zt = out / (".%s.tmp" % name), out / (".%s.zip.tmp" % name)
+    try:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+        for rel, (content, mode) in files.items():
+            d = tmp / rel
+            d.parent.mkdir(parents=True, exist_ok=True)
+            d.write_bytes(content)
+            os.chmod(str(d), mode)
+        with zipfile.ZipFile(str(zt), "w", zipfile.ZIP_DEFLATED) as z:
+            for f in sorted(tmp.rglob("*")):
+                arc = (Path(name) / f.relative_to(tmp)).as_posix() + ("/" if f.is_dir() else "")
+                zi = zipfile.ZipInfo(arc, date_time=(2026, 1, 1, 0, 0, 0))
+                zi.create_system = 3  # unix：解压后保留可执行位
+                zi.external_attr = ((0o40755 if f.is_dir() else 0o100000 | (f.stat().st_mode & 0o777)) << 16) | (
+                    0x10 if f.is_dir() else 0)
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                z.writestr(zi, b"" if f.is_dir() else f.read_bytes())
+        os.replace(str(tmp), str(dest))
+        os.replace(str(zt), str(zpath))
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+        if zt.exists():
+            zt.unlink()
+    zsha = hashlib.sha256(zpath.read_bytes()).hexdigest()
+    return ["离线升级包：%s（%s %s 通道，包 sha256 %s）" % (dest, version, ch, doc["sha256"]),
+            "zip：%s  sha256 %s（升级包里的 install.sh 也在 zip 里：拷到别的机器后可以核对这个摘要）" % (zpath, zsha),
+            "旧机器上：解压后 sh %s/upgrade.sh --dry-run，再 sh %s/upgrade.sh" % (name, name)]
+
+
 def cmd_unpublish_pause(a) -> list:
     to = Path(a.to)
     for p in (to / "pause.json", to / "pause.json.sig"):
@@ -504,11 +597,17 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--backup", required=True, help="备份公钥（.pub 文件或内容）")
     pi.add_argument("--to", required=True, help="更新源目录（静态文件根）")
     pi.add_argument("--repo", default=str(REPO))
+    bu = sub.add_parser("bundle")
+    bu.add_argument("--feed", required=True, help="更新源目录（publish / publish-installer 的 --to）")
+    bu.add_argument("--out", dest="bundle_out", required=True, help="升级包放到这个目录下")
+    bu.add_argument("--channel", default="stable", choices=("stable", "early", "canary"))
+    bu.add_argument("--readme", action="append", help="一起放进升级包根目录的说明文件（可多个）")
     return p
 
 
 COMMANDS = {"release": cmd_release, "rollback": cmd_rollback, "pause": cmd_pause, "rekey": cmd_rekey,
-            "publish": cmd_publish, "unpublish-pause": cmd_unpublish_pause, "publish-installer": cmd_publish_installer}
+            "publish": cmd_publish, "unpublish-pause": cmd_unpublish_pause, "publish-installer": cmd_publish_installer,
+            "bundle": cmd_bundle}
 
 
 def main(argv=None) -> int:

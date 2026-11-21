@@ -260,6 +260,14 @@ class EarlyLayoutDarwinTest(MigrateBase):
         migrate.undo(services=self.svc)
         self.assertTrue(renamed.exists())
 
+    def test_program_with_spaces_in_path_vs_sh_c_wrapper(self):
+        odd = self.home / "旧 代码 #1" / "bin" / "ticketd"
+        odd.parent.mkdir(parents=True)
+        odd.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.assertEqual(migrate._ticketd_arg([str(odd)]), str(odd))  # 代码目录本身带空格、中文：照认
+        self.assertEqual(migrate._ticketd_arg(["/bin/sh", "-c", "cd /x && exec %s" % odd]), "")  # 包装：不认
+        self.assertEqual(migrate._ticketd_arg(["/bin/sh", "-c", "exec /x/bin/ticketd"]), "")
+
     def test_old_daemon_not_stopping_rolls_back(self):
         before = self.snapshot()
         with self.assertRaises(migrate.MigrateError):
