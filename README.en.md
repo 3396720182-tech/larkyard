@@ -6,7 +6,7 @@
 
 [中文](./README.md)
 
-> **Larkyard is built on top of [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge).**
+> **Larkyard is built on top of [lark-channel-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge).**
 > Message I/O, sessions, `<bridge_context>`, the bot identity and the lark-cli environment all come from lark-channel-bridge (MIT).
 > Larkyard release packages bundle it, built from [our fork](https://github.com/3396720182-tech/lark-coding-agent-bridge) at the commit pinned in `vendor/bridge.lock.json`, so it is signed, installed and updated together with Larkyard. On top of it Larkyard adds a dispatch daemon, status cards and a set of workspace conventions. See [NOTICE.md](./NOTICE.md).
 
@@ -72,29 +72,59 @@ A few details about Codex workers:
 | Part | Where | What it does |
 |---|---|---|
 | `ticketd` daemon | `ticketd/`, `bin/ticketd`, `launchd/`, `systemd/` | Managed by launchd (macOS) or a systemd user service (Linux): queueing, concurrency limit, one worker per ticket (`claude -p` by default, `codex exec` per ticket), timeouts, crash recovery, an idempotent outbox with retries that falls back to the chat when the origin message was withdrawn, status cards |
-| `ticket` CLI | `bin/ticket` | The only entry point for the bridge session and workers: `new / send / lookup / stop / hold / release / grant / show / ls / report` |
+| `ticket` CLI | `bin/ticket` | The only entry point for the bridge session and workers: `new / send / lookup / stop / hold / release / restart / grant / approve / show / ls / report`; for you in a terminal there are also `doctor / stats / setup / update / bridge / migrate / enroll / console / telemetry` |
 | Worker contract | `prompts/worker.md`, `prompts/worker.codex.md` | System prompt for workers: the user's own words are the spec, write only to granted dirs, report stages, close with one of 5 states; Codex workers also get `worker.codex.md` |
 | Executors | `ticketd/executors.py` | Separates "which agent CLI runs a turn" from the scheduler: one implementation for Claude Code and one for Codex; Codex events are translated into the same shape, so status cards, stall detection and retries are shared |
 | Workspace conventions | `workspace/CLAUDE.md.tmpl` | `CLAUDE.md` for the bridge workspace: the attention principle, dispatch rules, follow-ups and control commands, honest delivery |
 | Personal overrides | `workspace/CLAUDE.local.example.md`, `config.example.env` | Your own preferences and settings, never committed |
 | Bundled bridge | `vendor/bridge.lock.json`, `vendor/runtime.json`, `scripts/build_bridge.py`, `ticketd/bridge.py` | lark-channel-bridge from a pinned fork commit, plus the Node and lark-cli versions and SHA-256s; installed under `~/.ticketd` with service definitions written by Larkyard, independent of nvm / npm |
 | One-line install | `install.sh`, `ticketd/bootstrap.py`, `ticketd/setup.py` | Check the release keys and signature → managed install → runtimes → the `ticket setup` wizard (QR app creation, workspace, services, owner detection) |
-| Design spec | `docs/spec.md` | Data model, permissions and sandbox, status cards, outbox, and the reason behind every change (Chinese) |
+| Signed self-update | `ticketd/update.py`, `ticketd/updsig.py`, `ticketd/launcher.py`, `scripts/release.py` | The publisher signs releases on their own machine; the daemon verifies and installs when idle; a launcher outside the version directories runs a probation period and switches back if the new version fails its self-check (off by default; on for one-line installs) |
+| Upgrading old installs | `ticketd/migrate.py`, `scripts/upgrade-offline.sh` | Turns an early or clone-based install into a managed install with the bundled bridge in one command; an offline upgrade bundle for when the release URL is unreachable |
+| Optional outbound connections | `ticketd/console.py`, `ticketd/telemetry.py`, `server/telemetry/` | Console enrollment (device status every 5 minutes after `ticket enroll`; the server is not in this repo) and anonymous usage statistics (Cloudflare Worker backend); both off by default and independent of each other |
+| Operational metrics | `ticketd/metrics.py` | Per-round cost, key events, `ticket stats`, the weekly digest DM, `ticket doctor` |
+| Design spec | `docs/spec.md`, `openspec/changes/` | Data model, permissions and sandbox, status cards, outbox, and the reason behind every change (Chinese); larger changes start as a proposal, specs and tasks under `openspec/changes/<name>/`, reviewed before code |
+
+**Dispatch and delivery** (from one sentence in Feishu to a result card):
 
 ```
-you ──Feishu──▶ lark-channel-bridge ──▶ bridge session (Claude Code, reads workspace CLAUDE.md)
-▲                                          │ ticket new / send / stop / hold / release / grant
-│                                          ▼
-│                               SQLite (~/.ticketd/db) ◀──poll── ticketd (launchd / systemd)
-│                                                                ├─ worker: Claude Code (claude -p) or Codex (codex exec),
-│                                                                │         routed per ticket, one session + dir + sandbox each
-│                                                                ├─ status card: edited in place, result overwrites it
-│                                                                └─ outbox: prepares artifacts, then sends via lark-cli
-│                                                                   ├─ images go into the card; videos go to your Drive as you (uploaded once per video); docs become Feishu docs
-│                                                                   ├─ network down: back off and wait; degrade only after 10+ minutes of failures
-│                                                                   ├─ replies to the origin message, or posts to the chat if it was withdrawn
-└──◀── result card / pings ─────────────────────────────────────────┘
+you ──Feishu──▶ lark-channel-bridge (bundled) ──▶ bridge session (Claude Code, reads workspace CLAUDE.md)
+▲                │ "make it a ticket" on meeting minutes  │ ticket new / send / stop / hold / release / grant / approve
+│                └───────────────────────┬────────────────┘
+│                                        ▼
+│                         SQLite (~/.ticketd/db) ◀──poll── ticketd (launchd / systemd; via the launcher when managed)
+│                                                          ├─ worker: Claude Code (claude -p) or Codex (codex exec),
+│                                                          │         routed per ticket, one session + dir + sandbox each
+│                                                          │         steps the sandbox can't do → a script that runs outside it after you reply "执行"
+│                                                          ├─ status card: edited in place, result overwrites it
+│                                                          └─ outbox + media lane: prepares artifacts, then sends via lark-cli
+│                                                             ├─ images go into the card; videos go to your Drive as you (uploaded once per video); docs become Feishu docs
+│                                                             ├─ network down: back off and wait; degrade only after 10+ minutes of failures
+│                                                             └─ replies to the origin message, or posts to the chat if it was withdrawn
+└──◀── result card / pings ───────────────────────────────────┘
 ```
+
+**Releases and updates** (how code reaches your machine, and how a bad version is undone):
+
+```
+publisher's machine (private keys live only here)
+  git tag ─▶ scripts/build_bridge.py (builds the bridge pinned in vendor/bridge.lock.json)
+          ─▶ scripts/release.py release (package; main key signs canary / early / stable manifests)
+          ─▶ release.py publish / publish-installer
+                      │
+                      ▼
+  update source (static files: install.sh, keys/, channels/<channel>/manifest.json(.sig), packages/)
+          ├─ offline bundle: release.py bundle → larkyard-<version>-upgrade.zip
+          │
+          ├─▶ new machine: curl …/install.sh | sh
+          │     check keys against built-in fingerprints → verify → install to ~/.ticketd/app/versions/<version> → ticket setup
+          │
+          └─▶ installed machine: ticketd checks hourly
+                verify signature and SHA-256 → switch current when idle → launcher probation (10 min default) → switch back on failure
+                the bridge is not restarted: a new bundled bridge goes live in the daily 04:07 window, rolled back if it can't reach Feishu in 90 s
+```
+
+Inside `~/.ticketd`: `app/versions/<version>/` (one directory per version), `app/current` (the one in use), `app/launcher.py` (outside the version directories), `bridge/current`, `runtime/node`, `bin/lark-cli`, `db/`, `logs/`, `config.env`.
 
 ## The conventions in short
 
