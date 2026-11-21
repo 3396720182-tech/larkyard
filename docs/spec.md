@@ -234,8 +234,9 @@ ticket report --status ready|blocked|failed|dropped|waiting \
 ## 6. 权限边界
 
 - 默认只能写工单目录，加上 `grants` 里的目录。
-- 文件工具：生成的 settings 只对上述目录开放 `Edit` 和 `Write`；`Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch` 全部放开。
+- 文件工具：生成的 settings 只对上述目录开放 `Edit` 和 `Write`；`Read`、`Glob`、`Grep`、`WebFetch`、`WebSearch` 除凭据目录外全部放开。
 - shell：启用 Claude Code sandbox，文件写入只允许上述目录加临时目录。
+- **凭据目录**（2026-11-22，T0064 调整）：`$TICKETD_HOME/console/`（设备令牌；以后 ticketd 代持的网关令牌也放这里，见 §12）worker 读不到也写不了，授权目录再宽也不例外。Claude worker 的设置里同时写 `sandbox.filesystem.denyRead` / `denyWrite`（管 Bash 及其子进程）和 `permissions.deny` 的 `Read` / `Edit` / `Write` / `NotebookEdit(//<目录>/**)`（管内置文件工具，`Grep` / `Glob` 跟 `Read` 规则走）；`TICKETD_HOME` 经软链时字面路径和真实路径都写。每轮写设置前先建好这个目录（700、空目录不算入网），因为 Linux 的 bubblewrap 只能遮住已经存在的路径。worker 里的 `ticket doctor` / `ticket console` 不碰这个目录，只说明看不到。Codex 的 `workspace-write` 不限制读，所以**本机入网后不起 Codex worker**（报「无法启动 worker」，提示改用 Claude 或先退出控制台）；Codex 0.134 的权限配置（permission profile）有禁读项，等实测后再放开。为什么改：这条在 T0046 是已知限制，网关上线后拿设备令牌能领网关令牌、花额度，性质变了（T0047）。实测：`scripts/selftest.py --only secrets`。
 - worker 的 `ticket report` 写入工单目录下的 `.reports/` 待收件（环境变量 `TICKETD_SPOOL`），由 ticketd 按工单目录归属入库；worker 对数据库目录没有写权限。lark-cli 的 deny 规则只是防误发的护栏，不是安全边界。
 - 未预先允许的操作，在 `dontAsk` 模式下会被直接拒绝，不会挂起。worker 应报 `blocked`，并用 `--ask` 说明需要写哪个目录。
 - worker 禁用给用户发消息的命令：`lark-cli im +messages-send`、`lark-cli im +messages-reply`。对外沟通只走 `ticket report` 这一个渠道。读飞书文档等只读 lark-cli 操作允许。
@@ -450,7 +451,12 @@ cp <工作区>/CLAUDE.md.bak-<时间> <工作区>/CLAUDE.md
 
 **自动更新**：本机没配 `TICKETD_UPDATE_URL`、但已入网时，更新源是 `<控制台地址>/api/v1/updates`（静态文件布局和 §11 相同），经 `console._open` 带 `Authorization: Bearer <设备令牌>` 取清单和包；配了 `TICKETD_UPDATE_URL` 时以它为准。一次更新检查开始时就定下走哪条路，检查中途退出控制台，剩下的请求失败，不会改走普通连接去请求控制台。
 
-**已知限制**：worker 的沙箱只限制写、不限制读，被提示词注入的 worker 能读到 `~/.ticketd/console/device-token`（拿到的人能冒充这台设备上报、或把它标为退出，不能改发版公钥、不能让本机执行东西）。worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `enroll`（写不了 `~/.ticketd`，最后会失败）。后续可以在 worker 沙箱设置里禁止读取这个目录。启用条件（信任公钥、受管安装、验签工具）不变。
+**凭据不进 worker**（2026-11-22，T0064 调整，原「已知限制」）：原来 worker 的沙箱只限制写、不限制读，被提示词注入的 worker 能读到 `~/.ticketd/console/device-token`；网关上线后，拿到设备令牌就能领网关令牌、用这台设备主人的额度。现在 Claude worker 对 `~/.ticketd/console/` 禁读禁写，入网的机器上不起 Codex worker（§6「凭据目录」）。规矩：
+- 设备令牌、网关令牌只放在 `console_dir()` 下，不进环境变量、命令行、工单目录和任何输出。
+- 客户端接网关时（另开单），网关令牌由 ticketd 代持；worker 每单只拿一个短时效、只对这一单有效的子令牌（由 ticketd 向控制台换取或自己签发，失效时间不超过单轮时长上限），worker 侧的生图工具只认子令牌。
+- 沙箱外执行（`--run`）的脚本不受这条限制：用户批准前要看脚本有没有读控制台目录。
+
+worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `enroll`（写不了 `~/.ticketd`，最后会失败）。启用条件（信任公钥、受管安装、验签工具）不变。
 
 ## 13. bridge 内化与一行安装（2026-11-20，T0052）
 

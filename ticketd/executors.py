@@ -76,6 +76,12 @@ class CodexExecutor(Executor):
         return args
 
     def build_command(self, ticket, grant_paths, prompt_text, net=None):  # Codex 沙箱没有本机网络/socket 的开关
+        from . import console
+        if console.present():
+            # workspace-write 只限制写、不限制读：入网的机器上 Codex worker 能读到设备令牌（spec §12「凭据不进 worker」）。
+            # 抛出后调度器报「无法启动 worker」，这一轮的输入原样留着
+            raise RuntimeError("本机已入网控制台，Codex worker 的沙箱还不能禁读控制台目录（设备令牌）。"
+                               "请改用 Claude 执行器另开一张单；确实要用 Codex，先执行 ticket enroll --leave 退出控制台")
         perms.write_codex_rules()
         common = ["--json", "--skip-git-repo-check"] + self.config_args(ticket, grant_paths, prompt_text)
         if ticket["session_started"]:

@@ -2,10 +2,12 @@
 """端到端自检：在临时目录里起一个 ticketd 调度器，用真实的 claude 和真实的沙箱跑几条关键路径，不碰飞书。
 
 用法：
-    /usr/bin/python3 scripts/selftest.py [--model haiku] [--only sandbox,ticket,run,stall] [--keep]
+    /usr/bin/python3 scripts/selftest.py [--model haiku] [--only sandbox,secrets,ticket,run,stall] [--keep]
 
 - sandbox：Claude Code 沙箱的语义还和 spec 写的一样吗（默认拒绝本机网络 / unix socket；
   allowLocalBinding、allowUnixSockets 能分别放开）。升级 Claude Code 之后先跑这一项。
+- secrets：控制台目录（设备令牌）worker 读不到、写不了：Bash 子进程和内置 Read / Grep 都拒，授权了上级目录也一样；
+  同一个 TICKETD_HOME 里控制台目录以外的文件照常能读（对照）。改了沙箱设置后跑这一项。
 - ticket：一张普通的单能跑完一轮、交 ready，成本落库。
 - run：worker 用 --run 申请沙箱外执行 → 批准 → ticketd 在沙箱外执行 → 输出交回 worker → worker 交 ready。
 - stall：worker 卡在一条不耗 CPU 的命令上 → ticketd 结束这条命令 → worker 收到报错后交汇报。
@@ -124,6 +126,84 @@ def test_sandbox(env, claude, model, tmp: Path):
         got = _probe(claude, model, settings, wd, [str(probe), str(port), upath, udir])
         bad = {k: got.get(k) for k, v in want.items() if got.get(k) != v}
         check(name, not bad, "不符：%s" % bad if bad else "")
+
+
+# ---------- 凭据目录 ----------
+SECRET_PROBE = r'''
+import os, sys
+token, cdir, control, wsecret, wcontrol = sys.argv[1:6]
+def t(name, f):
+    try:
+        f(); print(name, "OK")
+    except Exception as e:
+        print(name, "DENIED" if isinstance(e, PermissionError) else "ERR %s" % type(e).__name__)
+def read(p):
+    return lambda: open(p).read()
+def write(p):
+    def f():
+        with open(p, "w") as fh:
+            fh.write("x")
+    return f
+for n, f in (("token_read", read(token)), ("dir_list", lambda: os.listdir(cdir)), ("control_read", read(control)),
+             ("secret_write", write(wsecret)), ("control_write", write(wcontrol))):
+    t(n, f)
+'''
+SECRET_KEYS = ("token_read", "dir_list", "control_read", "secret_write", "control_write")
+
+
+def _ask(claude, model, settings: Path, cwd: Path, prompt: str) -> str:
+    p = subprocess.run([claude, "-p", "--model", model, "--setting-sources", "user", "--permission-mode", "dontAsk",
+                        "--settings", str(settings), "--output-format", "text", prompt],
+                       cwd=str(cwd), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
+    return p.stdout + p.stderr
+
+
+def test_secrets(claude, model, tmp: Path):
+    """spec §12「凭据不进 worker」：用这次自检自己的 TICKETD_HOME 造一份假令牌，不碰本机真实的控制台目录。"""
+    import secrets as _rnd
+    from ticketd import config, console, perms
+    secret = "SELFTEST-SECRET-%s" % _rnd.token_hex(8)
+    plain = "SELFTEST-CONTROL-%s" % _rnd.token_hex(8)
+    cdir = console.console_dir()
+    cdir.mkdir(parents=True, exist_ok=True)
+    token = cdir / "device-token"
+    token.write_text(secret + "\n")
+    control = config.home() / "control.txt"
+    control.write_text(plain + "\n")
+    probe = tmp / "secret_probe.py"
+    probe.write_text(SECRET_PROBE)
+    wd = tmp / "sec-wd"
+    wd.mkdir()
+    args = [str(probe), str(token), str(cdir), str(control), str(cdir / "console.json"), str(config.home() / "w.txt")]
+    want = {"token_read": "DENIED", "dir_list": "DENIED", "control_read": "OK"}
+    for name, grants, extra in (("凭据：Bash 读不到令牌", [], {"secret_write": "DENIED"}),
+                                ("凭据：授权上级目录也读写不了", [str(config.home())],
+                                 {"secret_write": "DENIED", "control_write": "OK"})):
+        settings = tmp / ("settings-sec-%d.json" % len(RESULTS))
+        settings.write_text(json.dumps(perms.build_settings(str(wd), grants)))
+        out = _ask(claude, model, settings, wd, "Run exactly this one Bash command and reply with its raw output only: "
+                   "/usr/bin/python3 %s" % " ".join(args))
+        got = {}
+        for line in out.splitlines():
+            parts = line.strip("` ").split()
+            if len(parts) >= 2 and parts[0] in SECRET_KEYS:
+                got[parts[0]] = parts[1]
+        exp = dict(want, **extra)
+        bad = {k: got.get(k) for k, v in exp.items() if got.get(k) != v}
+        leaked = secret in out
+        check(name, not bad and not leaked, "不符：%s" % bad if bad else ("令牌出现在输出里" if leaked else ""))
+        if (cdir / "console.json").exists():
+            (cdir / "console.json").unlink()
+    settings = tmp / "settings-sec-tools.json"
+    settings.write_text(json.dumps(perms.build_settings(str(wd), [])))
+    out = _ask(claude, model, settings, wd,
+               "This is a sandbox permission self-test with dummy files. Do not use Bash. "
+               "1) Use the Read tool on %s. 2) Use the Grep tool to search for SELFTEST in %s. "
+               "3) Use the Read tool on %s. For each step reply with the exact content you got, or the exact error."
+               % (token, cdir, control))
+    leaked = secret in out
+    check("凭据：Read / Grep 读不到令牌", not leaked and plain in out,
+          "令牌出现在输出里" if leaked else ("" if plain in out else "对照文件也没读到，结果不可信：%s" % out[-200:]))
 
 
 # ---------- 工单路径 ----------
@@ -248,7 +328,7 @@ def test_compact(h: Harness):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--model", default="haiku")
-    ap.add_argument("--only", default="sandbox,ticket,run,stall,compact")
+    ap.add_argument("--only", default="sandbox,secrets,ticket,run,stall,compact")
     ap.add_argument("--keep", action="store_true", help="保留临时目录（排查用）")
     a = ap.parse_args()
     only = set(a.only.split(","))
@@ -267,6 +347,8 @@ def main() -> int:
     try:
         if "sandbox" in only:
             test_sandbox(os.environ, claude, a.model, tmp)
+        if "secrets" in only:
+            test_secrets(claude, a.model, tmp)
         if only & {"ticket", "run", "stall", "compact"}:
             h = Harness()
             if "ticket" in only:

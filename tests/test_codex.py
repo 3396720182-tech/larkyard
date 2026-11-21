@@ -100,6 +100,18 @@ class CodexCommandTest(TicketdTestCase):
         self.assertEqual(json.loads(di.split("=", 1)[1]), "提示\n第二行\"引号\"")
         self.assertNotIn("-m", cmd)
 
+    def test_refuses_on_enrolled_machine(self):
+        # Codex 的 workspace-write 不限制读：入网的机器上不起 Codex worker（spec §12「凭据不进 worker」）
+        from ticketd import console, executors
+        d = console.console_dir()
+        d.mkdir(parents=True)
+        (d / "device-token").write_text("x")
+        with self.assertRaises(RuntimeError) as cm:
+            executors.get("codex").build_command(self.ticket(), [], "p")
+        self.assertIn("ticket enroll --leave", str(cm.exception))
+        (d / "device-token").unlink()  # 空的控制台目录（每轮写设置时会建）不算入网
+        executors.get("codex").build_command(self.ticket(), [], "p")
+
     def test_git_writable_flag(self):
         from ticketd import perms
         repo, plain = self.tmp / "repo", self.tmp / "plain"
