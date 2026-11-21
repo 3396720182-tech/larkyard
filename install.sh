@@ -16,6 +16,9 @@
 #   --app-id <id>          用已有的飞书应用，不扫码新建
 #   --console <地址> --enroll <入网码>   装完接着入网（内部员工）
 #   --no-setup             只安装，不进向导（之后在终端里执行 ~/.ticketd/app/current/bin/ticket setup）
+#   --upgrade-existing     已经在跑的旧安装（早期私有版、从 clone 装的）：装好之后用 ticket migrate 转成受管安装 +
+#                          打包的 bridge（保留飞书应用、bridge 的 profile 和会话、工单数据库和工单目录）
+#   --dry-run              和 --upgrade-existing 一起用：核对完只列出要做的事，~/.ticketd 下不写任何东西
 #
 # 发版公钥指纹：和开源仓库里的 install.sh 是同一份，两边可以互相比对（这就是「发布渠道以外」的核对）。
 # 换钥（docs/spec.md §11「换钥」）之后两处一起改。
@@ -37,6 +40,7 @@ Larkyard 一行安装：curl -fsSL <发布地址>/install.sh | sh [-s -- 参数]
   --app-id <id>                 用已有的飞书应用，不扫码新建
   --console <地址> --enroll <入网码>   装完接着入网（内部员工）
   --no-setup                    只安装，不进向导
+  --upgrade-existing [--dry-run]  升级已经在跑的旧安装（--dry-run 只列出要做的事）
 USAGE
 }
 die() { say "install: $*"; exit 1; }
@@ -44,7 +48,7 @@ die() { say "install: $*"; exit 1; }
 case "$RELEASE_URL" in @*) RELEASE_URL="";; esac
 FROM="${LARKYARD_RELEASE_URL:-$RELEASE_URL}"
 CHANNEL=stable
-PROFILE=""; WORKSPACE=""; APP_ID=""; CONSOLE=""; ENROLL=""; SETUP=1
+PROFILE=""; WORKSPACE=""; APP_ID=""; CONSOLE=""; ENROLL=""; SETUP=1; UPGRADE=0; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) FROM="${2:?--from 要跟地址}"; shift 2;;
@@ -57,6 +61,8 @@ while [ $# -gt 0 ]; do
     --console) CONSOLE="${2:?}"; shift 2;;
     --enroll) ENROLL="${2:?}"; shift 2;;
     --no-setup) SETUP=0; shift;;
+    --upgrade-existing) UPGRADE=1; shift;;
+    --dry-run) DRY=1; shift;;
     -h|--help) usage; exit 0;;
     *) die "不认识的参数：$1";;
   esac
@@ -67,6 +73,11 @@ FROM="${FROM%/}"
 case "$FROM" in https://*) ;; file://*) say "install: ⚠️ 用的是本地发布目录 ${FROM}（测试用）";; *) die "发布地址只接受 https://";; esac
 case "$CHANNEL" in stable|early|canary) ;; *) die "通道只能是 stable / early / canary";; esac
 if [ -n "$ENROLL" ] && [ -z "$CONSOLE" ]; then die "--enroll 要和 --console <控制台地址> 一起用"; fi
+if [ "$DRY" = 1 ] && [ "$UPGRADE" = 0 ]; then die "--dry-run 只和 --upgrade-existing 一起用"; fi
+if [ "$UPGRADE" = 1 ] && [ -n "$ENROLL" ]; then die "--upgrade-existing 不和 --enroll 一起用（升级完再 ticket enroll）"; fi
+if [ "$UPGRADE" = 1 ] && [ "$DRY" = 0 ] && [ "${LARK_CHANNEL:-}" = 1 ]; then
+  die "升级会重启 ticketd 和 bridge：看起来是在 bridge 驱动的会话里执行（LARK_CHANNEL=1），会把这个会话自己打断。请在你自己的终端里执行（--dry-run 可以在哪儿都跑）"
+fi
 for fp in "$RELEASE_KEY_FP" "$BACKUP_KEY_FP"; do
   printf '%s' "$fp" | grep -Eq '^SHA256:[A-Za-z0-9+/]{43}$' || die "公钥指纹格式不对：$fp"
 done
@@ -145,13 +156,39 @@ PYEOF
 # ---------- 5. 交给包里的代码装成受管安装 ----------
 mkdir "$TMP/x"
 tar -xzf "$TMP/$PACKAGE" -C "$TMP/x" "larkyard-$VERSION/ticketd" || die "解包失败"
+TH="${TICKETD_HOME:-$HOME/.ticketd}"
+NOURL=""
+if [ "$UPGRADE" = 1 ]; then
+  # 先用包里的代码只读检查现有安装（不打开数据库、不写 ~/.ticketd）：有挡路的就停，什么都没装
+  say "install: 检查现有安装"
+  ( cd "$TMP/x/larkyard-$VERSION" && "$PY" -m ticketd.migrate --check --target "$VERSION" ${PROFILE:+--profile "$PROFILE"} ) \
+    || die "现有安装不能直接升级（原因见上）：~/.ticketd 下没有写任何东西"
+  if [ "$DRY" = 1 ]; then say "install: --dry-run：核对和检查都通过了，没有改任何东西"; exit 0; fi
+  (exec </dev/tty) 2>/dev/null || die "升级要在终端里确认（这里没有终端）"
+  printf '%s' "install: 照上面的计划升级吗？会重启 ticketd 和 bridge。输入 yes 继续：" >/dev/tty
+  read -r ANSWER </dev/tty || ANSWER=""
+  [ "$ANSWER" = yes ] || die "没有改任何东西"
+  INSTALLED_NOW=1
+  if [ -L "$TH/app/current" ]; then INSTALLED_NOW=0; fi
+  NOURL=--no-update-url
+fi
 say "install: 安装到 ${TICKETD_HOME:-$HOME/.ticketd}"
 ( cd "$TMP/x/larkyard-$VERSION" && "$PY" -m ticketd.bootstrap --package "$TMP/$PACKAGE" \
     --manifest "$TMP/manifest.json" --sig "$TMP/manifest.json.sig" \
     --main-key "$TMP/main.pub" --backup-key "$TMP/backup.pub" \
     --main-fp "$RELEASE_KEY_FP" --backup-fp "$BACKUP_KEY_FP" --from "$FROM" --channel "$CHANNEL" \
-    ${ENROLL:+--no-update-url} ) || die "安装失败"
+    ${ENROLL:+--no-update-url} ${NOURL} ) || die "安装失败"
 TICKET="${TICKETD_HOME:-$HOME/.ticketd}/app/current/bin/ticket"
+
+if [ "$UPGRADE" = 1 ]; then
+  # 更新源由 migrate 写（先备份，--undo 能撤）
+  set -- migrate --yes --update-url "$FROM" --channel "$CHANNEL"
+  if [ "$INSTALLED_NOW" = 1 ]; then set -- "$@" --installed-now; fi
+  if [ -n "$PROFILE" ]; then set -- "$@" --profile "$PROFILE"; fi
+  "$TICKET" "$@" </dev/tty || die "升级没有完成（原因见上）。退回：$TICKET migrate --undo"
+  say "install: 完成。自检：$TICKET doctor"
+  exit 0
+fi
 
 # ---------- 6. 向导 ----------
 if [ "$SETUP" = 0 ]; then

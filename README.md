@@ -136,6 +136,18 @@ curl -fsSL <发布地址>/install.sh | sh
 - 没有终端（CI、远程脚本）时只装不问，之后在终端里执行 `ticket setup`。
 - 配置文件改了不用重启：服务和 `ticket` 命令读取时会发现文件变化。
 
+### 已经在跑的旧安装（升级）
+
+早期版本（服务名、主用户、工单根目录写在代码里）或从 clone 装的 Larkyard，用升级模式一条命令转成受管安装 + 打包的 bridge，飞书应用、bridge 的 profile 和会话、工单数据库和工单目录都保留：
+
+```bash
+curl -fsSL <发布地址>/install.sh | sh -s -- --upgrade-existing --dry-run   # 只核对和检查，列出要做的事，什么都不改
+curl -fsSL <发布地址>/install.sh | sh -s -- --upgrade-existing             # 在你自己的终端里执行，输入 yes；会重启 ticketd 和 bridge
+~/.ticketd/app/current/bin/ticket migrate --undo                           # 按备份退回
+```
+
+升级模式（`ticket migrate`）按启动命令认出在跑的 ticketd 服务（不管服务名），用旧代码自己算出它实际在用的主用户和工单根目录，和新版本的默认值不同才写进 `config.env`；停旧服务、拷一份数据库快照、把服务统一成 `dev.larkyard.ticketd` 并经启动器运行、主会话约定里的 `ticket` 路径改到 `~/.ticketd/app/current/bin/ticket`，等新守护进程起来；任何一步失败自动退回。bridge 是分开安装的（Homebrew / npm）就接着做下面的 `ticket bridge adopt`。有正在运行的工单时不动手。已经装好受管安装的机器也可以直接 `ticket migrate --dry-run` / `ticket migrate`。旧代码目录和旧的 bridge 安装不删（退回要用）。
+
 ### 已经分开装过 bridge 的机器（迁移）
 
 以前按「先 `npm i -g lark-channel-bridge`、再 clone Larkyard」装的机器：先让 Larkyard 成为受管安装（服务还在直接跑克隆的，先 `ticket update adopt`）并更新到带 bridge 的版本（`ticket update status` 看版本），等没有正在运行的工单，然后**在你自己的终端里**（不要让主会话执行：它跑在 bridge 上，会把自己打断；这几条命令在 bridge 驱动的会话里会拒绝）：

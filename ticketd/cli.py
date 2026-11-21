@@ -109,6 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
     br.add_argument("--if-stale", action="store_true", help="restart：在用的已是当前版本带的 bridge 就不重启")
     br.add_argument("--dry-run", action="store_true", help="adopt：只列出要改的文件")
     br.add_argument("--undo", action="store_true", help="adopt：按备份原样退回")
+    mg = sub.add_parser("migrate", help="把已有的就地安装（早期版本、clone）转成受管安装 + 打包的 bridge：[--dry-run | --undo]")
+    from . import migrate
+    migrate.add_args(mg)
     return p
 
 
@@ -594,6 +597,18 @@ def main(argv=None) -> int:
             if run:
                 print("沙箱外执行的申请已登记（%s）。现在结束本轮：用户批准后 ticketd 会执行它，"
                       "退出码和输出会作为下一轮的输入交给你。" % run["path"])
+            return 0
+        if args.cmd == "migrate":
+            # 在打开数据库之前：--dry-run 不能改库，旧守护进程可能还在跑
+            from . import bridge, migrate, update
+            try:
+                out = migrate.run(args)
+            except (migrate.MigrateError, bridge.BridgeError, update.UpdateError) as e:
+                raise core.TicketError(str(e))
+            except (KeyboardInterrupt, EOFError):
+                raise core.TicketError("已取消")
+            if out:
+                print(out)
             return 0
         con = db.connect()
         out = COMMANDS[args.cmd](con, args)

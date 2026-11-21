@@ -245,6 +245,13 @@ class Wizard:
 
     def step_services(self, profile: str) -> bool:
         """返回 bridge 服务是否由 Larkyard 管理（分开安装的不动）。"""
+        from . import migrate
+        old = [s for s in migrate.find_ticketd_services() if "launcher.py" not in " ".join(s["program"])]
+        if old:
+            # 已有直接跑旧代码的 ticketd（可能是别的服务名）：照这里装会多出第二个服务抢数据库锁，也不会搬写死的配置
+            raise SetupError("这台已经有在跑的 ticketd（服务 %s 直接跑 %s）：用 ticket migrate --dry-run 看看、再 ticket migrate"
+                             "（或 install.sh --upgrade-existing）升级，不要用 setup 重装" % (
+                                 old[0]["label"], " ".join(old[0]["program"])))
         sf = bridge.bridge_service_file(profile)
         managed = True
         if sf.exists() and not bridge.is_managed_service(sf):

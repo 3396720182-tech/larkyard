@@ -136,6 +136,18 @@ One command and two interactions: **scan one QR code** with Lark/Feishu (creates
 - Without a terminal (CI, remote scripts) it installs but asks nothing; run `ticket setup` in a terminal later.
 - Config changes are picked up without a restart.
 
+### Upgrading an existing install
+
+An early build (service name, owner and ticket root written in the code) or a Larkyard clone can be turned into a managed install with the bundled bridge in one command, keeping the Feishu app, the bridge profile and sessions, the ticket database and the ticket directories:
+
+```bash
+curl -fsSL <release-url>/install.sh | sh -s -- --upgrade-existing --dry-run   # verify and check only; lists what would change
+curl -fsSL <release-url>/install.sh | sh -s -- --upgrade-existing             # in your own terminal, type yes; restarts ticketd and the bridge
+~/.ticketd/app/current/bin/ticket migrate --undo                              # undo from the backup
+```
+
+The upgrade (`ticket migrate`) finds the running ticketd service by its command (whatever its name), asks the old code which owner and ticket root it actually uses and writes them to `config.env` only where the new defaults differ; then it stops the old service, snapshots the database, reinstalls the service as `dev.larkyard.ticketd` through the launcher, points the `ticket` path in the workspace `CLAUDE.md` at `~/.ticketd/app/current/bin/ticket`, and waits for the new daemon; any failure is undone automatically. A separately installed bridge (Homebrew / npm) then goes through `ticket bridge adopt` below. It does nothing while a ticket is running. Machines that already have the managed install can run `ticket migrate --dry-run` / `ticket migrate` directly. The old code directory and the old bridge install are left in place (undo needs them).
+
 ### Machines with a separately installed bridge (migration)
 
 Machines set up the old way (`npm i -g lark-channel-bridge`, then a Larkyard clone): once Larkyard is a managed install (if the service still runs the clone, `ticket update adopt` first) on a version that bundles the bridge (`ticket update status`), and no ticket is running, run **in your own terminal** (not from the bridge session: it runs on the bridge and would cut itself off; these commands refuse to run inside a bridge-driven session):
