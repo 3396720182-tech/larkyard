@@ -23,8 +23,9 @@
 
 ```
 用户 ──飞书──▶ bridge 会话（主会话：只派单）
-▲                │  ticket new / send / stop / hold / release / grant / show / ls
-│                ▼
+▲   bridge 本身：会议纪要卡「派成工单」── ticket new ──┐
+│                │  ticket new / send / stop / hold / release / grant / approve / show / ls
+│                ▼◀──────────────────────────────────┘
 │         SQLite（~/.ticketd/db/ticketd.db） ◀──轮询（1s）── ticketd（launchd / systemd 托管）
 │                                                       ├─ worker：Claude Code（claude -p）或 Codex（codex exec），按单路由
 │                                                       │          每单一个会话 + 目录 + 沙箱，汇报写进 .reports/
@@ -44,6 +45,8 @@
 | worker | 读资料、做事、验证，用 `ticket report` 收尾 | 不直接给用户发飞书消息 |
 
 `ticket` CLI 和 `ticketd` 之间只通过 SQLite 通信：不开端口，不用 socket。SQLite 用 WAL 模式加 busy_timeout，以支持并发写入。
+
+上图只画派单和送达。v1 之后加的几块挂在同一个守护进程上，不改这条主路径：签名自动更新和启动器（§11）、控制台接入（§12，默认关闭）、打包的 bridge 和一行安装（§13）、升级旧安装（§14）、匿名统计（§7.4，默认关闭）。发版和更新的总图见 README「组成」。
 
 ## 3. 路径与部署
 
