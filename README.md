@@ -6,7 +6,7 @@
 
 [English](./README.en.md)
 
-> **Larkyard 基于 [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge) 开发。**
+> **Larkyard 基于 [lark-channel-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge) 开发。**
 > 飞书消息的收发、会话、`<bridge_context>`、bot 身份和 lark-cli 环境都来自 lark-channel-bridge（MIT 协议）。
 > Larkyard 的发版包里打包了它（取自我们的 [fork](https://github.com/3396720182-tech/lark-coding-agent-bridge)，固定在 `vendor/bridge.lock.json` 记录的提交上），和 Larkyard 一起签名、一起安装、一起更新；在它上面加的一层是派单服务、状态卡和一套工作区约定。详见 [NOTICE.md](./NOTICE.md)。
 
@@ -72,29 +72,59 @@ Codex worker 的几点细节：
 | 部分 | 位置 | 作用 |
 |---|---|---|
 | `ticketd` 派单服务 | `ticketd/`、`bin/ticketd`、`launchd/`、`systemd/` | launchd（macOS）或 systemd 用户服务（Linux）托管的守护进程：排队、并发上限、为每张单起一个 worker（默认 `claude -p`，可按单换成 `codex exec`）、超时、崩溃恢复、发件箱（失败重试、幂等，原消息撤回时改发到会话）、状态卡 |
-| `ticket` 命令 | `bin/ticket` | 主会话和 worker 操作工单的唯一入口：`new / send / lookup / stop / hold / release / grant / show / ls / report` |
+| `ticket` 命令 | `bin/ticket` | 主会话和 worker 操作工单的唯一入口：`new / send / lookup / stop / hold / release / restart / grant / approve / show / ls / report`；你自己在终端用的还有 `doctor / stats / setup / update / bridge / migrate / enroll / console / telemetry` |
 | worker 约定 | `prompts/worker.md`、`prompts/worker.codex.md` | worker 的系统提示：只认用户原话、只写授权目录、按阶段自报进度、用 5 种状态之一收尾；Codex worker 额外追加 `worker.codex.md` |
 | 执行器 | `ticketd/executors.py` | 把「用哪个 agent CLI 跑一轮」从调度器里拆出来：Claude Code 和 Codex 各一个实现，Codex 的事件翻译成同一种格式，状态卡、卡死检测、重试两边共用 |
 | 工作区约定 | `workspace/CLAUDE.md.tmpl` | 放进 bridge 工作目录的 `CLAUDE.md`：注意力原则、派单规则、追问与控制命令、诚实交付 |
 | 个人覆盖 | `workspace/CLAUDE.local.example.md`、`config.example.env` | 只属于你自己的偏好和配置，不进仓库 |
 | 打包的 bridge | `vendor/bridge.lock.json`、`vendor/runtime.json`、`scripts/build_bridge.py`、`ticketd/bridge.py` | 发版包里带的 lark-channel-bridge（fork 的固定提交），以及 Node、lark-cli 的版本和 SHA-256；安装到 `~/.ticketd`，服务定义由 Larkyard 写，不依赖 nvm / npm |
 | 一行安装 | `install.sh`、`ticketd/bootstrap.py`、`ticketd/setup.py` | 核对发版公钥和签名 → 装成受管安装 → 装运行时 → `ticket setup` 向导（扫码建应用、工作区、服务、认主人） |
-| 设计规格 | `docs/spec.md` | 数据模型、权限与沙箱、状态卡、发件箱等设计和每次调整的原因 |
+| 签名自动更新 | `ticketd/update.py`、`ticketd/updsig.py`、`ticketd/launcher.py`、`scripts/release.py` | 发布者本机签名发版；守护进程验签、空闲时安装；版本目录外的启动器管试用期，新版本自检不过自动切回（默认关闭，一行安装的已启用） |
+| 升级旧安装 | `ticketd/migrate.py`、`scripts/upgrade-offline.sh` | 把早期版本或 clone 装的 Larkyard 一条命令转成受管安装 + 打包的 bridge；发布地址打不开时用离线升级包 |
+| 可选的对外连接 | `ticketd/console.py`、`ticketd/telemetry.py`、`server/telemetry/` | 控制台接入（入网后每 5 分钟上报设备状态，服务端不在本仓库）和匿名使用统计（后端是 Cloudflare Worker）；两者默认都关、彼此独立 |
+| 运营指标 | `ticketd/metrics.py` | 每轮成本、关键事件、`ticket stats`、每周概况私信、`ticket doctor` 自检 |
+| 设计规格 | `docs/spec.md`、`openspec/changes/` | 数据模型、权限与沙箱、状态卡、发件箱等设计和每次调整的原因；大一点的变更先在 `openspec/changes/<名字>/` 写提案、规格和任务，审过再写代码 |
+
+**派单和送达**（一张工单从你的一句话到结果卡）：
 
 ```
-你 ──飞书──▶ lark-channel-bridge ──▶ 主会话（Claude Code，读工作区 CLAUDE.md）
-▲                                       │ ticket new / send / stop / hold / release / grant
-│                                       ▼
-│                            SQLite（~/.ticketd/db） ◀──轮询── ticketd（launchd / systemd）
-│                                                              ├─ worker：Claude Code（claude -p）或 Codex（codex exec），
-│                                                              │          按单路由，每单一个会话 + 目录 + 沙箱
-│                                                              ├─ 状态卡：原地刷新，结果覆盖
-│                                                              └─ 发件箱：处理产物，再用 lark-cli 发回飞书
-│                                                                 ├─ 图片放进卡里；视频以你的身份传云空间（同一视频只传一次）；稿子导入云文档
-│                                                                 ├─ 断网时退避重试，等网络恢复；连续失败 10 分钟以上才降级
-│                                                                 ├─ 回复原消息；原消息已撤回则改发到会话
-└──◀── 结果卡 / 提醒 ─────────────────────────────────────────────┘
+你 ──飞书──▶ lark-channel-bridge（随包发布）──▶ 主会话（Claude Code，读工作区 CLAUDE.md）
+▲              │ 会议纪要卡上的「派成工单」          │ ticket new / send / stop / hold / release / grant / approve
+│              └──────────────────────┬─────────────┘
+│                                     ▼
+│                      SQLite（~/.ticketd/db） ◀──轮询── ticketd（launchd / systemd，受管安装时经启动器运行）
+│                                                        ├─ worker：Claude Code（claude -p）或 Codex（codex exec），
+│                                                        │          按单路由，每单一个会话 + 目录 + 沙箱
+│                                                        │          沙箱里做不了的步骤 → 写成脚本，你回复「执行」后在沙箱外跑
+│                                                        ├─ 状态卡：原地刷新，结果覆盖
+│                                                        └─ 发件箱 + 媒体通道：处理产物，再用 lark-cli 发回飞书
+│                                                           ├─ 图片放进卡里；视频以你的身份传云空间（同一视频只传一次）；稿子导入云文档
+│                                                           ├─ 断网时退避重试，等网络恢复；连续失败 10 分钟以上才降级
+│                                                           └─ 回复原消息；原消息已撤回则改发到会话
+└──◀── 结果卡 / 提醒 ───────────────────────────────────────┘
 ```
+
+**发版和更新**（代码怎么到你的电脑上、坏了怎么退回）：
+
+```
+发布者的电脑（私钥只在这里）
+  git tag ─▶ scripts/build_bridge.py（按 vendor/bridge.lock.json 构建 bridge）
+          ─▶ scripts/release.py release（打包，主私钥签 canary / early / stable 三份清单）
+          ─▶ release.py publish / publish-installer
+                      │
+                      ▼
+  更新源（静态文件：install.sh、keys/、channels/<通道>/manifest.json(.sig)、packages/）
+          ├─ 离线升级包：release.py bundle → larkyard-<版本>-upgrade.zip
+          │
+          ├─▶ 新机器：curl …/install.sh | sh
+          │     按内置指纹核对公钥 → 验签 → 装到 ~/.ticketd/app/versions/<版本> → ticket setup
+          │
+          └─▶ 已装的机器：ticketd 每小时检查一次
+                验签、核对 SHA-256 → 空闲时切换 current → 启动器试用期（默认 10 分钟）→ 自检不过自动切回
+                bridge 不随之重启：新版本带的 bridge 在每天 04:07 的窗口换上，90 秒连不上飞书就切回
+```
+
+本机的 `~/.ticketd` 里：`app/versions/<版本>/`（每个版本一个目录）、`app/current`（指向在用的版本）、`app/launcher.py`（启动器，不在版本目录里）、`bridge/current`、`runtime/node`、`bin/lark-cli`、`db/`、`logs/`、`config.env`。
 
 ## 工作区约定的核心
 

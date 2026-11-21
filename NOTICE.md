@@ -2,7 +2,7 @@
 
 ## 基于 lark-channel-bridge 开发 / Built on lark-channel-bridge
 
-Larkyard 是架在 [lark-channel-bridge](https://github.com/zarazhangrui/feishu-claude-code-bridge)（npm 包 `lark-channel-bridge`）之上的一层。
+Larkyard 是架在 [lark-channel-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge)（npm 包 `lark-channel-bridge`）之上的一层。
 
 | 来自 lark-channel-bridge | Larkyard 自己的 |
 |---|---|
