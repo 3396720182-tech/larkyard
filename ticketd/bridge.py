@@ -28,6 +28,7 @@ RUNTIME_TIMEOUT = 900.0
 HEALTH_WAIT = 90.0
 RESTART_LABEL = "dev.larkyard.bridge-restart"
 MANAGED_MARK = "LARKYARD_MANAGED"          # Larkyard 写的 bridge 服务带这个环境变量，用来和用户自己装的区分
+TICKET_BIN_ENV = "LARKYARD_TICKET_BIN"         # bridge 派单用的 ticket 命令（会议待办 → 工单）
 BRIDGE_ENTRY = Path("bin") / "lark-channel-bridge.mjs"
 PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64")
 ONLINE_EVENTS = (("ws", "connected"), ("supervisor", "profile-online"))
@@ -464,8 +465,11 @@ def render_bridge_service(profile: str, path: str, home: Optional[Path] = None,
     home = Path(home or lc_home())
     out, err = daemon_logs(profile, home)
     out, err = stdout or out, stderr or err
+    from . import update
     args = [str(node_bin()), str(bridge_entry()), "run", "--profile", profile]
-    env = {"PATH": path, "LARK_CHANNEL_HOME": str(home), "HOME": str(Path.home()), MANAGED_MARK: "1"}
+    env = {"PATH": path, "LARK_CHANNEL_HOME": str(home), "HOME": str(Path.home()), MANAGED_MARK: "1",
+           # 会议纪要卡片的「派成工单」按钮由 bridge 调 ticket new；跟着版本走的 current，不是某个版本目录
+           TICKET_BIN_ENV: str(update.app_dir() / "current" / "bin" / "ticket")}
     if host.system() == "darwin":
         return plistlib.dumps({
             "Label": bridge_label(profile), "ProgramArguments": args, "RunAtLoad": True, "KeepAlive": True,

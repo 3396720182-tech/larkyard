@@ -485,6 +485,8 @@ cp <工作区>/CLAUDE.md.bak-<时间> <工作区>/CLAUDE.md
 - `publish-installer` 只发提交里的 `install.sh`（工作树要干净），发布地址不能含 `$ \` " \\` 和空白。`bridge.lock.json` 不是合法 JSON 时报错，不当成没有锁文件。
 - 留着的：会议里没授权的人的字幕和弹幕仍会进入授权用户那次 run 的上下文（会议智能体本来就要读会议内容）；`ticket doctor` 的 bridge 一项只看文件和上次重启结果，不实时确认在线；Linux 上 unit 目录用当前 shell 的 `XDG_CONFIG_HOME`（和 `scripts/install.sh` 问 systemd 的做法不同，两者不一致时要手动对齐）。
 
+**调整（2026-11-21，T0054）**：bridge 服务环境里多一个 `LARKYARD_TICKET_BIN=~/.ticketd/app/current/bin/ticket`（跟着版本走的 `current`，和每天的重启任务用的是同一个路径）。fork 上的会议纪要卡片有「派成工单」按钮（`/meeting todo <存档号>#<序号>`，只有管理员能点），bridge 用它执行 `ticket new`；没有这个变量时 bridge 退回 PATH 上的 `ticket`，而服务的 PATH 里没有它。已装好的机器重新执行一次 `ticket setup`（服务定义变了才重新加载 bridge）或 `ticket bridge adopt` 之后生效。
+
 **没实测的**（单测和临时 HOME 全流程只用了替身）：真实租户上的扫码建应用、bot 身份查应用所有者、真实 launchd 下的 bridge 重启和在线确认、Linux 上的整套服务。
 
 ## 14. 升级已有安装（2026-11-21，T0056）

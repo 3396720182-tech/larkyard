@@ -211,6 +211,8 @@ class ServiceRenderDarwinTest(BridgeTestBase):
         self.assertEqual(doc["ProgramArguments"], [str(bridge.node_bin()), str(bridge.bridge_entry()),
                                                    "run", "--profile", "claude"])
         self.assertEqual(doc["EnvironmentVariables"]["LARKYARD_MANAGED"], "1")
+        self.assertEqual(doc["EnvironmentVariables"]["LARKYARD_TICKET_BIN"],
+                         str(update.app_dir() / "current" / "bin" / "ticket"))
         self.assertTrue(doc["EnvironmentVariables"]["PATH"].startswith(str(bridge.node_link() / "bin")))
         self.assertIn("/opt/claude/bin", doc["EnvironmentVariables"]["PATH"])
         self.assertTrue(doc["StandardErrorPath"].endswith("profiles/claude/logs/daemon/daemon-stderr.log"))
@@ -240,6 +242,7 @@ class ServiceRenderLinuxTest(BridgeTestBase):
         data = bridge.render_bridge_service("claude", bridge.service_path()).decode()
         self.assertIn('ExecStart="%s" "%s" "run" "--profile" "claude"' % (bridge.node_bin(), bridge.bridge_entry()), data)
         self.assertIn('Environment="LARKYARD_MANAGED=1"', data)
+        self.assertIn('Environment="LARKYARD_TICKET_BIN=%s"' % (update.app_dir() / "current" / "bin" / "ticket"), data)
         self.assertIn("/usr/local/bin", data)
         p = bridge.bridge_service_file("claude")
         self.assertEqual(p.name, "lark-channel-bridge.bot.claude.service")
