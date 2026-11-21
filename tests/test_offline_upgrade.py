@@ -208,12 +208,21 @@ class AnyPathTest(OfflineBase):
         (repo / "ticketd/config.py").write_text(OLD_CONFIG, encoding="utf-8")
         self.th.mkdir()
         (self.th / "config.env").write_text("TICKETD_OWNER=ou_test_owner\n", encoding="utf-8")
-        saved = os.environ.get("HOME")
-        os.environ["HOME"] = str(self.user)
+        # 服务文件的位置要和下面子进程看到的一样：Linux 上 service_file 先看 XDG_CONFIG_HOME，
+        # 而 GitHub 的 ubuntu 机器在环境里设了 XDG_CONFIG_HOME=/home/runner/.config（只改 HOME 会写到临时 HOME 外面）
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "runner config")  # 照 CI 的样子：外面先设了一个（tearDown 还原）
+        xdg = str(self.user / ".config")
+        saved = {k: os.environ.get(k) for k in ("HOME", "XDG_CONFIG_HOME")}
+        os.environ.update({"HOME": str(self.user), "XDG_CONFIG_HOME": xdg})
         try:
             sf = update.service_file(update.DEFAULT_LABEL)
         finally:
-            os.environ["HOME"] = saved
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.assertTrue(str(sf).startswith(str(self.user) + os.sep), sf)  # 不写到临时 HOME 外面
         sf.parent.mkdir(parents=True, exist_ok=True)
         if sys.platform == "darwin":
             sf.write_bytes(plistlib.dumps({"Label": update.DEFAULT_LABEL, "ProgramArguments": [str(repo / "bin/ticketd")],
@@ -225,7 +234,7 @@ class AnyPathTest(OfflineBase):
             return sorted(str(p) for p in self.user.rglob("*") if "Library/Caches" not in str(p))
         before = files()
         d = self.unzip_to(self.tmp / ODD[1])
-        p = self.run_sh(d / "upgrade.sh", "--dry-run", XDG_CONFIG_HOME=str(self.user / ".config"))
+        p = self.run_sh(d / "upgrade.sh", "--dry-run", XDG_CONFIG_HOME=xdg)
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         self.assertIn("在直接跑 %s" % repo, out)
