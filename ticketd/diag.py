@@ -9,16 +9,18 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import secrets
 import socket
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, config, console, core, metrics
+from . import __version__, config, console, core, metrics, safefs
 
 CONTENT_LIMIT = 48 * 1024        # 诊断包全文上限（UTF-8 字节；控制台和 Nginx 都限请求体 64KB）
 BODY_LIMIT = 60 * 1024           # 整个请求体上限
@@ -26,15 +28,25 @@ NOTE_LIMIT = 500
 KEEP_FILES = 20
 PROBLEM_DAYS = 7
 PROBLEM_ROWS = 50
-NAME_RE = re.compile(r"^diag-[0-9]{8}-[0-9]{6}(-T[0-9]{1,8})?\.md$")
+NAME_RE = re.compile(r"^diag-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}(-T[0-9]{1,8})?\.md$")
+SHA_KEY = "diag.sha256:"         # kv：生成时记下的内容摘要（worker 碰不到数据库）；发送时不一致就拒发
 TICKET_RE = re.compile(r"^T[0-9]{1,8}$")
 PATH = "/api/v1/diagnostics"
 REDACTED = "‹已打码›"
 
-# 常见密钥形态（打码后替换为 ‹已打码›）。宁可多打：诊断包是给人看的，不是给机器解析的
+# 常见密钥形态（打码后替换为 ‹已打码›）。尽力而为：主要防线是本人发送前看过全文。规则按顺序执行，可以重复执行
+_KEYS = (r"api[_-]?key|access[_-]?key|secret[_-]?key|app[_-]?secret|client[_-]?secret|secret|password|passwd|"
+         r"passphrase|token|access[_-]?token|refresh[_-]?token|authorization|口令|密码|密钥")
 _SECRET_PATTERNS = [
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S), REDACTED),
-    (re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 " + REDACTED),
+    # Cookie / Set-Cookie：整行（可能有好几个键）
+    (re.compile(r"(?i)\b((?:set-)?cookie\s*[:=：]\s*)[^\n]+"), r"\1" + REDACTED),
+    # 环境变量式的敏感键名（ANTHROPIC_AUTH_TOKEN=…、DB_PASSWORD=…）：不论值多短都打
+    (re.compile(r"\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|"
+                r"CREDENTIALS?)[A-Z0-9_]*\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;]+)"), r"\1" + REDACTED),
+    (re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 " + REDACTED),
+    # token / basic 后面的串要带数字才算（「token verification」这种普通单词不打）
+    (re.compile(r"(?i)\b(token|basic)\s+(?=[A-Za-z0-9._~+/=-]*[0-9])[A-Za-z0-9._~+/=-]{12,}"), r"\1 " + REDACTED),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{12,}"), REDACTED),
     (re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"), REDACTED),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), REDACTED),
@@ -42,11 +54,16 @@ _SECRET_PATTERNS = [
     (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"), REDACTED),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), REDACTED),
     (re.compile(r"\bly[a-z]?_[A-Za-z0-9_-]{16,}"), REDACTED),                              # 设备 / 网关令牌这类
-    (re.compile(r"\b[tu]-[A-Za-z0-9._-]{30,}"), REDACTED),                                 # 飞书 tenant / user token
+    # 飞书 tenant / user token：t- / u- 后面一段字母数字混合的长串（t-shirt-blue.png 这种文件名不算）
+    (re.compile(r"\b[tu]-(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9._]{24,}"), REDACTED),
     (re.compile(r"(://)[^/\s:@]+:[^/\s@]+@"), r"\1" + REDACTED + "@"),                     # 地址里的用户名口令
-    (re.compile(r"(?i)((?:api[_-]?key|access[_-]?key|secret[_-]?key|app[_-]?secret|client[_-]?secret|secret|"
-                r"password|passwd|pwd|passphrase|token|access[_-]?token|refresh[_-]?token|auth|authorization|"
-                r"cookie|口令|密码|密钥)[\"']?\s*[:=：]\s*[\"']?)([^\s\"',;]{4,})"), r"\1" + REDACTED),
+    # 键 = "整段带空格的值"
+    (re.compile(r"(?i)((?:%s)[\"']?\s*[:=：]\s*)(\"[^\"\n]*\"|'[^'\n]*')" % _KEYS), r"\1" + REDACTED),
+    # 键: 值 / 键=值（x-lark-secret: …、"password": "…" 也在这里）
+    (re.compile(r"(?i)((?:%s)[\"']?\s*[:=：]\s*[\"']?)([^\s\"',;]{4,})" % _KEYS), r"\1" + REDACTED),
+    # 键 空格 值（.netrc 的 password hunter22）：值里要有字母以外的字符，「password reset」不算
+    (re.compile(r"(?i)\b(password|passwd|passphrase)\s+(?=[^\s\"',;]*[^A-Za-z\s\"',;])[^\s\"',;]{4,}"),
+     r"\1 " + REDACTED),
     (re.compile(r"\b[0-9a-fA-F]{32,}\b"), REDACTED),                                       # 长十六进制串（多半是密钥或摘要）
 ]
 # 长的随机串（base64 之类）：40 个字符以上、同时有大写、小写和数字。不含 / 和 .，路径和域名不会被误打
@@ -81,13 +98,17 @@ def _cut(text: str, limit: int) -> str:
 
 
 def _tail_file(path: Path, max_bytes: int) -> str:
-    """文件末尾最多 max_bytes 字节（从下一个整行开始）。读不了返回说明。"""
+    """文件末尾最多 max_bytes 字节（从下一个整行开始）。工单目录对 worker 可写：和 cli._log_tail 一样经 safefs 打开
+    （不跟随符号链接、不在 FIFO 上阻塞、只认普通文件、拒绝硬链接）。读不了返回说明。"""
     try:
-        with open(str(path), "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - max_bytes))
-            raw = f.read(max_bytes)
+        fd = safefs.open_read(path)
+        if fd is None:
+            return "（没有这个文件）"
+        try:
+            size = os.fstat(fd).st_size
+            raw = safefs.read_at(fd, max(0, size - max_bytes), max_bytes)
+        finally:
+            os.close(fd)
     except OSError as e:
         return "（读不了：%s）" % e.__class__.__name__
     text = raw.decode("utf-8", "replace")
@@ -199,13 +220,33 @@ def build(con, ticket: Optional[str] = None) -> str:
     return _cut(fixed, CONTENT_LIMIT)
 
 
-def _prune(d: Path) -> None:
+def _prune(con, d: Path) -> None:
     files = sorted(p for p in d.iterdir() if NAME_RE.match(p.name))
     for p in files[:-KEEP_FILES]:
         try:
             p.unlink()
         except OSError:
             pass
+    keep = {p.name for p in d.iterdir() if NAME_RE.match(p.name)}
+    for r in con.execute("SELECT key FROM kv WHERE key LIKE ?", (SHA_KEY + "%",)).fetchall():
+        if r[0][len(SHA_KEY):] not in keep:
+            con.execute("DELETE FROM kv WHERE key=?", (r[0],))
+
+
+def _create_private(path: Path, data: bytes) -> None:
+    """新建（O_EXCL，同名已存在就失败、不覆盖），600。"""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    os.close(fd)
 
 
 def create(con, ticket: Optional[str] = None, now: Optional[float] = None) -> Path:
@@ -220,15 +261,24 @@ def create(con, ticket: Optional[str] = None, now: Optional[float] = None) -> Pa
     d = diag_dir()
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(str(d), 0o700)
-    name = "diag-%s%s.md" % (time.strftime("%Y%m%d-%H%M%S", time.localtime(now)), "-" + ticket if ticket else "")
-    path = d / name
-    console._write_private(path, text.encode("utf-8"))
-    _prune(d)
+    data = text.encode("utf-8")
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+    for _ in range(5):
+        path = d / ("diag-%s-%s%s.md" % (stamp, secrets.token_hex(3), "-" + ticket if ticket else ""))
+        try:
+            _create_private(path, data)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise ValueError("生成诊断包失败：文件名一直冲突，请重试")
+    metrics.kv_set(con, SHA_KEY + path.name, hashlib.sha256(data).hexdigest())
+    _prune(con, d)
     return path
 
 
 def _resolve(file: str) -> Path:
-    """只接受 diag_dir() 里、按生成规则命名的普通文件（主会话不能借这个命令把任意文件发出去）。"""
+    """只接受 diag_dir() 里、按生成规则命名的文件（主会话不能借这个命令把任意文件发出去）。"""
     d = diag_dir().resolve()
     raw = Path(file).expanduser()
     p = raw if raw.is_absolute() else d / raw.name if raw.parent == Path(".") else raw
@@ -236,9 +286,33 @@ def _resolve(file: str) -> Path:
         rp = p.resolve(strict=True)
     except (OSError, RuntimeError):
         raise ValueError("没有这个诊断包：%s（先执行 ticket diag 生成）" % file)
-    if rp.parent != d or not NAME_RE.match(rp.name) or not rp.is_file() or p.is_symlink():
+    if rp.parent != d or not NAME_RE.match(rp.name) or p.is_symlink():
         raise ValueError("只能发送 ticket diag 生成在 %s 里的诊断包" % d)
     return rp
+
+
+def _read_generated(con, path: Path) -> bytes:
+    """读诊断包：不跟随符号链接、只认普通文件、拒绝硬链接；内容必须和生成时记下的摘要一致
+    （看过之后被改写、复制件、别的文件改成这个名字，都拒发）。"""
+    want = metrics.kv_get(con, SHA_KEY + path.name)
+    if not want:
+        raise ValueError("这个诊断包不是本机 ticket diag 生成的（或已过期被清理）：请重新执行 ticket diag 生成")
+    try:
+        fd = safefs.open_read(path)
+        if fd is None:
+            raise ValueError("没有这个诊断包：%s" % path)
+        try:
+            size = os.fstat(fd).st_size
+            if size > CONTENT_LIMIT:
+                raise ValueError("诊断包超过 48KB（被改过），请重新执行 ticket diag 生成")
+            raw = safefs.read_at(fd, 0, CONTENT_LIMIT + 1)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        raise ValueError("读不了诊断包（%s）：只能发送 ticket diag 生成的原文件" % e)
+    if hashlib.sha256(raw).hexdigest() != want:
+        raise ValueError("诊断包生成之后被改过，和给你看的不一样了：请重新执行 ticket diag 生成、看过后再发")
+    return raw
 
 
 def send(con, file: str, note: str = "") -> str:
@@ -247,16 +321,13 @@ def send(con, file: str, note: str = "") -> str:
     path = _resolve(file)
     if not console.enrolled():
         raise ValueError("本机没有入网，诊断包发不了：可以把 %s 直接发给管理员" % path)
-    try:
-        raw = path.read_bytes()
-    except OSError as e:
-        raise ValueError("读不了诊断包：%s" % e)
+    raw = _read_generated(con, path)
     text = redact(raw.decode("utf-8", "replace"))
     if len(text.encode("utf-8")) > CONTENT_LIMIT:
-        raise ValueError("诊断包超过 48KB（可能被改过），请重新执行 ticket diag 生成")
+        raise ValueError("诊断包超过 48KB（被改过），请重新执行 ticket diag 生成")
     note = "".join(ch for ch in (note or "") if ch.isprintable()).strip()
     note = redact(note)[:NOTE_LIMIT]
-    m = re.search(r"-(T[0-9]{1,8})\.md$", path.name)
+    m = re.search(r"-(T[0-9]{1,8})\.md$", path.name)  # 文件名里的工单号（生成时写的）
     body = {"ticket": m.group(1) if m else None, "note": note, "content": text}
     if len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > BODY_LIMIT:
         raise ValueError("诊断包转成请求后超过 60KB，请重新执行 ticket diag 生成")

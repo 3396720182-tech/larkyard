@@ -36,12 +36,14 @@ def _existing_on_linux(paths: List[str], keep: int) -> List[str]:
 
 def secret_dirs() -> List[str]:
     """worker 读不到也写不了的目录（spec §12「凭据不进 worker」）：控制台目录里放设备令牌，以后 ticketd 代持的
-    网关令牌也放这里。路径和 console.console_dir() 一致；解析后的真实路径和字面路径不同时两个都写。"""
-    d = config.home() / "console"
-    out = [str(d.absolute())]
-    real = str(d.resolve())
-    if real not in out:
-        out.append(real)
+    网关令牌也放这里；诊断包目录（diag.diag_dir()）里是各张单的原话和日志，worker 不能读、也不能换掉要发的文件。
+    解析后的真实路径和字面路径不同时两个都写。"""
+    out = []
+    for name in ("console", "diag"):
+        d = config.home() / name
+        for p in (str(d.absolute()), str(d.resolve())):
+            if p not in out:
+                out.append(p)
     return out
 
 
@@ -60,7 +62,7 @@ def ensure_secret_dirs() -> None:
     """先把控制台目录建好（700、空目录，不算入网）：Linux 的 bubblewrap 只能遮住已经存在的路径，
     这一轮中途才入网时，令牌也落在已被遮住的目录里。下发技能的目录同理（空目录 = 没装技能）。
     建不了就算了，macOS 的规则不依赖目录存在。"""
-    for name, mode in (("console", 0o700), ("skills", 0o755)):
+    for name, mode in (("console", 0o700), ("diag", 0o700), ("skills", 0o755)):
         try:
             (config.home() / name).mkdir(parents=True, exist_ok=True, mode=mode)
         except OSError:
