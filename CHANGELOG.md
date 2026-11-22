@@ -1,6 +1,6 @@
 # Changelog
 
-## 未发布
+## 0.3.4 — 2026-11-22
 
 - 安全：worker 读不到、写不了 ticketd 的控制台目录 `~/.ticketd/console/`（设备令牌，以后的网关令牌也放这里）。之前 worker 的沙箱只限制写，被提示词注入的 worker 能读走设备令牌、拿去领网关令牌花额度。Claude worker 的设置里同时加了沙箱禁读禁写和文件工具的 deny 规则，授权目录再宽也不放开；本机入网后不再起 Codex worker（它的沙箱还禁不了读），提示改用 Claude 或先 `ticket enroll --leave`。worker 里的 `ticket doctor` / `ticket console` 改为说明「看不到」。`scripts/selftest.py` 新增 `secrets` 一项实测。规格见 `docs/spec.md` §6「凭据目录」、§12「凭据不进 worker」。
 
