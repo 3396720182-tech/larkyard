@@ -31,10 +31,10 @@ from typing import Optional
 from . import __version__, config, db, host, metrics, skills, updsig
 
 # ---------- 采集清单 ----------
-CONSENT_VERSION = "c1"
-# 逐字和 openspec/changes/add-console-enrollment/design.md D4 一致：UTF-8、\n 换行、每行（含最后一行）以 \n 结尾。
-# 打印的就是参与哈希的这段文本；改一个字都要升版本号（控制台先登记新版本）。
-CONSENT_TEXT = (
+# 逐字和 openspec 的 design 一致：UTF-8、\n 换行、每行（含最后一行）以 \n 结尾。打印的就是参与哈希的这段文本；
+# 改一个字都要升版本号（控制台先登记新版本）。旧版本保留：已入网设备本机记的版本决定上报哪些字段。
+# c1：add-console-enrollment design D4（0 级：设备状态）。
+CONSENT_C1 = (
     "控制台会收集（0 级：设备状态）\n"
     "入网时一次：主机名；系统名称、版本和架构；Larkyard 版本；本机 bot 的 open_id（TICKETD_OWNER）；你同意的这份清单的版本。\n"
     "每 5 分钟一次：Larkyard 版本；系统名称、版本和架构；ticket doctor 的结论（是否通过、不通过的检查项名称）；"
@@ -42,10 +42,25 @@ CONSENT_TEXT = (
     "不会收集：工单标题、原话、追问、产物、文件、过程日志、成本。\n"
     "谁能看：只有控制台管理员。随时查看下一次上报的内容：ticket console show。退出：ticket enroll --leave。\n"
 )
+# c2：add-console-problem-reports design D1（多了出错记录；诊断包只在本人确认后发送）。
+CONSENT_C2 = (
+    "控制台会收集（0 级：设备状态；1 级里只收出错记录）\n"
+    "入网时一次：主机名；系统名称、版本和架构；Larkyard 版本；本机 bot 的 open_id（TICKETD_OWNER）；你同意的这份清单的版本。\n"
+    "每 5 分钟一次：Larkyard 版本；系统名称、版本和架构；ticket doctor 的结论（是否通过、不通过的检查项名称）；"
+    "运行中和排队中的工单数量；自动更新是否启用、更新通道、最近一次更新结果和时间、本机暂停更新的到期时间；"
+    "上次上报以来的出错记录（时间、工单号、出错的环节、错误归类码，都是代码里写死的代号，不含任何文字）。\n"
+    "不会收集：工单标题、原话、追问、产物、文件、过程日志、成本、报错原文。\n"
+    "诊断包：只有你本人确认发送时才发，发之前先给你看完整内容。\n"
+    "谁能看：只有控制台管理员。随时查看下一次上报的内容：ticket console show。退出：ticket enroll --leave。\n"
+)
+CONSENTS = {"c1": CONSENT_C1, "c2": CONSENT_C2}
+CONSENT_VERSION = "c2"                       # 新入网用的版本
+CONSENT_TEXT = CONSENTS[CONSENT_VERSION]
+PROBLEMS_FROM = "c2"                         # 本机记的清单是这个版本时，心跳才带出错记录
 
 
-def consent_sha256() -> str:
-    return hashlib.sha256(CONSENT_TEXT.encode("utf-8")).hexdigest()
+def consent_sha256(version: str = CONSENT_VERSION) -> str:
+    return hashlib.sha256(CONSENTS[version].encode("utf-8")).hexdigest()
 
 
 # ---------- 常量 ----------
@@ -86,6 +101,8 @@ HINTS = {
     "TooFrequent": "上报太频繁，控制台忽略了这一次，稍后自动再报",
     "Stale": "控制台已有更新的状态，这一次上报被忽略",
     "RateLimited": "请求太频繁，请过一分钟再试",
+    "TooMany": "今天从这台电脑发出的诊断包已经太多了，明天再发，或者直接联系管理员",
+    "TooLarge": "要发的内容超过控制台的上限",
     "Unavailable": "控制台暂时不可用，请稍后再试",
     # 以下是本机判断的，不来自控制台
     "CertInvalid": "证书校验失败：控制台地址的证书不是签给这个域名的、是自签证书，或者本机 Python 找不到 CA 证书。"
@@ -634,6 +651,8 @@ def enroll(con, url: str, code: str, release_fp: str, backup_fp: str, hostname: 
         raise ValueError("控制台已登记这台设备（设备 id：%s），但本机写入失败（%r）：请管理员在控制台吊销这台设备后重新入网"
                          % (device_id, e))
     _clear_kv(con)
+    if CONSENT_VERSION == PROBLEMS_FROM:
+        set_problems_baseline(con)  # 入网之前的出错记录不上报
     _event(con, "enrolled", "已接入控制台 %s，设备 %s" % (url, device_id), dedupe=False)
     lines = ["✅ 已接入控制台 %s（设备 %s）" % (url, device_id),
              "发版公钥：%s" % ("本机原来就信任这一对，信任不变" if same else "已按你给的指纹信任主公钥和备份公钥"),
@@ -692,6 +711,56 @@ def leave(con, out=print) -> list:
     return out
 
 
+def accept(con, version: str = CONSENT_VERSION, out=print) -> list:
+    """`ticket console accept [c1|c2]`：已入网的设备换一份采集清单（本人在终端里看完全文、输入 yes 才发）。
+    升到 c2 才开始上报出错记录（PRD §7.1：1 级数据要本人重新确认）；改回 c1 就不再上报。"""
+    if _in_worker():
+        raise PermissionError("worker 里不能执行 ticket console accept：只能由用户本人在终端执行")
+    version = (version or CONSENT_VERSION).strip()
+    if version not in CONSENTS:
+        raise ValueError("没有这份采集清单：%s（可选：%s）" % (version, "、".join(sorted(CONSENTS))))
+    info = load()
+    if info is None or not token_path().is_file():
+        raise ValueError("本机没有入网（或控制台文件不完整），没有清单可换")
+    st = state(con)
+    if st.startswith("stopped:") or stopped_path().exists():
+        raise ValueError("这台设备在控制台已失效，已停止上报：不用再换清单")
+    if info.get("consent_version") == version:
+        return ["本机同意的采集清单已经是 %s，不用再换" % version]
+    if not _stdin_is_tty():
+        raise PermissionError("ticket console accept 要在终端里由本人确认采集清单，不能在管道或脚本里执行")
+    out("采集清单 %s（SHA-256 %s）：" % (version, consent_sha256(version)))
+    out(CONSENTS[version][:-1])
+    answer = _ask("同意上面的清单（替换现在的 %s）？输入 yes 继续：" % (info.get("consent_version") or "—"))
+    if answer.strip() != "yes":
+        return ["没有同意，清单不变（%s），没有发出任何请求" % (info.get("consent_version") or "—")]
+    try:
+        resp = request("POST", "/api/v1/device/consent", {"version": version, "sha256": consent_sha256(version)},
+                       token=read_token())
+    except ConsoleError as e:
+        raise ValueError("换清单失败：%s。本机清单不变" % e.text())
+    if resp.get("ok") is not True or resp.get("consent_version") != version:
+        raise ValueError("换清单失败：控制台没有确认。本机清单不变")
+    if version == PROBLEMS_FROM:
+        set_problems_baseline(con)  # 同意之前的出错记录不上报
+    new = dict(info, consent_version=version)
+    _write_private(info_path(), (json.dumps(new, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+    _event(con, "consent", "采集清单 %s → %s" % (info.get("consent_version") or "—", version), dedupe=False)
+    if version == PROBLEMS_FROM:
+        return ["✅ 已换成采集清单 %s：从现在起心跳里多一份出错记录（只有时间、工单号、出错环节和归类码）。"
+                "下一次上报的内容：ticket console show" % version]
+    return ["✅ 已换成采集清单 %s：不再上报出错记录" % version]
+
+
+def consent_note(con=None) -> Optional[str]:
+    """本机清单还是不带出错记录的旧版本时，给 status / show 的一句提示。"""
+    v = consent_version()
+    if v is None or v == PROBLEMS_FROM:
+        return None
+    return ("采集清单是 %s：出错记录不上报，管理员看不到这台电脑哪一步出了错。"
+            "执行 ticket console accept 可以开启（会先给你看新清单全文）" % v)
+
+
 # ---------- 心跳 ----------
 def _iso(ts) -> Optional[str]:
     try:
@@ -744,14 +813,112 @@ def _doctor_part(con, now: Optional[float] = None) -> dict:
     return {"ok": not failed, "failed": failed[:20]}
 
 
-def build_heartbeat(con, now: Optional[float] = None) -> dict:
-    """下一次心跳的完整内容。只有这些字段（白名单，和采集清单 c1 对应）；守护进程和 ticket console show 都用它。"""
+# ---------- 出错记录（清单 c2，openspec add-console-problem-reports） ----------
+PROBLEMS_MAX = 20
+PROBLEMS_MORE_MAX = 100000
+CURSOR_KEY = "console.problems_cursor"     # {"event": events.id, "round": rounds.id}：已经上报到（含）哪一条
+TICKET_ID_RE = re.compile(r"^T[0-9]{1,8}$")
+PROBLEM_CODE_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+PROBLEM_STEPS = ("round", "model", "stall", "outage", "feishu", "media", "skills", "other")
+# rounds.outcome → 出错记录。stopped / held 是用户自己停的，blocked / waiting 是正常的「要你决定」，都不算出错
+ROUND_PROBLEMS = ("failed", "retry", "compact_failed")
+MODEL_CODES = ("balance", "auth", "rate_limit", "overloaded", "network", "server_5xx", "client_4xx", "other")
+LARK_CODES = ("rate_limit", "network", "api_other", "other")
+EVENT_PROBLEM_KINDS = ("model_error", "api_error", "stall_interrupt", "stall_abort", "outage_start", "delivery_dead",
+                       "card_giveup", "media_stuck", "lark_error", "media", KIND)
+
+
+def _problem_of(kind: str, code: str) -> Optional[tuple]:
+    """一条本机事件 → (step, code)；不算出错的返回 None。只返回写死的枚举值，事件的 detail 原文不经过这里。"""
+    code = code or ""
+    if kind in ("model_error", "api_error"):
+        return "model", code if code in MODEL_CODES else "other"
+    if kind in ("stall_interrupt", "stall_abort"):
+        return "stall", kind
+    if kind == "outage_start":
+        return "outage", kind
+    if kind in ("delivery_dead", "card_giveup", "media_stuck"):
+        return "feishu", kind
+    if kind == "lark_error":
+        if re.fullmatch(r"[0-9]{1,12}", code):
+            return "feishu", "e" + code
+        return "feishu", code if code in LARK_CODES else "other"
+    if kind == "media":
+        what, _, res = code.partition(":")
+        if what in ("image", "video", "doc") and res == "fail":
+            return "media", what + "_fail"
+        return None
+    if kind == KIND and code == "skills_failed":
+        return "skills", "skills_failed"
+    return None
+
+
+def consent_version() -> Optional[str]:
+    """本机记录的、本人同意过的清单版本（console.json）；没入网为 None。"""
+    info = load()
+    v = info.get("consent_version") if info else None
+    return v if v in CONSENTS else None
+
+
+def _max_ids(con) -> dict:
+    return {"event": int(con.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]),
+            "round": int(con.execute("SELECT COALESCE(MAX(id), 0) FROM rounds").fetchone()[0])}
+
+
+def _cursor(con) -> Optional[dict]:
+    try:
+        c = json.loads(metrics.kv_get(con, CURSOR_KEY) or "")
+        if isinstance(c, dict) and all(isinstance(c.get(k), int) and not isinstance(c.get(k), bool)
+                                       for k in ("event", "round")):
+            return {"event": c["event"], "round": c["round"]}
+    except ValueError:
+        pass
+    return None
+
+
+def set_problems_baseline(con) -> None:
+    """从现在开始算：同意 c2（入网或 ticket console accept）之前的出错记录不上报。"""
+    metrics.kv_set(con, CURSOR_KEY, json.dumps(_max_ids(con), sort_keys=True))
+
+
+def _problems_part(con) -> tuple:
+    """(心跳里的 problems, 发送成功后游标要前移到的位置)。只读本机 events / rounds 的 id、时间、kind、code、outcome；
+    没有游标（比如本机 kv 被清过）时从现在算起，不补报历史。"""
+    top = _max_ids(con)
+    cur = _cursor(con)
+    if cur is None or cur["event"] > top["event"] or cur["round"] > top["round"]:
+        return {"items": [], "more": 0}, top          # 库被换过（id 比游标小）：同样从现在算起
+    found = []
+    marks = ",".join("?" * len(EVENT_PROBLEM_KINDS))
+    for e in con.execute("SELECT id, ticket_id, kind, code, created_at FROM events WHERE id>? AND id<=? AND kind IN (%s)"
+                         % marks, (cur["event"], top["event"]) + EVENT_PROBLEM_KINDS):
+        p = _problem_of(e["kind"], e["code"])
+        if p:
+            found.append((float(e["created_at"] or 0), 0, e["id"], e["ticket_id"], p))
+    marks = ",".join("?" * len(ROUND_PROBLEMS))
+    for r in con.execute("SELECT id, ticket_id, outcome, ended_at FROM rounds WHERE id>? AND id<=? AND outcome IN (%s)"
+                         % marks, (cur["round"], top["round"]) + ROUND_PROBLEMS):
+        found.append((float(r["ended_at"] or 0), 1, r["id"], r["ticket_id"], ("round", r["outcome"])))
+    found.sort()
+    keep = found[-PROBLEMS_MAX:]
+    items = []
+    for at, _, _, tid, (step, code) in keep:
+        items.append({"at": updsig.iso(max(at, 0.0)), "ticket": tid if TICKET_ID_RE.match(str(tid or "")) else None,
+                      "step": step if step in PROBLEM_STEPS else "other",
+                      "code": code if PROBLEM_CODE_RE.match(code) else "other"})
+    return {"items": items, "more": min(len(found) - len(keep), PROBLEMS_MORE_MAX)}, top
+
+
+def build_heartbeat(con, now: Optional[float] = None, cursor_out: Optional[dict] = None) -> dict:
+    """下一次心跳的完整内容。只有这些字段（白名单，和本机同意的采集清单对应）；守护进程和 ticket console show 都用它。
+    本机清单是 c2 时多一个 problems（出错记录）；c1 时一个字节都不带。cursor_out：给了就填入发送成功后游标要前移到的位置
+    （只有 send_heartbeat 在收到 200 后才写回；show 不传、不前移）。"""
     now = time.time() if now is None else now
 
     def count(state):
         n = con.execute("SELECT COUNT(*) FROM tickets WHERE state=?", (state,)).fetchone()[0]
         return min(max(int(n), 0), 10000)
-    return {
+    hb = {
         "schema": 1,
         "sent_at": updsig.iso(now),
         "larkyard_version": __version__,
@@ -760,6 +927,11 @@ def build_heartbeat(con, now: Optional[float] = None) -> dict:
         "tickets": {"running": count("running"), "queued": count("queued")},
         "update": _update_part(con, now),
     }
+    if consent_version() == PROBLEMS_FROM:
+        hb["problems"], top = _problems_part(con)
+        if cursor_out is not None:
+            cursor_out.update(top)
+    return hb
 
 
 def state(con) -> str:
@@ -797,7 +969,8 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
         return {"sent": False, "ok": False, "code": code, "next_in": None, "stopped": True}
     try:
         token = read_token()
-        payload = build_heartbeat(con, now)
+        advance: dict = {}
+        payload = build_heartbeat(con, now, cursor_out=advance)
         resp = request("POST", "/api/v1/heartbeat", payload, token=token)
     except ConsoleError as e:
         if not enrolled():  # 发送期间执行了 --leave：什么都不记
@@ -823,6 +996,8 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
     next_in = n if isinstance(n, int) and not isinstance(n, bool) and NEXT_IN_MIN <= n <= NEXT_IN_MAX else None
     if ok:
         metrics.kv_set(con, "console.last_ok_at", str(now))
+        if advance and "problems" in payload:  # 控制台确认收到了才前移；失败、没确认的下次重报（控制台按内容去重）
+            metrics.kv_set(con, CURSOR_KEY, json.dumps(advance, sort_keys=True))
         if st != "ok":
             _event(con, "recovered" if st == "failing" else "started",
                     "恢复上报" if st == "failing" else "开始上报", dedupe=False)
@@ -955,7 +1130,7 @@ def status_lines(con, now: Optional[float] = None) -> list:
             "入网时间：%s  同意的采集清单：%s" % (info.get("enrolled_at") or "—", info.get("consent_version") or "—"),
             "最后一次成功上报：%s" % _ts(last_ok_at(con)),
             "最近一次错误：%s" % (metrics.kv_get(con, "console.last_error") or "—"),
-            "控制台下发的技能：%s" % skills_text()]
+            "控制台下发的技能：%s" % skills_text()] + ([consent_note(con)] if consent_note(con) else [])
 
 
 def skills_text() -> str:
@@ -971,7 +1146,8 @@ def show_text(con) -> str:
     info = load()
     if info is None:
         return "未入网：不会发出任何内容。入网后每 5 分钟上报的就是下面这份（现在不会发出）：\n" + payload
-    return "下一次心跳发往 %s/api/v1/heartbeat，内容：\n%s" % (info["url"], payload)
+    note = consent_note(con)
+    return "%s下一次心跳发往 %s/api/v1/heartbeat，内容：\n%s" % (note + "\n" if note else "", info["url"], payload)
 
 
 IN_WORKER_NOTE = "worker 的沙箱禁读控制台目录，这里看不到入网状态（在终端里执行可以看到）"
@@ -1008,9 +1184,13 @@ def doctor_line(con, now: Optional[float] = None) -> str:
     return "❌ 控制台：最近 30 分钟没有成功上报（最近的错误：%s）%s" % (err or "无，守护进程可能没在运行", suffix)
 
 
-def command_console(con, action: str) -> str:
+def command_console(con, action: str, version: Optional[str] = None) -> str:
     if _in_worker():
+        if action == "accept":
+            raise PermissionError("worker 里不能执行 ticket console accept：只能由用户本人在终端执行")
         return "控制台：" + IN_WORKER_NOTE
+    if action == "accept":
+        return "\n".join(accept(con, version or CONSENT_VERSION))
     if action == "show":
         return show_text(con)
     return "\n".join(status_lines(con))

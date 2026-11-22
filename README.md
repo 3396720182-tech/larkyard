@@ -334,10 +334,12 @@ ticket enroll https://console.example.com LY-XXXX-XXXX-XXXX \
 
 命令先打印采集清单（版本和 SHA-256）、要你输入 `yes`；然后取控制台上的两把发版公钥按你给的指纹核对（不一致就中止、本机不写任何东西），提交入网码；控制台把 6 位确认码私信给入网码对应的人，输入确认码后入网完成。只接受 `https://`，按系统 CA 校验证书和主机名，校验失败不发出任何请求内容，没有跳过校验的选项。worker 里不能执行，也不能在管道或脚本里执行。
 
-入网后守护进程每 5 分钟上报一次设备状态（Larkyard 版本、系统、`ticket doctor` 结论、运行中 / 排队中的工单数、自动更新状态；不含工单标题、原话、产物、文件、日志和成本）。没配 `TICKETD_UPDATE_URL` 时，自动更新的更新源是控制台（带设备令牌）。
+入网后守护进程每 5 分钟上报一次设备状态（Larkyard 版本、系统、`ticket doctor` 结论、运行中 / 排队中的工单数、自动更新状态；不含工单标题、原话、产物、文件、日志和成本）。采集清单 c2 起还带上次以来的出错记录（时间、工单号、出错环节、错误归类码，都是写死的代号，不含报错原文）；早先按 c1 入网的机器执行 `ticket console accept` 看过新清单、同意后才开始带。没配 `TICKETD_UPDATE_URL` 时，自动更新的更新源是控制台（带设备令牌）。
 
 - `ticket console show`：打印下一次上报的完整内容（不发送）
 - `ticket console status`：入网状态、最后一次成功上报、最近的错误
+- `ticket console accept [c1|c2]`：换采集清单（只能本人在终端里执行；c1 = 不报出错记录）
+- `ticket diag [工单号]`：在本机生成诊断包（版本、自检、最近的报错原文、工单的原话和过程日志末尾，密钥打码），只显示不发送；看过、确认后 `ticket diag send <文件> [--note 一句话]` 发给控制台管理员。在飞书里对 bot 说「把诊断包发给管理员」也走这两步
 - `ticket enroll --leave`：通知控制台并删除本机的设备令牌和控制台配置（`~/.ticketd/console/`）；信任的发版公钥保留
 - 被管理员吊销后停止上报、`ticket doctor` 会提示，派单不受影响
 - 控制台可以按人给 worker 下发技能（比如团队内部工具）：装在 `~/.ticketd/skills/`，只有 Larkyard 的 worker 加载、能读不能写，你自己的 Claude Code 会话不加载；关掉开通或退出控制台后本机删掉。`ticket console status` 能看到装了哪些

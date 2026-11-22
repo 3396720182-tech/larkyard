@@ -471,6 +471,12 @@ worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `e
 - **签名**：每个技能都要有发布者的签名，针对 `{"name", "files"}` 的确定性 JSON（`updsig.canonical`），用入网时按指纹信任的 main 发版公钥（`main.allowed_signers`，身份 `larkyard-release`）验，命名空间 `larkyard-skill`（版本清单的签名冒充不了技能）；有一个验不过整批不装，没有信任的公钥也不装。控制台只分发、改不了技能内容；凭据是数据，不签。
 - **信任边界**：被攻破的控制台能做的是：给开通的人换凭据、停发、或者重新下发以前签过的旧版本（签名里没有版本号，接受这个风险）；不能塞没签过的内容。所以技能脚本只从下发的凭据里读口令这类数据，不读会改变行为的配置（比如服务地址）。换 main 公钥（§11 换钥）后旧签名全部失效：发布者要用新钥重签，在那之前本机保留原来装的（含旧凭据）。只给 worker、不给用户自己的会话；采集清单不变（领取不上报任何新内容）。
 
+**出错记录和诊断包**（2026-11-23，T0073 调整）：行为以 `openspec/changes/add-console-problem-reports/` 为准。管理员要能看到「谁、哪台电脑、哪一步坏了」，但不碰同事的工作内容。
+- **清单 c2**：`console.CONSENTS` 里 c1、c2 并存（c1 文本和哈希不变）。新入网用 c2；本机 `console.json` 的 `consent_version` 决定心跳带不带出错记录。已入网的 c1 设备只有本人在终端执行 `ticket console accept`（打印全文 → `yes` → `POST /api/v1/device/consent`，控制台确认后才改本机）才升级；`ticket console accept c1` 改回。c1 设备的 `ticket console status` / `show` 提示怎么开启。
+- **心跳 `problems`**（只在 c2 下出现）：`{"items": [{at, ticket, step, code}…最多 20 条], "more": n}`。来源是本机 `events` / `rounds` 表的 id、时间、kind、code、outcome，`events.detail` 原文不经过；`step` / `code` 的映射和不报的项（用户停止、正常的 blocked / waiting、只是提醒的 stall_flag、重复的 delivery dead、超时中止）见 design D3。游标 `kv console.problems_cursor` 在心跳 200 且 `ok: true` 后才前移到构造时的上界，失败下次重报（控制台按内容去重）；`ticket console show` 用同一个函数构造、不前移。入网、升级到 c2、游标丢失或比表里大时从当时算起，不补历史。
+- **诊断包**（`ticketd/diag.py`）：`ticket diag [工单号]` 写 `~/.ticketd/diag/diag-<时间>[-T…].md`（700 / 600，留 20 份），内容按优先级（版本和控制台状态、doctor、最近 7 天出错记录带原文、工单概况和最后汇报，剩余空间给过程日志和 stderr 末尾）截到 48KB，常见密钥形态打码；只打印、不发送。`ticket diag send <文件> [--note]` 只接受这个目录里按规则命名的普通文件，再打一遍码，经 `console.request` 发 `POST /api/v1/diagnostics`（请求体 ≤60KB，控制台和 Nginx 限 64KB）。worker 环境两条都拒绝。主会话约定（`workspace/CLAUDE.md.tmpl`「诊断包」）：先生成给同事看、说明发给谁，同事明确确认后才发送。
+- **上线顺序**：控制台先认得 c2 和两个新接口，再发客户端；控制台退回旧版时 c2 设备的心跳会被 `UnknownField` 拒绝，直到控制台恢复或本人改回 c1。
+
 ## 13. bridge 内化与一行安装（2026-11-20，T0052）
 
 行为以 `openspec/changes/vendor-bridge-one-line-install/specs/`（`vendored-bridge`、`one-line-install`、`bridge-adopt`）为准，设计取舍见同目录的 `design.md`。架构不变：bridge 仍驱动主会话；这一节只管 bridge 怎么来、怎么装、怎么换。

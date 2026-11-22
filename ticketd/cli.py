@@ -96,8 +96,14 @@ def build_parser() -> argparse.ArgumentParser:
     en.add_argument("--backup-key", help="备份发版公钥的指纹 SHA256:…")
     en.add_argument("--hostname", help="上报的主机名（默认本机主机名，只保留字母、数字和 . _ -）")
     en.add_argument("--leave", action="store_true", help="退出控制台：通知控制台并删除本机的设备令牌和控制台配置")
-    cs = sub.add_parser("console", help="控制台接入（只读）：status / show（下一次心跳的完整内容）")
-    cs.add_argument("action", nargs="?", default="status", choices=("status", "show"))
+    cs = sub.add_parser("console", help="控制台接入：status / show（下一次心跳的完整内容）/ accept [c1|c2]（换采集清单，"
+                                        "只由本人在终端执行）")
+    cs.add_argument("action", nargs="?", default="status", choices=("status", "show", "accept"))
+    cs.add_argument("version", nargs="?", help="accept：要换成的采集清单版本（默认最新的 c2；c1 = 不再上报出错记录）")
+    dg = sub.add_parser("diag", help="诊断包：ticket diag [工单号] 生成并显示（不发送）；ticket diag send <文件> [--note 一句话] "
+                                     "在本人看过、确认后发给控制台管理员")
+    dg.add_argument("args", nargs="*", help="[工单号] 或 send <文件>")
+    dg.add_argument("--note", default="", help="send：给管理员的一句话（≤500 字）")
     se = sub.add_parser("setup", help="安装向导（只由本人在终端执行）：飞书应用、工作区、服务、认主人、用户授权、自检")
     se.add_argument("--profile", default="", help="bridge 的 profile 名（默认 claude）")
     se.add_argument("--workspace", default="", help="工作区目录（默认 ~/larkyard-workspace；已有 profile 时用它的）")
@@ -483,7 +489,22 @@ def cmd_enroll(con, a) -> str:
 
 def cmd_console(con, a) -> str:
     from . import console
-    return console.command_console(con, a.action)
+    if a.version and a.action != "accept":
+        raise core.TicketError("只有 accept 带清单版本")
+    try:
+        return console.command_console(con, a.action, a.version)
+    except (PermissionError, ValueError, console.ConsoleError) as e:
+        raise core.TicketError(e.text() if isinstance(e, console.ConsoleError) else str(e))
+    except (KeyboardInterrupt, EOFError):
+        raise core.TicketError("已取消")
+
+
+def cmd_diag(con, a) -> str:
+    from . import diag
+    try:
+        return diag.command(con, a.args, a.note)
+    except (PermissionError, ValueError) as e:
+        raise core.TicketError(str(e))
 
 
 def cmd_setup(con, a) -> str:
@@ -576,7 +597,7 @@ COMMANDS = {
     "new": cmd_new, "send": cmd_send, "lookup": cmd_lookup, "report": cmd_report,
     "stop": cmd_stop, "hold": cmd_hold, "release": cmd_release, "restart": cmd_restart, "approve": cmd_approve, "grant": cmd_grant,
     "ls": cmd_ls, "show": cmd_show, "stats": cmd_stats, "doctor": cmd_doctor,
-    "telemetry": cmd_telemetry, "update": cmd_update, "enroll": cmd_enroll, "console": cmd_console,
+    "telemetry": cmd_telemetry, "update": cmd_update, "enroll": cmd_enroll, "console": cmd_console, "diag": cmd_diag,
     "setup": cmd_setup, "bridge": cmd_bridge,
 }
 

@@ -350,7 +350,7 @@ class EnrollTest(ConsoleBase):
         self.assertIn(console.CONSENT_TEXT[:-1], self.out)
         start = self.fake.bodies("/api/v1/enroll/start")[0]
         self.assertEqual(set(start), {"code", "hostname", "os", "larkyard_version", "bot_open_id", "consent"})
-        self.assertEqual(start["consent"], {"version": "c1", "sha256": console.consent_sha256()})
+        self.assertEqual(start["consent"], {"version": "c2", "sha256": console.consent_sha256("c2")})
         self.assertRegex(start["consent"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual((start["code"], start["hostname"], start["bot_open_id"]), (CODE, "test-host", OWNER))
         self.assertEqual(set(start["os"]), {"name", "version", "arch"})
@@ -363,7 +363,9 @@ class EnrollTest(ConsoleBase):
         self.assertTrue(any("不要告诉任何人" in o for o in self.out))
         info = json.loads(console.info_path().read_text(encoding="utf-8"))
         self.assertEqual(set(info), {"url", "device_id", "enrolled_at", "consent_version"})
-        self.assertEqual((info["url"], info["device_id"], info["consent_version"]), (URL, DEVICE, "c1"))
+        self.assertEqual((info["url"], info["device_id"], info["consent_version"]), (URL, DEVICE, "c2"))
+        # 入网之前的出错记录不上报：游标从入网时算起
+        self.assertIsNotNone(console._cursor(self.con))
         self.assertEqual(console.read_token(), TOKEN)
         self.assertEqual(updsig.signer_key(update.main_signers()), updsig.parse_pubkey(signing.pub(self.k.main)))
         self.assertEqual(updsig.signer_key(update.backup_signers()), updsig.parse_pubkey(signing.pub(self.k.backup)))
@@ -1034,11 +1036,25 @@ class ConsentTest(unittest.TestCase):
         import re
         d = (REPO / "openspec" / "changes" / "add-console-enrollment" / "design.md").read_text(encoding="utf-8")
         block = re.search(r"### D4.*?```\n(.*?)```", d, re.S).group(1)
-        self.assertEqual(block, console.CONSENT_TEXT)
-        self.assertEqual(len(console.CONSENT_TEXT.splitlines()), 5)
-        self.assertTrue(console.CONSENT_TEXT.endswith("。\n"))
-        self.assertEqual(console.consent_sha256(),
+        self.assertEqual(block, console.CONSENT_C1)
+        self.assertEqual(len(console.CONSENT_C1.splitlines()), 5)
+        self.assertTrue(console.CONSENT_C1.endswith("。\n"))
+        # c1 一个字都不能变：已入网设备的同意记录指向它
+        self.assertEqual(console.consent_sha256("c1"),
                          "0ad831b7df4c8dfa5ad888fd05430495f4c0816b9936ef32a0037a046925d92a")
+
+    def test_c2_matches_design(self):
+        import re
+        d = (REPO / "openspec" / "changes" / "add-console-problem-reports" / "design.md").read_text(encoding="utf-8")
+        block = re.search(r"### D1.*?```\n(.*?)```", d, re.S).group(1)
+        self.assertEqual(block, console.CONSENT_C2)
+        self.assertEqual(console.CONSENT_VERSION, "c2")
+        self.assertEqual(console.CONSENT_TEXT, console.CONSENT_C2)
+        self.assertEqual(len(console.CONSENT_C2.splitlines()), 6)
+        self.assertTrue(console.CONSENT_C2.endswith("。\n"))
+        # 和控制台仓库登记的 c2 逐字一致（两边对照这个哈希）
+        self.assertEqual(console.consent_sha256("c2"),
+                         "4f85ce4332334dc76eb8c4870e2fe646866f4fe6b7f4c6b979fa3f0027760ccd")
 
 
 if __name__ == "__main__":
