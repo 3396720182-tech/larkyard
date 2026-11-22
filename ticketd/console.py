@@ -734,18 +734,34 @@ def accept(con, version: str = CONSENT_VERSION, out=print) -> list:
     answer = _ask("同意上面的清单（替换现在的 %s）？输入 yes 继续：" % (info.get("consent_version") or "—"))
     if answer.strip() != "yes":
         return ["没有同意，清单不变（%s），没有发出任何请求" % (info.get("consent_version") or "—")]
+    local_only = False
     try:
         resp = request("POST", "/api/v1/device/consent", {"version": version, "sha256": consent_sha256(version)},
                        token=read_token())
     except ConsoleError as e:
-        raise ValueError("换清单失败：%s。本机清单不变" % e.text())
+        # 收窄采集（改回 c1）不需要控制台同意：控制台是不认识这个接口的旧版本时，只改本机（少报不会多收）
+        if version != PROBLEMS_FROM and e.status == 404 and e.code in ("NotFound", "HttpError"):
+            local_only, resp = True, {"ok": True, "consent_version": version}
+        else:
+            raise ValueError("换清单失败：%s。本机清单不变" % e.text())
     if resp.get("ok") is not True or resp.get("consent_version") != version:
         raise ValueError("换清单失败：控制台没有确认。本机清单不变")
     if version == PROBLEMS_FROM:
         set_problems_baseline(con)  # 同意之前的出错记录不上报
+    else:
+        bump_problems_epoch(con)    # 在途的心跳回来也不再动游标
     new = dict(info, consent_version=version)
-    _write_private(info_path(), (json.dumps(new, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
-    _event(con, "consent", "采集清单 %s → %s" % (info.get("consent_version") or "—", version), dedupe=False)
+    try:
+        _write_private(info_path(), (json.dumps(new, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+                       .encode("utf-8"))
+    except OSError as e:
+        where = "本机" if local_only else "控制台已改成 %s，但本机" % version
+        raise ValueError("%s没写进去（%s）：请重试 ticket console accept %s" % (where, e.__class__.__name__, version))
+    _event(con, "consent", "采集清单 %s → %s%s" % (info.get("consent_version") or "—", version,
+                                                 "（只改了本机）" if local_only else ""), dedupe=False)
+    if local_only:
+        return ["✅ 已换成采集清单 %s：不再上报出错记录。控制台是旧版本、不认识换清单的接口，只改了本机；"
+                "控制台那边仍记着你原来同意的版本" % version]
     if version == PROBLEMS_FROM:
         return ["✅ 已换成采集清单 %s：从现在起心跳里多一份出错记录（只有时间、工单号、出错环节和归类码）。"
                 "下一次上报的内容：ticket console show" % version]
@@ -817,6 +833,7 @@ def _doctor_part(con, now: Optional[float] = None) -> dict:
 PROBLEMS_MAX = 20
 PROBLEMS_MORE_MAX = 100000
 CURSOR_KEY = "console.problems_cursor"     # {"event": events.id, "round": rounds.id}：已经上报到（含）哪一条
+EPOCH_KEY = "console.problems_epoch"       # 每次换清单 / 重设起点加 1：在途的心跳回来时核对，不一致就不写游标
 TICKET_ID_RE = re.compile(r"^T[0-9]{1,8}$")
 PROBLEM_CODE_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 PROBLEM_STEPS = ("round", "model", "stall", "outage", "feishu", "media", "skills", "other")
@@ -876,9 +893,35 @@ def _cursor(con) -> Optional[dict]:
     return None
 
 
+def _epoch(con) -> str:
+    return metrics.kv_get(con, EPOCH_KEY) or "0"
+
+
+def bump_problems_epoch(con) -> None:
+    """换清单（accept）时调用：在途心跳构造时记下的游标上界作废。"""
+    try:
+        n = int(_epoch(con)) + 1
+    except ValueError:
+        n = 1
+    metrics.kv_set(con, EPOCH_KEY, str(n))
+
+
 def set_problems_baseline(con) -> None:
     """从现在开始算：同意 c2（入网或 ticket console accept）之前的出错记录不上报。"""
+    bump_problems_epoch(con)
     metrics.kv_set(con, CURSOR_KEY, json.dumps(_max_ids(con), sort_keys=True))
+
+
+def _advance_cursor(con, advance: dict) -> None:
+    """心跳被控制台确认后前移游标：构造之后换过清单（epoch 变了）就不写；平时每个键只往前走（取大），
+    除非构造时发现游标作废（库换过 / 没有游标），那时直接写成当时的上界。"""
+    if advance.get("epoch") != _epoch(con):
+        return
+    new = {"event": advance["event"], "round": advance["round"]}
+    cur = _cursor(con)
+    if cur is not None and not advance.get("reset"):
+        new = {k: max(new[k], cur[k]) for k in new}
+    metrics.kv_set(con, CURSOR_KEY, json.dumps(new, sort_keys=True))
 
 
 def _problems_part(con) -> tuple:
@@ -887,7 +930,7 @@ def _problems_part(con) -> tuple:
     top = _max_ids(con)
     cur = _cursor(con)
     if cur is None or cur["event"] > top["event"] or cur["round"] > top["round"]:
-        return {"items": [], "more": 0}, top          # 库被换过（id 比游标小）：同样从现在算起
+        return {"items": [], "more": 0}, dict(top, reset=True)  # 没有游标 / 库被换过（id 比游标小）：从现在算起
     found = []
     marks = ",".join("?" * len(EVENT_PROBLEM_KINDS))
     for e in con.execute("SELECT id, ticket_id, kind, code, created_at FROM events WHERE id>? AND id<=? AND kind IN (%s)"
@@ -928,9 +971,10 @@ def build_heartbeat(con, now: Optional[float] = None, cursor_out: Optional[dict]
         "update": _update_part(con, now),
     }
     if consent_version() == PROBLEMS_FROM:
+        epoch = _epoch(con)
         hb["problems"], top = _problems_part(con)
         if cursor_out is not None:
-            cursor_out.update(top)
+            cursor_out.update(top, epoch=epoch)
     return hb
 
 
@@ -971,7 +1015,15 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
         token = read_token()
         advance: dict = {}
         payload = build_heartbeat(con, now, cursor_out=advance)
-        resp = request("POST", "/api/v1/heartbeat", payload, token=token)
+        try:
+            resp = request("POST", "/api/v1/heartbeat", payload, token=token)
+        except ConsoleError as e:
+            if not (e.status == 400 and e.code == "UnknownField" and "problems" in payload):
+                raise
+            # 控制台不认识 problems（退回了旧版本）：去掉它再报一次设备状态，游标不动，控制台恢复后照报
+            payload = {k: v for k, v in payload.items() if k != "problems"}
+            _event(con, "problems_rejected", "控制台不认识出错记录（多半退回了旧版本），这一阵只报设备状态")
+            resp = request("POST", "/api/v1/heartbeat", payload, token=token)
     except ConsoleError as e:
         if not enrolled():  # 发送期间执行了 --leave：什么都不记
             return {"sent": True, "ok": False, "code": e.code, "next_in": None, "stopped": True}
@@ -997,7 +1049,7 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
     if ok:
         metrics.kv_set(con, "console.last_ok_at", str(now))
         if advance and "problems" in payload:  # 控制台确认收到了才前移；失败、没确认的下次重报（控制台按内容去重）
-            metrics.kv_set(con, CURSOR_KEY, json.dumps(advance, sort_keys=True))
+            _advance_cursor(con, advance)
         if st != "ok":
             _event(con, "recovered" if st == "failing" else "started",
                     "恢复上报" if st == "failing" else "开始上报", dedupe=False)
