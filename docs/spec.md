@@ -461,6 +461,15 @@ cp <工作区>/CLAUDE.md.bak-<时间> <工作区>/CLAUDE.md
 
 worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `enroll`（写不了 `~/.ticketd`，最后会失败）。启用条件（信任公钥、受管安装、验签工具）不变。
 
+**下发技能**（2026-11-22，T0069）：入网的机器上，控制台可以按人给 worker 下发技能（Agent Skills 格式：目录 + `SKILL.md` + 可选脚本）和技能要用的凭据，用来把团队内部的工具（比如只在公司内网、只有一把共用口令的服务）开给指定的人。实现在 `ticketd/skills.py`，控制台一侧不在本仓库。
+- **只给 worker 用**：装在 `$TICKETD_HOME/skills/`，整个目录是一个 Claude Code 插件（`.claude-plugin/plugin.json`，插件名 `larkyard`），Claude worker 每轮以 `--plugin-dir` 加载（技能名带 `larkyard:` 前缀；没装任何技能时不加这个参数）。用户自己的 Claude Code 会话和 bridge 主会话不加载。worker 能读（技能脚本要读凭据），不能写：目录进沙箱的 `denyWrite` 和文件工具的 `Edit/Write/NotebookEdit` deny 规则，授权目录再宽也不放开（否则一张单能改掉别的单要加载的技能）；每轮写设置前先建好空目录（Linux 的 bubblewrap 只能遮住已存在的路径）。Codex worker 不加载（入网的机器上本来就不起 Codex）。
+- **布局**：`skills/<名字>/…`（644）、`secrets/<名字>/<键>`（目录 700、文件 600）、`state.json`（控制台给的摘要、技能名、更新时间）。技能脚本按「本技能目录往上两级的 `secrets/<名字>/`」找凭据。
+- **同步**：心跳成功时响应里多一个 `skills`（控制台算的 64 位十六进制摘要；`ok` / `next_in` 之外唯一会读的字段）。和 `state.json` 里的不同才 `GET /api/v1/skills`（设备令牌，响应上限 1MB），校验后在旁边写好整套新目录、两次 rename 换上；列表为空也照样换（只剩 `state.json`，不再加 `--plugin-dir`），所以没开通的机器只在第一次心跳后领一次。校验：最多 8 个技能、每个最多 64 个文件、合计 512KB，名字 `[a-z0-9-]`，路径每段不能以点开头、最多 4 层，凭据是可见 ASCII。
+- **删除**：控制台给空列表；心跳被拒停止上报（吊销 / 退出 / 不认识，含自动更新发现的）；`ticket enroll --leave`；本机不再入网（手工删了控制台目录）时守护进程下一拍删掉。
+- **不动**：心跳响应里没有 `skills`（旧版控制台）或格式不对、领取失败、内容不合规、写盘失败：本机保持原样，记一条控制台事件（`skills_failed`），心跳结果不受影响。
+- **看得到**：`ticket console status` 列出装着的技能和更新时间；装上、删掉都记控制台事件。
+- **信任**：下发的技能不签名，信任来自入网时核对过证书的控制台；控制台被攻破时，攻击者能给入网机器的 worker 塞技能（仍在沙箱里，写不了工单目录以外）。所以只给 worker、不给用户自己的会话；采集清单不变（领取不上报任何新内容）。
+
 ## 13. bridge 内化与一行安装（2026-11-20，T0052）
 
 行为以 `openspec/changes/vendor-bridge-one-line-install/specs/`（`vendored-bridge`、`one-line-install`、`bridge-adopt`）为准，设计取舍见同目录的 `design.md`。架构不变：bridge 仍驱动主会话；这一节只管 bridge 怎么来、怎么装、怎么换。

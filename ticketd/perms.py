@@ -45,14 +45,26 @@ def secret_dirs() -> List[str]:
     return out
 
 
+def readonly_dirs() -> List[str]:
+    """worker 能读、不能写的目录（spec §12「下发技能」）：控制台下发的技能和它们的凭据。授权目录再宽也不能改，
+    否则一张单的 worker 能改掉别的单要加载的技能。路径和 skills.root() 一致；真实路径不同时两个都写。"""
+    d = config.home() / "skills"
+    out = [str(d.absolute())]
+    real = str(d.resolve())
+    if real not in out:
+        out.append(real)
+    return out
+
+
 def ensure_secret_dirs() -> None:
     """先把控制台目录建好（700、空目录，不算入网）：Linux 的 bubblewrap 只能遮住已经存在的路径，
-    这一轮中途才入网时，令牌也落在已被遮住的目录里。建不了就算了，macOS 的规则不依赖目录存在。"""
-    d = config.home() / "console"
-    try:
-        d.mkdir(parents=True, exist_ok=True, mode=0o700)
-    except OSError:
-        pass
+    这一轮中途才入网时，令牌也落在已被遮住的目录里。下发技能的目录同理（空目录 = 没装技能）。
+    建不了就算了，macOS 的规则不依赖目录存在。"""
+    for name, mode in (("console", 0o700), ("skills", 0o755)):
+        try:
+            (config.home() / name).mkdir(parents=True, exist_ok=True, mode=mode)
+        except OSError:
+            pass
 
 
 def build_settings(workdir: str, grant_paths: List[str], net: Optional[dict] = None) -> dict:
@@ -67,6 +79,9 @@ def build_settings(workdir: str, grant_paths: List[str], net: Optional[dict] = N
     deny = list(DENY)
     for s in secrets:
         deny += ["%s(/%s/**)" % (tool, s) for tool in ("Read", "Edit", "Write", "NotebookEdit")]
+    readonly = readonly_dirs()
+    for s in readonly:
+        deny += ["%s(/%s/**)" % (tool, s) for tool in ("Edit", "Write", "NotebookEdit")]
     sandbox_write = paths + [host.lark_cli_data_dir(), host.shared_tmp()]
     tmpdir = os.environ.get("TMPDIR")
     if tmpdir:
@@ -93,7 +108,8 @@ def build_settings(workdir: str, grant_paths: List[str], net: Optional[dict] = N
             "allowUnsandboxedCommands": False,
             # Linux / WSL2 上沙箱靠 bubblewrap + socat：没装时宁可让 worker 起不来，也不裸跑
             "failIfUnavailable": True,
-            "filesystem": {"allowWrite": sandbox_write, "denyRead": list(secrets), "denyWrite": list(secrets)},
+            "filesystem": {"allowWrite": sandbox_write, "denyRead": list(secrets),
+                           "denyWrite": list(secrets) + readonly},
             "network": network,
         },
     }

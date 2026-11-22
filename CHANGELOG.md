@@ -1,5 +1,9 @@
 # Changelog
 
+## 未发布
+
+- 控制台下发技能：入网的机器上，控制台可以按人给 worker 下发技能和它要用的凭据（团队内部工具开给指定的人用）。随心跳检查（摘要变了才领），装在 `~/.ticketd/skills/`，只给 Claude worker 以 `--plugin-dir` 加载，用户自己的 Claude Code 会话不加载；worker 能读不能写。控制台关掉开通、设备被吊销或退出、`ticket enroll --leave` 时本机删掉。`ticket console status` 列出装着的技能。旧版控制台不受影响。规格见 `docs/spec.md` §12「下发技能」。
+
 ## 0.3.4 — 2026-11-22
 
 - 安全：worker 读不到、写不了 ticketd 的控制台目录 `~/.ticketd/console/`（设备令牌，以后的网关令牌也放这里）。之前 worker 的沙箱只限制写，被提示词注入的 worker 能读走设备令牌、拿去领网关令牌花额度。Claude worker 的设置里同时加了沙箱禁读禁写和文件工具的 deny 规则，授权目录再宽也不放开；本机入网后不再起 Codex worker（它的沙箱还禁不了读），提示改用 Claude 或先 `ticket enroll --leave`。worker 里的 `ticket doctor` / `ticket console` 改为说明「看不到」。`scripts/selftest.py` 新增 `secrets` 一项实测。规格见 `docs/spec.md` §6「凭据目录」、§12「凭据不进 worker」。

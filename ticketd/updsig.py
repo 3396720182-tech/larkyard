@@ -72,15 +72,15 @@ def ssh_keygen() -> str:
     return shutil.which("ssh-keygen") or "/usr/bin/ssh-keygen"
 
 
-def verify(data: bytes, sig: bytes, signers: Path, principal: str) -> bool:
-    """用 allowed_signers 文件和固定命名空间验签。任何异常都当验不过。"""
+def verify(data: bytes, sig: bytes, signers: Path, principal: str, namespace: str = NAMESPACE) -> bool:
+    """用 allowed_signers 文件和固定命名空间验签（控制台下发的技能用另一个命名空间，见 skills.py）。任何异常都当验不过。"""
     if not signers.is_file() or not sig:
         return False
     with tempfile.TemporaryDirectory(prefix="larkyard-verify-") as d:
         sp = Path(d) / "data.sig"
         sp.write_bytes(sig)
         try:
-            p = subprocess.run([ssh_keygen(), "-Y", "verify", "-f", str(signers), "-I", principal, "-n", NAMESPACE,
+            p = subprocess.run([ssh_keygen(), "-Y", "verify", "-f", str(signers), "-I", principal, "-n", namespace,
                                 "-s", str(sp)], input=data, capture_output=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
             return False

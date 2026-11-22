@@ -28,7 +28,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, config, db, host, metrics, updsig
+from . import __version__, config, db, host, metrics, skills, updsig
 
 # ---------- 采集清单 ----------
 CONSENT_VERSION = "c1"
@@ -396,9 +396,9 @@ def _error_of(status: int, data: bytes) -> ConsoleError:
 
 
 def request(method: str, path: str, body=None, *, base: Optional[str] = None, token: Optional[str] = None,
-            timeout: float = TIMEOUT) -> dict:
+            timeout: float = TIMEOUT, limit: int = BODY_LIMIT) -> dict:
     """到控制台的 JSON 请求。base 不给时用本机 console.json 里的地址。返回响应 JSON 对象；
-    控制台返回错误（{"error": {"code"}}）、网络或证书问题都抛 ConsoleError。"""
+    控制台返回错误（{"error": {"code"}}）、网络或证书问题都抛 ConsoleError。limit：响应体上限（下发技能用得大一些）。"""
     if base is None:
         info = load()
         if info is None:
@@ -408,9 +408,9 @@ def request(method: str, path: str, body=None, *, base: Optional[str] = None, to
         raise ConsoleError("BadResponse", "控制台地址必须是 https://")
     url = base.rstrip("/") + path
     data = None if body is None else json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    status, _, raw = _transport(method, url, _headers(token, data is not None), data, timeout, BODY_LIMIT)
-    if len(raw) > BODY_LIMIT:
-        raise ConsoleError("BadResponse", "响应超过 %d 字节" % BODY_LIMIT, status)
+    status, _, raw = _transport(method, url, _headers(token, data is not None), data, timeout, limit)
+    if len(raw) > limit:
+        raise ConsoleError("BadResponse", "响应超过 %d 字节" % limit, status)
     if not 200 <= status < 300:
         raise _error_of(status, raw)
     try:
@@ -682,8 +682,14 @@ def leave(con, out=print) -> list:
         raise ValueError("%s，但本机的控制台文件没删掉（%s）：请手工删除 %s" % (note, e, console_dir()))
     _clear_kv(con)
     _event(con, "left", note, dedupe=False)
-    return ["已退出控制台：%s；本机的 %s 已删除，不再上报" % (note, console_dir()),
-            "信任的发版公钥保留（它们属于自动更新，ticket update status 可以看到）"]
+    out = ["已退出控制台：%s；本机的 %s 已删除，不再上报" % (note, console_dir()),
+           "信任的发版公钥保留（它们属于自动更新，ticket update status 可以看到）"]
+    try:
+        if skills.remove():
+            out.append("控制台下发的技能和凭据已删除（%s）" % skills.root())
+    except OSError as e:
+        out.append("控制台下发的技能没删掉（%s）：请手工删除 %s" % (e, skills.root()))
+    return out
 
 
 # ---------- 心跳 ----------
@@ -785,6 +791,7 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
         code = code if code in STOP_CODES else "DeviceRevoked"
         metrics.kv_set(con, "console.state", "stopped:" + code)
         _event(con, "stopped", "%s，停止上报" % HINTS[code])
+        _drop_skills(con)
         return {"sent": False, "ok": False, "code": code, "next_in": None, "stopped": True}
     try:
         token = read_token()
@@ -801,6 +808,7 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
             except OSError:
                 pass
             _event(con, "stopped", "%s，停止上报" % HINTS[e.code])
+            _drop_skills(con)
             return {"sent": True, "ok": False, "code": e.code, "next_in": None, "stopped": True}
         if st != "failing":
             _event(con, "cert_failed" if e.code in ("CertInvalid", "NoCA") else "failing", e.text()[:200])
@@ -817,9 +825,38 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
             _event(con, "recovered" if st == "failing" else "started",
                     "恢复上报" if st == "failing" else "开始上报", dedupe=False)
         metrics.kv_set(con, "console.state", "ok")
+        _sync_skills(con, resp.get("skills"), token)
     else:
         metrics.kv_set(con, "console.last_error", "%s 控制台没有确认这次上报" % updsig.iso(now))
     return {"sent": True, "ok": ok, "code": None, "next_in": next_in, "stopped": False}
+
+
+def _sync_skills(con, remote, token: str) -> None:
+    """心跳成功后：控制台下发的技能有变化就领（spec §12「下发技能」）。出什么错都不影响这次心跳的结果。"""
+    try:
+        what = skills.sync(remote, lambda: request("GET", skills.PATH, token=token, limit=skills.PULL_LIMIT))
+    except ConsoleError as e:
+        _event(con, "skills_failed", "领取控制台下发的技能失败：%s" % e.text()[:200])
+        return
+    except (skills.Invalid, OSError) as e:
+        _event(con, "skills_failed", "控制台下发的技能没装上：%s" % str(e)[:200])
+        return
+    except Exception as e:  # noqa: BLE001
+        _event(con, "skills_failed", "控制台下发的技能没装上：%r" % (e,))
+        return
+    if what == "removed":
+        _event(con, "skills", "控制台下发的技能已全部删除（开通已关闭）", dedupe=False)
+    elif what:
+        _event(con, "skills", "已装上控制台下发的技能：%s" % what.split(":", 1)[1], dedupe=False)
+
+
+def _drop_skills(con) -> None:
+    """设备在控制台失效（吊销 / 退出 / 不认识）：删掉控制台下发的技能和凭据。"""
+    try:
+        if skills.remove():
+            _event(con, "skills", "设备在控制台已失效，下发的技能和凭据已删除", dedupe=False)
+    except OSError as e:
+        _event(con, "skills_failed", "设备在控制台已失效，但下发的技能没删掉：%s" % str(e)[:200])
 
 
 class Heartbeat:
@@ -853,6 +890,11 @@ class Heartbeat:
         now = self.clock()
         if not enrolled():
             self.next_at = None
+            if skills.state() is not None:  # 本机不再入网（手工删了控制台目录等）：下发的技能跟着删
+                try:
+                    skills.remove()
+                except OSError:
+                    pass
             return False
         if self.next_at is None:
             self.next_at = now + self.rand(0, JITTER)  # 刚启动或刚入网：很快报第一次
@@ -910,7 +952,16 @@ def status_lines(con, now: Optional[float] = None) -> list:
             "控制台地址：%s" % info["url"],
             "入网时间：%s  同意的采集清单：%s" % (info.get("enrolled_at") or "—", info.get("consent_version") or "—"),
             "最后一次成功上报：%s" % _ts(last_ok_at(con)),
-            "最近一次错误：%s" % (metrics.kv_get(con, "console.last_error") or "—")]
+            "最近一次错误：%s" % (metrics.kv_get(con, "console.last_error") or "—"),
+            "控制台下发的技能：%s" % skills_text()]
+
+
+def skills_text() -> str:
+    names = skills.installed()
+    if not names:
+        return "没有"
+    st = skills.state() or {}
+    return "%s（%s 更新，只给 worker 用，在 %s）" % ("、".join(names), st.get("installed_at") or "—", skills.root())
 
 
 def show_text(con) -> str:

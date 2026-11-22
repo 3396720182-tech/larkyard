@@ -11,7 +11,7 @@ import shlex
 import time
 from typing import Callable, Dict, List
 
-from . import config, perms, worker
+from . import config, perms, skills, worker
 
 NAMES = ("claude", "codex")
 
@@ -40,7 +40,11 @@ class ClaudeExecutor(Executor):
 
     def build_command(self, ticket, grant_paths, prompt_text, net=None):
         settings = perms.write_settings(ticket["id"], ticket["workdir"], grant_paths, net)
-        return worker.build_command(ticket, settings, prompt_text)
+        cmd = worker.build_command(ticket, settings, prompt_text)
+        plugin = skills.plugin_dir()  # 控制台下发的技能（spec §12）：只给 worker 加载，每轮按当时装着的
+        if plugin:
+            cmd += ["--plugin-dir", plugin]
+        return cmd
 
     def takeover_hint(self, ticket):
         return "cd %s && claude --resume %s" % (ticket["workdir"], ticket["session_id"])
