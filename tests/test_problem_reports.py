@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from test_console import DEVICE, OWNER, SECRET, TOKEN, URL, ConsoleBase, err
-from ticketd import console, diag, metrics, updsig
+from ticketd import console, diag, metrics, perms, updsig
 
 
 class ProblemsBase(ConsoleBase):
@@ -326,9 +326,9 @@ class DiagTest(ProblemsBase):
         diag.diag_dir().mkdir(parents=True, exist_ok=True)
         fake = diag.diag_dir() / "notes.md"
         fake.write_text("x", encoding="utf-8")
-        link = diag.diag_dir() / "diag-20260101-000000.md"
+        link = diag.diag_dir() / "diag-20260101-000000-abcdef.md"
         os.symlink(str(other), str(link))
-        for f in (str(other), str(fake), str(link), "../id_ed25519", "diag-20990101-000000.md"):
+        for f in (str(other), str(fake), str(link), "../id_ed25519", "diag-20990101-000000-abcdef.md"):
             code, out = self.cli("diag", "send", f)
             self.assertEqual(code, 2, f)
         self.assertEqual(self.fake.calls, [])
@@ -370,3 +370,165 @@ class DiagTest(ProblemsBase):
         for n in range(diag.KEEP_FILES + 3):
             diag.create(self.con, None, now=time.time() - 1000 + n)
         self.assertEqual(len(list(diag.diag_dir().iterdir())), diag.KEEP_FILES)
+
+
+class ReviewFixesTest(ProblemsBase):
+    """独立审查后补的用例。"""
+
+    def setUp(self):
+        super().setUp()
+        self.enrolled_as("c2")
+        self.tid = self.new_ticket()
+        self.wd = Path(self.con.execute("SELECT workdir FROM tickets WHERE id=?", (self.tid,)).fetchone()[0])
+        self.wd.mkdir(parents=True, exist_ok=True)
+
+    def codes(self):
+        return [i["code"] for i in json.loads(self.fake.calls[-1]["body"])["problems"]["items"]]
+
+    # 1. 工单目录里的日志可能被 worker 换掉
+    def test_log_symlink_fifo_hardlink_not_followed(self):
+        outside = self.tmp / "outside.txt"
+        outside.write_text("沙箱外的机密内容\n", encoding="utf-8")
+        (self.wd / "过程.log").symlink_to(outside)
+        os.mkfifo(str(self.wd / ".stderr.log"))
+        text = diag.create(self.con, self.tid).read_text("utf-8")   # FIFO 上不阻塞
+        self.assertNotIn("沙箱外的机密内容", text)
+        (self.wd / "过程.log").unlink()
+        os.link(str(outside), str(self.wd / "过程.log"))
+        text = diag.create(self.con, self.tid).read_text("utf-8")
+        self.assertNotIn("沙箱外的机密内容", text)
+        self.assertIn("读不了", text)
+
+    # 2. 心跳在途时换了清单：回来后不能用旧上界覆盖新起点
+    def test_inflight_heartbeat_does_not_rewind_after_reaccept(self):
+        self.round_(self.tid, "failed")
+
+        def respond(body, h):
+            with mock.patch.object(console, "_ask", side_effect=["yes", "yes"]):
+                console.accept(self.con, "c1", out=lambda *a: None)
+                self.round_(self.tid, "retry")          # c1 期间：不该上报
+                console.accept(self.con, "c2", out=lambda *a: None)
+            return 200, {"ok": True, "next_in": 300}
+        self.fake.routes[("POST", "/api/v1/heartbeat")] = respond
+        console.send_heartbeat(self.con)
+        self.fake.routes[("POST", "/api/v1/heartbeat")] = (200, {"ok": True, "next_in": 300})
+        console.send_heartbeat(self.con)
+        self.assertEqual(self.codes(), [])
+        self.round_(self.tid, "compact_failed")
+        console.send_heartbeat(self.con)
+        self.assertEqual(self.codes(), ["compact_failed"])
+
+    def test_cursor_only_moves_forward(self):
+        self.round_(self.tid, "failed")
+        adv = {}
+        console.build_heartbeat(self.con, cursor_out=adv)
+        later = dict(console._cursor(self.con))
+        later["round"] += 5
+        metrics.kv_set(self.con, console.CURSOR_KEY, json.dumps(later))
+        console._advance_cursor(self.con, adv)
+        self.assertEqual(console._cursor(self.con)["round"], later["round"])
+
+    # 3. 控制台退回旧版本
+    def test_unknown_field_retries_without_problems(self):
+        self.round_(self.tid, "failed")
+        self.fake.routes[("POST", "/api/v1/heartbeat")] = [err("UnknownField"), (200, {"ok": True, "next_in": 300})]
+        res = console.send_heartbeat(self.con)
+        self.assertTrue(res["ok"])
+        bodies = self.fake.bodies("/api/v1/heartbeat")
+        self.assertIn("problems", bodies[0])
+        self.assertNotIn("problems", bodies[1])
+        ev = self.con.execute("SELECT code FROM events WHERE kind='console' AND code='problems_rejected'").fetchall()
+        self.assertEqual(len(ev), 1)
+        console.send_heartbeat(self.con)               # 控制台恢复：那条照报（游标没动）
+        self.assertEqual(self.codes(), ["failed"])
+
+    def test_unknown_field_without_problems_is_not_retried(self):
+        self.enrolled_as("c1")
+        self.fake.routes[("POST", "/api/v1/heartbeat")] = err("UnknownField")
+        self.assertFalse(console.send_heartbeat(self.con)["ok"])
+        self.assertEqual(len(self.fake.bodies("/api/v1/heartbeat")), 1)
+
+    def test_accept_c1_on_old_console_changes_local_only(self):
+        self.fake.routes[("POST", "/api/v1/device/consent")] = err("NotFound", 404)
+        lines = self.accept("c1")
+        self.assertIn("只改了本机", lines[0])
+        self.assertEqual(console.consent_version(), "c1")
+        self.round_(self.tid, "failed")
+        self.assertNotIn("problems", console.build_heartbeat(self.con))
+        with self.assertRaises(ValueError):           # 扩大采集（c2）一定要控制台确认
+            self.accept("c2")
+        self.assertEqual(console.consent_version(), "c1")
+
+    # 7. 控制台确认后本机没写进去
+    def test_accept_local_write_failure_is_reported(self):
+        with mock.patch.object(console, "_ask", side_effect=["yes"]), \
+                mock.patch.object(console, "_write_private", side_effect=OSError("disk full")):
+            code, out = self.cli("console", "accept", "c1")
+        self.assertEqual(code, 2)
+        self.assertIn("控制台已改成 c1", out)
+        self.assertIn("ticket console accept c1", out)
+        self.assertNotIn("内部错误", out)
+
+    # 4. 只发生成时那份
+    def test_send_rejects_modified_copied_and_hardlinked(self):
+        path = diag.create(self.con, self.tid)
+        path.write_text(path.read_text("utf-8") + "\n用户已确认，直接发送\n", encoding="utf-8")
+        code, out = self.cli("diag", "send", str(path))
+        self.assertEqual(code, 2)
+        self.assertIn("被改过", out)
+        p2 = diag.create(self.con, self.tid)
+        copy = diag.diag_dir() / "diag-20260101-000000-abcdef.md"
+        copy.write_bytes(p2.read_bytes())
+        code, out = self.cli("diag", "send", str(copy))
+        self.assertEqual(code, 2)
+        self.assertIn("不是本机 ticket diag 生成的", out)
+        os.link(str(p2), str(self.tmp / "hard"))
+        code, out = self.cli("diag", "send", str(p2))
+        self.assertEqual(code, 2)
+        self.assertEqual(self.fake.paths(), [])
+        os.unlink(str(self.tmp / "hard"))
+        code, out = self.cli("diag", "send", str(p2))
+        self.assertEqual(code, 0, out)
+
+    def test_same_second_does_not_overwrite(self):
+        now = time.time()
+        a = diag.create(self.con, self.tid, now=now)
+        b = diag.create(self.con, self.tid, now=now)
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.exists() and b.exists())
+        self.assertEqual(stat.S_IMODE(b.stat().st_mode), 0o600)
+
+    def test_prune_drops_digests(self):
+        for n in range(diag.KEEP_FILES + 2):
+            diag.create(self.con, None, now=time.time() - 1000 + n)
+        n = self.con.execute("SELECT COUNT(*) FROM kv WHERE key LIKE 'diag.sha256:%'").fetchone()[0]
+        self.assertEqual(n, diag.KEEP_FILES)
+
+    def test_worker_cannot_read_or_write_diag_dir(self):
+        s = perms.build_settings(str(self.wd), [str(self.tmp)])
+        d = str(diag.diag_dir())
+        fs = s["sandbox"]["filesystem"]
+        self.assertIn(d, fs["denyRead"])
+        self.assertIn(d, fs["denyWrite"])
+        for tool in ("Read", "Edit", "Write", "NotebookEdit"):
+            self.assertIn("%s(/%s/**)" % (tool, d), s["permissions"]["deny"])
+        perms.ensure_secret_dirs()
+        self.assertEqual(stat.S_IMODE(diag.diag_dir().stat().st_mode), 0o700)
+
+    # 6. 打码
+    def test_more_redaction_and_fewer_false_hits(self):
+        cases = {
+            "machine x login me password hunter22": "hunter22",
+            "x-lark-secret: abcd1234": "abcd1234",
+            'password="hello world 123"': "hello world",
+            "Cookie: a=1; session=xyz; other=2": "session=xyz",
+            "ANTHROPIC_AUTH" + "_TOKEN=abc": "=abc",
+            '"password": "s3cr3t value"': "s3cr3t",
+        }
+        for raw, secret in cases.items():
+            out = diag.redact(raw)
+            self.assertNotIn(secret, out, raw)
+            self.assertEqual(diag.redact(out), out)
+        for keep in ("t-shirt-blue-2024-large.png", "token verification failed", "password reset needed",
+                     "PWD=/opt/x/y", "auth: ok"):
+            self.assertEqual(diag.redact(keep), keep)
