@@ -1,6 +1,6 @@
 # Changelog
 
-## 未发布
+## 0.3.5 — 2026-11-22
 
 - 控制台下发技能：入网的机器上，控制台可以按人给 worker 下发技能和它要用的凭据（团队内部工具开给指定的人用）。随心跳检查（摘要变了才领），装在 `~/.ticketd/skills/`，只给 Claude worker 以 `--plugin-dir` 加载，用户自己的 Claude Code 会话不加载；worker 能读不能写。控制台关掉开通、设备被吊销或退出、`ticket enroll --leave` 时本机删掉。`ticket console status` 列出装着的技能。旧版控制台不受影响。规格见 `docs/spec.md` §12「下发技能」。
 
