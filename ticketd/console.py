@@ -782,6 +782,8 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
         return {"sent": False, "ok": False, "code": "NotEnrolled", "next_in": None, "stopped": False}
     st = state(con)
     if st.startswith("stopped:"):
+        if skills.present():  # 停止时删失败过：每次都再试
+            _drop_skills(con)
         return {"sent": False, "ok": False, "code": st.split(":", 1)[1], "next_in": None, "stopped": True}
     if stopped_path().exists():  # 自动更新请求已经发现被吊销 / 退出：不再带令牌请求
         try:
@@ -890,7 +892,7 @@ class Heartbeat:
         now = self.clock()
         if not enrolled():
             self.next_at = None
-            if skills.state() is not None:  # 本机不再入网（手工删了控制台目录等）：下发的技能跟着删
+            if skills.present():  # 本机不再入网（手工删了控制台目录等）：下发的技能跟着删
                 try:
                     skills.remove()
                 except OSError:

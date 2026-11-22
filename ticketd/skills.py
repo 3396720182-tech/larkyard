@@ -5,16 +5,18 @@
 
 - 技能内容（名字 + 全部文件）要有发布者的签名：和版本包同一把 main 公钥（入网时按指纹信任的那把）、命名空间
   `larkyard-skill`，控制台只分发、改不了内容（凭据是数据，不签）。验不过整批不装。
-- 装在 `$TICKETD_HOME/skills/`，整个目录是一个 Claude Code 插件（`.claude-plugin/plugin.json`，插件名 larkyard）；
-  Claude worker 每轮以 `--plugin-dir` 加载，技能名带 `larkyard:` 前缀。用户自己的 Claude Code 会话、bridge 的主会话
-  都不加载它。worker 的沙箱能读这里（技能脚本要读凭据），不能写。
-- 布局：`skills/<名字>/…`（技能文件，644）、`secrets/<名字>/<键>`（凭据，目录 700、文件 600）、`state.json`（摘要）。
-  技能脚本按「本技能目录往上两级的 secrets/<名字>/」找自己的凭据。
+- 装在 `$TICKETD_HOME/skills/current/`，这个目录是一个 Claude Code 插件（`.claude-plugin/plugin.json`，插件名
+  larkyard）；Claude worker 每轮以 `--plugin-dir` 加载，技能名带 `larkyard:` 前缀。用户自己的 Claude Code 会话、bridge
+  的主会话都不加载它。worker 的沙箱能读 `$TICKETD_HOME/skills/`（技能脚本要读凭据），不能写。
+- 外层的 `skills/` 一直留着、只在里面换：Linux 的 bubblewrap 把只读绑定挂在目录上，换掉 `skills/` 本身的话，
+  正在跑的 worker 看到的新目录就没有只读保护了。
+- 布局（在 `current/` 里）：`skills/<名字>/…`（技能文件，644）、`secrets/<名字>/<键>`（凭据，目录 700、文件 600）、
+  `state.json`（摘要）。技能脚本按「本技能目录往上两级的 secrets/<名字>/」找自己的凭据。
 
 什么时候变：
 - 心跳成功时，响应里的 `skills` 是控制台算的摘要；和 `state.json` 里的不同，才 `GET /api/v1/skills` 领全部内容，
-  整个目录换成新的（先在旁边写好，再两次 rename）。列表为空也照样换：只剩 `state.json`，worker 不再加载插件。
-- 设备被吊销 / 已退出 / 控制台不认识（心跳停止）、`ticket enroll --leave`、本机不再入网：删掉整个目录。
+  `current/` 换成新的（先在旁边写好，再两次 rename）。列表为空也照样换：只剩 `state.json`，worker 不再加载插件。
+- 设备被吊销 / 已退出 / 控制台不认识（心跳停止）、`ticket enroll --leave`、本机不再入网：删掉 `skills/` 里的全部内容。
 - 控制台的心跳响应里没有 `skills`（旧版控制台）、摘要格式不对、领取失败、内容不合规：本机不动，下次心跳再说。
 """
 from __future__ import annotations
@@ -50,11 +52,17 @@ class Invalid(ValueError):
 
 
 def root() -> Path:
+    """worker 只读的外层目录（perms.readonly_dirs）。一直留着，只换里面的 current/。"""
     return config.home() / "skills"
 
 
+def current() -> Path:
+    """装着的那一套：插件目录。"""
+    return root() / "current"
+
+
 def _state_path() -> Path:
-    return root() / "state.json"
+    return current() / "state.json"
 
 
 def state() -> Optional[dict]:
@@ -75,7 +83,7 @@ def installed() -> List[str]:
 
 def plugin_dir() -> Optional[str]:
     """worker 要加载的插件目录；没装任何技能时为 None（不加 --plugin-dir）。"""
-    r = root()
+    r = current()
     if installed() and (r / ".claude-plugin" / "plugin.json").is_file():
         return str(r)
     return None
@@ -149,21 +157,30 @@ def _write(path: Path, data: bytes, mode: int) -> None:
 
 
 def _leftovers() -> list:
-    home = config.home()
+    """换到一半崩掉留下的 .new-* / .old-*（里面可能有凭据）。"""
     try:
-        return [p for p in home.iterdir() if p.name.startswith(("skills.new-", "skills.old-"))]
+        return [p for p in root().iterdir() if p.name.startswith((".new-", ".old-"))]
     except OSError:
         return []
 
 
+def present() -> bool:
+    """本机有没有下发的东西（装着的、或者换到一半留下的）。只建了空的 skills/ 不算。"""
+    c = current()
+    return c.exists() or c.is_symlink() or bool(_leftovers())
+
+
 def install(digest: str, skills: list, now: Optional[float] = None) -> None:
-    """把整套内容写到旁边的新目录，再换掉 skills/。中途失败时旧的保持不动；换的那一下崩了，下次心跳重新领。"""
+    """把整套内容写到 skills/ 里的新目录，再换掉 current/。中途失败时旧的保持不动；换的那一下崩了，下次心跳重新领。"""
     now = time.time() if now is None else now
-    home = config.home()
+    r = root()
+    if r.is_symlink():
+        r.unlink()
+    r.mkdir(0o755, parents=True, exist_ok=True)
     for p in _leftovers():
         shutil.rmtree(str(p), ignore_errors=True)
     tag = "%d-%d" % (os.getpid(), int(now * 1000) % 10 ** 9)
-    new = home / ("skills.new-" + tag)
+    new = r / (".new-" + tag)
     os.makedirs(str(new), 0o755)
     try:
         if skills:
@@ -188,13 +205,13 @@ def install(digest: str, skills: list, now: Optional[float] = None) -> None:
         st = {"digest": digest, "skills": [s["name"] for s in skills],
               "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
         _write(new / "state.json", (json.dumps(st, ensure_ascii=False, indent=2) + "\n").encode("utf-8"), 0o644)
-        r = root()
-        old = home / ("skills.old-" + tag)
-        if r.is_symlink():
-            r.unlink()
-        elif r.exists():
-            os.rename(str(r), str(old))
-        os.rename(str(new), str(r))
+        c = current()
+        old = r / (".old-" + tag)
+        if c.is_symlink():
+            c.unlink()
+        elif c.exists():
+            os.rename(str(c), str(old))
+        os.rename(str(new), str(c))
     except BaseException:
         shutil.rmtree(str(new), ignore_errors=True)
         raise
@@ -202,17 +219,21 @@ def install(digest: str, skills: list, now: Optional[float] = None) -> None:
 
 
 def remove() -> bool:
-    """删掉下发的全部技能和凭据。返回本来有没有。删不掉抛 OSError。"""
+    """删掉下发的全部技能和凭据（外层 skills/ 留着，见模块说明）。返回本来有没有。删不掉抛 OSError。"""
     r = root()
-    had = r.exists() or r.is_symlink()
     if r.is_symlink():
         r.unlink()
+        return True
+    had = present()
+    c = current()
+    if c.is_symlink():
+        c.unlink()
     else:
-        shutil.rmtree(str(r), ignore_errors=True)
+        shutil.rmtree(str(c), ignore_errors=True)
     for p in _leftovers():
         shutil.rmtree(str(p), ignore_errors=True)
-    if r.exists():
-        raise OSError("删不掉 %s" % r)
+    if present():
+        raise OSError("删不掉 %s 里的内容" % r)
     return had
 
 

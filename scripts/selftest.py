@@ -2,12 +2,14 @@
 """端到端自检：在临时目录里起一个 ticketd 调度器，用真实的 claude 和真实的沙箱跑几条关键路径，不碰飞书。
 
 用法：
-    /usr/bin/python3 scripts/selftest.py [--model haiku] [--only sandbox,secrets,ticket,run,stall] [--keep]
+    /usr/bin/python3 scripts/selftest.py [--model haiku] [--only sandbox,secrets,skills,ticket,run,stall] [--keep]
 
 - sandbox：Claude Code 沙箱的语义还和 spec 写的一样吗（默认拒绝本机网络 / unix socket；
   allowLocalBinding、allowUnixSockets 能分别放开）。升级 Claude Code 之后先跑这一项。
 - secrets：控制台目录（设备令牌）worker 读不到、写不了：Bash 子进程和内置 Read / Grep 都拒，授权了上级目录也一样；
   同一个 TICKETD_HOME 里控制台目录以外的文件照常能读（对照）。改了沙箱设置后跑这一项。
+- skills：控制台下发的技能（spec §12「下发技能」）worker 以 --plugin-dir 加载得到（larkyard: 前缀），技能脚本读得到
+  自己的凭据，但写不了下发目录（授权了上级目录也一样）。
 - ticket：一张普通的单能跑完一轮、交 ready，成本落库。
 - run：worker 用 --run 申请沙箱外执行 → 批准 → ticketd 在沙箱外执行 → 输出交回 worker → worker 交 ready。
 - stall：worker 卡在一条不耗 CPU 的命令上 → ticketd 结束这条命令 → worker 收到报错后交汇报。
@@ -213,6 +215,60 @@ def test_secrets(claude, model, tmp: Path):
           "令牌出现在输出里" if leaked else ("" if plain in out else "对照文件也没读到，结果不可信：%s" % out[-200:]))
 
 
+# ---------- 下发技能 ----------
+SKILL_PROBE = r'''
+import os
+here = os.path.dirname(os.path.abspath(__file__))
+root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+def t(name, f):
+    try:
+        print(name, "OK" if f() else "EMPTY")
+    except Exception as e:
+        print(name, "DENIED" if isinstance(e, PermissionError) else "ERR %s" % type(e).__name__)
+def write(p):
+    def f():
+        with open(p, "w") as fh:
+            fh.write("x")
+        return True
+    return f
+t("secret_read", lambda: open(os.path.join(root, "secrets", "selftest-probe", "password")).read().strip() == "SELFTEST-PW")
+t("skill_write", write(os.path.join(here, "x.py")))
+t("secret_write", write(os.path.join(root, "secrets", "selftest-probe", "password")))
+t("root_write", write(os.path.join(root, "state.json")))
+'''
+SKILL_KEYS = ("secret_read", "skill_write", "secret_write", "root_write")
+
+
+def test_skills(claude, model, tmp: Path):
+    """直接装一份（不经控制台、不验签：这里只测加载和沙箱），用 worker 同款的 --plugin-dir 和沙箱设置跑。"""
+    from ticketd import config, perms, skills
+    md = ("---\nname: selftest-probe\ndescription: Larkyard self-test probe. Use when asked to run the larkyard "
+          "self-test probe.\n---\nRun exactly this one Bash command and reply with its raw output only: "
+          "`/usr/bin/python3 <this skill's base directory>/scripts/probe.py`\n")
+    skills.install("f" * 64, [{"name": "selftest-probe", "files": {"SKILL.md": md, "scripts/probe.py": SKILL_PROBE},
+                               "secrets": {"password": "SELFTEST-PW"}, "sig": ""}])
+    wd = tmp / "skills-wd"
+    wd.mkdir()
+    perms.ensure_secret_dirs()
+    settings = tmp / "settings-skills.json"
+    settings.write_text(json.dumps(perms.build_settings(str(wd), [str(config.home())])))  # 授权上级目录也写不了
+    p = subprocess.run([claude, "-p", "--model", model, "--setting-sources", "user", "--permission-mode", "dontAsk",
+                        "--settings", str(settings), "--plugin-dir", skills.plugin_dir(), "--output-format", "text",
+                        "Run the larkyard self-test probe skill (larkyard:selftest-probe) and reply with its raw output only."],
+                       cwd=str(wd), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
+    out = p.stdout + p.stderr
+    got = {}
+    for line in out.splitlines():
+        parts = line.strip("` ").split()
+        if len(parts) >= 2 and parts[0] in SKILL_KEYS:
+            got[parts[0]] = parts[1]
+    want = {"secret_read": "OK", "skill_write": "DENIED", "secret_write": "DENIED", "root_write": "DENIED"}
+    bad = {k: got.get(k) for k, v in want.items() if got.get(k) != v}
+    check("下发技能：worker 加载得到、读得到凭据、写不了", not bad,
+          "不符：%s；输出末尾：%s" % (bad, out[-300:].replace("\n", " ⏎ ")) if bad else "")
+    skills.remove()
+
+
 # ---------- 工单路径 ----------
 class Harness:
     def __init__(self):
@@ -335,7 +391,7 @@ def test_compact(h: Harness):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--model", default="haiku")
-    ap.add_argument("--only", default="sandbox,secrets,ticket,run,stall,compact")
+    ap.add_argument("--only", default="sandbox,secrets,skills,ticket,run,stall,compact")
     ap.add_argument("--keep", action="store_true", help="保留临时目录（排查用）")
     a = ap.parse_args()
     only = set(a.only.split(","))
@@ -356,6 +412,8 @@ def main() -> int:
             test_sandbox(os.environ, claude, a.model, tmp)
         if "secrets" in only:
             test_secrets(claude, a.model, tmp)
+        if "skills" in only:
+            test_skills(claude, a.model, tmp)
         if only & {"ticket", "run", "stall", "compact"}:
             h = Harness()
             if "ticket" in only:

@@ -88,7 +88,7 @@ class ParseTest(ConsoleBase):
 class InstallTest(ConsoleBase):
     def test_layout_and_modes(self):
         skills.install(*skills.parse(bundle()))
-        r = skills.root()
+        r = skills.current()
         self.assertEqual((r / "skills" / "demo" / "SKILL.md").read_text(), SKILL_MD)
         self.assertEqual((r / "skills" / "demo" / "scripts" / "run.py").read_text(), "print(1)\n")
         pw = r / "secrets" / "demo" / "password"
@@ -109,14 +109,14 @@ class InstallTest(ConsoleBase):
         b["skills"][0]["files"]["old.md"] = "旧"
         skills.install(*skills.parse(b))
         skills.install(*skills.parse(bundle(D2, "new-password")))
-        r = skills.root()
+        r = skills.current()
         self.assertFalse((r / "skills" / "demo" / "old.md").exists())
         self.assertEqual((r / "secrets" / "demo" / "password").read_text(), "new-password\n")
         skills.install(DE, [])
         self.assertEqual(sorted(p.name for p in r.iterdir()), ["state.json"])
+        self.assertEqual([p.name for p in skills.root().iterdir()], ["current"])
         self.assertEqual(skills.state()["digest"], DE)
         self.assertIsNone(skills.plugin_dir())
-        self.assertEqual([p.name for p in r.parent.iterdir() if p.name.startswith("skills.")], [])
 
     def test_failure_keeps_old(self):
         skills.install(*skills.parse(bundle()))
@@ -124,19 +124,21 @@ class InstallTest(ConsoleBase):
             with self.assertRaises(OSError):
                 skills.install(*skills.parse(bundle(D2, "x-password")))
         self.assertEqual(skills.state()["digest"], D1)
-        self.assertEqual((skills.root() / "secrets" / "demo" / "password").read_text(), "pw-0123456789\n")
-        self.assertEqual([p.name for p in skills.root().parent.iterdir() if p.name.startswith("skills.")], [])
+        self.assertEqual((skills.current() / "secrets" / "demo" / "password").read_text(), "pw-0123456789\n")
+        self.assertEqual([p.name for p in skills.root().iterdir()], ["current"])  # 没留下 .new-* / .old-*
 
     def test_remove(self):
         self.assertFalse(skills.remove())
         skills.install(*skills.parse(bundle()))
         self.assertTrue(skills.remove())
-        self.assertFalse(skills.root().exists())
+        self.assertFalse(skills.present())
+        self.assertTrue(skills.root().is_dir())   # 外层留着：Linux 上正在跑的 worker 的只读绑定挂在它上面
         self.assertIsNone(skills.plugin_dir())
+        self.assertFalse(skills.remove())           # 只剩空的外层目录：不算有
 
     def test_broken_state_means_nothing_installed(self):
         skills.install(*skills.parse(bundle()))
-        (skills.root() / "state.json").write_text("{")
+        (skills.current() / "state.json").write_text("{")
         self.assertIsNone(skills.plugin_dir())
 
 
@@ -177,7 +179,7 @@ class SyncTest(ConsoleBase):
         self.fake.routes[("GET", skills.PATH)] = (200, {"digest": DE, "skills": []})
         self.beat()
         self.assertEqual(skills.installed(), [])
-        self.assertFalse((skills.root() / "secrets").exists())
+        self.assertFalse((skills.current() / "secrets").exists())
         self.assertIsNone(skills.plugin_dir())
         self.assertIn(("skills", "控制台下发的技能已全部删除（开通已关闭）"), self.events())
         self.fake.calls.clear()
@@ -219,7 +221,7 @@ class SyncTest(ConsoleBase):
             self.fake.routes[("GET", skills.PATH)] = (200, b)
             self.assertTrue(self.beat()["ok"])
             self.assertIsNone(skills.state())
-            self.assertFalse(skills.root().exists() and any(skills.root().iterdir()))
+            self.assertFalse(skills.present())
         self.assertIn("签名验不过", "\n".join(d for _, d in self.events()))
         self.fake.routes[("GET", skills.PATH)] = (200, bundle(key=self.k.main))
         self.beat()
@@ -234,33 +236,58 @@ class SyncTest(ConsoleBase):
         files = {"SKILL.md": SKILL_MD, "big.md": "x" * 200000}   # 大于心跳的 64KB 上限、小于领取上限
         self.fake.routes[("GET", skills.PATH)] = (200, bundle(key=self.k.main, files=files))
         self.beat()
-        self.assertEqual(len((skills.root() / "skills" / "demo" / "big.md").read_text()), 200000)
+        self.assertEqual(len((skills.current() / "skills" / "demo" / "big.md").read_text()), 200000)
 
     def test_device_revoked_removes(self):
         self.beat()
         self.fake.routes[("POST", "/api/v1/heartbeat")] = err("DeviceRevoked", 401)
         out = console.send_heartbeat(self.con)
         self.assertTrue(out["stopped"])
-        self.assertFalse(skills.root().exists())
+        self.assertFalse(skills.present())
         self.assertIn("下发的技能和凭据已删除", "\n".join(d for _, d in self.events()))
 
     def test_stopped_marker_from_update_removes(self):
         self.beat()
         console._write_private(console.stopped_path(), b"DeviceLeft\n")
         console.send_heartbeat(self.con)
-        self.assertFalse(skills.root().exists())
+        self.assertFalse(skills.present())
 
     def test_leave_removes(self):
         self.beat()
         lines = console.leave(self.con, out=self.say)
         self.assertIn("控制台下发的技能和凭据已删除", "\n".join(lines))
-        self.assertFalse(skills.root().exists())
+        self.assertFalse(skills.present())
+
+    def test_failed_remove_on_stop_is_retried(self):
+        self.beat()
+        self.fake.routes[("POST", "/api/v1/heartbeat")] = err("DeviceRevoked", 401)
+        with mock.patch.object(skills, "remove", side_effect=OSError("busy")):
+            console.send_heartbeat(self.con)
+        self.assertTrue(skills.present())
+        self.assertIn("skills_failed", [c for c, _ in self.events()])
+        n = len(self.fake.calls)
+        console.send_heartbeat(self.con)           # 已停止：不发请求，但再删一次
+        self.assertEqual(len(self.fake.calls), n)
+        self.assertFalse(skills.present())
+
+    def test_leave_without_skills_says_nothing_about_them(self):
+        perms.ensure_secret_dirs()                  # 每轮 worker 前都会建空的 skills/
+        lines = console.leave(self.con, out=self.say)
+        self.assertNotIn("下发的技能", "\n".join(lines))
+
+    def test_crash_leftovers_cleaned_after_unenroll(self):
+        self.beat()
+        os.rename(str(skills.current()), str(skills.root() / ".old-1-1"))   # 换到一半崩了
+        self.assertTrue(skills.present())
+        console.remove_local()
+        console.Heartbeat(clock=time.time).tick()
+        self.assertFalse(skills.present())
 
     def test_not_enrolled_anymore_removes_on_tick(self):
         self.beat()
         console.remove_local()
         console.Heartbeat(clock=time.time).tick()
-        self.assertFalse(skills.root().exists())
+        self.assertFalse(skills.present())
 
 
 class WorkerTest(ConsoleBase):
@@ -275,7 +302,7 @@ class WorkerTest(ConsoleBase):
         skills.install(*skills.parse(bundle()))
         cmd = executors.get("claude").build_command(t, [], "prompt")
         i = cmd.index("--plugin-dir")
-        self.assertEqual(cmd[i + 1], str(skills.root()))
+        self.assertEqual(cmd[i + 1], str(skills.current()))
         skills.install(DE, [])
         self.assertNotIn("--plugin-dir", executors.get("claude").build_command(t, [], "prompt"))
 

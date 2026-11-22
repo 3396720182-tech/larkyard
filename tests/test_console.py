@@ -42,7 +42,7 @@ class Keys:
 
     @classmethod
     def get(cls):
-        if cls.dir is None:
+        if cls.dir is None or not cls.dir.exists():  # 别的测试模块（test_skills）也用：上一个模块结束时删过
             cls.dir = Path(tempfile.mkdtemp(prefix="ticketd-console-keys-"))
             for n in ("main", "backup", "evil"):
                 setattr(cls, n, signing.keygen(cls.dir, n))
