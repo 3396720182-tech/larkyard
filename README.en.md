@@ -81,9 +81,15 @@ A few details about Codex workers:
 | One-line install | `install.sh`, `ticketd/bootstrap.py`, `ticketd/setup.py` | Check the release keys and signature → managed install → runtimes → the `ticket setup` wizard (QR app creation, workspace, services, owner detection) |
 | Signed self-update | `ticketd/update.py`, `ticketd/updsig.py`, `ticketd/launcher.py`, `scripts/release.py` | The publisher signs releases on their own machine; the daemon verifies and installs when idle; a launcher outside the version directories runs a probation period and switches back if the new version fails its self-check (off by default; on for one-line installs) |
 | Upgrading old installs | `ticketd/migrate.py`, `scripts/upgrade-offline.sh` | Turns an early or clone-based install into a managed install with the bundled bridge in one command; an offline upgrade bundle for when the release URL is unreachable |
-| Optional outbound connections | `ticketd/console.py`, `ticketd/telemetry.py`, `server/telemetry/` | Console enrollment (device status every 5 minutes after `ticket enroll`; the server is not in this repo) and anonymous usage statistics (Cloudflare Worker backend); both off by default and independent of each other |
+| Optional outbound connections | `ticketd/console.py`, `ticketd/skills.py`, `ticketd/telemetry.py`, `server/telemetry/` | Console enrollment (device status every 5 minutes after `ticket enroll`, plus per-person, publisher-signed skills for workers; the server is not in this repo) and anonymous usage statistics (Cloudflare Worker backend); both off by default and independent of each other |
 | Operational metrics | `ticketd/metrics.py` | Per-round cost, key events, `ticket stats`, the weekly digest DM, `ticket doctor` |
 | Design spec | `docs/spec.md`, `openspec/changes/` | Data model, permissions and sandbox, status cards, outbox, and the reason behind every change (Chinese); larger changes start as a proposal, specs and tasks under `openspec/changes/<name>/`, reviewed before code |
+
+**Overview** (green is installed on your machine, purple is optional and off by default, grey is external):
+
+![Larkyard architecture](docs/assets/architecture.en.png)
+
+The two text diagrams below show the same system in more detail.
 
 **Dispatch and delivery** (from one sentence in Feishu to a result card):
 
@@ -108,6 +114,7 @@ you ──Feishu──▶ lark-channel-bridge (bundled) ──▶ bridge session
 
 ```
 publisher's machine (private keys live only here)
+  skills: signed with the same main key (namespace larkyard-skill) → handed to the console for per-person delivery
   git tag ─▶ scripts/build_bridge.py (builds the bridge pinned in vendor/bridge.lock.json)
           ─▶ scripts/release.py release (package; main key signs canary / early / stable manifests)
           ─▶ release.py publish / publish-installer
@@ -122,9 +129,13 @@ publisher's machine (private keys live only here)
           └─▶ installed machine: ticketd checks hourly
                 verify signature and SHA-256 → switch current when idle → launcher probation (10 min default) → switch back on failure
                 the bridge is not restarted: a new bundled bridge goes live in the daily 04:07 window, rolled back if it can't reach Feishu in 90 s
+
+  enrolled machine (optional): ticketd sends the console a heartbeat every 5 minutes
+        skills digest changed → fetch → verify each against the trusted main key (one failure rejects the batch) → swap into ~/.ticketd/skills/current
+        → Claude workers load it with --plugin-dir each round, read-only; removed when the grant is turned off, the device is revoked or leaves the console
 ```
 
-Inside `~/.ticketd`: `app/versions/<version>/` (one directory per version), `app/current` (the one in use), `app/launcher.py` (outside the version directories), `bridge/current`, `runtime/node`, `bin/lark-cli`, `db/`, `logs/`, `config.env`.
+Inside `~/.ticketd`: `app/versions/<version>/` (one directory per version), `app/current` (the one in use), `app/launcher.py` (outside the version directories), `bridge/current`, `runtime/node`, `bin/lark-cli`, `db/`, `logs/`, `config.env`; once enrolled also `console/` (the device token, unreadable by workers) and `skills/` (skills delivered by the console).
 
 ## The conventions in short
 
@@ -280,6 +291,47 @@ Everything lives in `~/.ticketd/config.env` (environment variables of the same n
 | `TICKETD_MEDIA_VIDEO_WORKERS` | `1` | How many of those may be uploading video (limits bandwidth, memory and Feishu rate limits); capped at the value above |
 
 Install-time variables: `TICKETD_HOME` (default `~/.ticketd`), `TICKETD_LABEL` (default `dev.larkyard.ticketd`; the systemd unit name on Linux), `LARK_CHANNEL_HOME`, `LARK_CHANNEL_PROFILE`, `TICKETD_PYTHON` (Python interpreter, default `/usr/bin/python3`; `bin/ticket` and `bin/ticketd` honour it too; on Linux it is always written into the service environment, on macOS into the plist when set explicitly).
+
+## Self-update (off by default)
+
+A one-line install is already a managed install with self-update on (the update source is the URL you installed from); the three steps below are only for machines installed from a clone.
+
+Without configuration nothing happens: no requests, service templates and workspace untouched. Once on, the daemon checks the update source hourly, installs only releases signed by the publisher, installs when idle (no worker, no outside-sandbox script, no media upload), and if the new version fails its self-check within 10 minutes switches back to the previous one and DMs you. Spec: `docs/spec.md` §11 (Chinese).
+
+Enable it in your own terminal (workers can't: the commands refuse inside a worker, and the sandbox keeps `~/.ticketd` read-only for them):
+
+```bash
+# 1. Trust the publisher's two public keys. Get the fingerprints out of band (in person, by phone, another chat); mismatches are refused
+bin/ticket update trust --main main.pub --fingerprint SHA256:... --backup backup.pub --backup-fingerprint SHA256:...
+# 2. Become a managed install: versions live in ~/.ticketd/app/versions/<version>/, the service runs ~/.ticketd/app/current
+#    through a launcher outside the version directories, and the ticket path in the bridge workspace CLAUDE.md follows (backed up first)
+bin/ticket update adopt
+# 3. Set the update source in ~/.ticketd/config.env
+TICKETD_UPDATE_URL=https://updates.example.com/larkyard
+```
+
+Day to day: `ticket update status | check | hold [--days N] | resume | rollback`. Undo: `ticket update adopt --undo` (back to running the clone in place), then remove `TICKETD_UPDATE_URL`. If the daemon won't start at all: `ln -sfn versions/<old version> ~/.ticketd/app/current` and restart the service. Publishing (`scripts/release.py`, key rotation, rollback and pause manifests) is described in the Chinese README.
+
+## Console (off by default)
+
+An optional way for a team admin to see device status. **It turns on only after you run `ticket enroll` yourself in a terminal**: the repo contains no console URL and no setting or environment variable can set one; machines that never enrolled send nothing to a console. Spec: `docs/spec.md` §12 (Chinese).
+
+```bash
+# From the admin: console URL and enrollment code; the two release-key fingerprints match install.sh in this repo (check out of band)
+ticket enroll https://console.example.com LY-XXXX-XXXX-XXXX \
+    --release-key SHA256:<main key fingerprint> --backup-key SHA256:<backup key fingerprint> [--hostname <reported name>]
+```
+
+The command prints what will be collected and asks for `yes`, checks the console's release keys against your fingerprints, then the console DMs a 6-digit code to the person the enrollment code belongs to. `https://` only, certificates checked against the system CA, no way to skip verification; it refuses to run inside a worker, a pipe or a script.
+
+Once enrolled the daemon reports device status every 5 minutes (Larkyard version, OS, `ticket doctor` verdicts, running / queued ticket counts, self-update state; no ticket titles, words, artifacts, files, logs or cost). Without `TICKETD_UPDATE_URL`, updates come from the console.
+
+- `ticket console show`: print the next report without sending it; `ticket console status`: enrollment, last successful report, recent errors, installed skills
+- `ticket enroll --leave`: tell the console and delete the device token and console config (`~/.ticketd/console/`); trusted release keys stay
+- Revoked by an admin: reporting stops and `ticket doctor` says so; dispatching is unaffected
+- The console can deliver skills to workers per person (e.g. internal team tools): installed in `~/.ticketd/skills/`, loaded only by Larkyard's Claude workers, read-only for them, never loaded by your own Claude Code sessions; removed when the grant is turned off, the device is revoked or you leave
+- Every delivered skill must carry the publisher's signature (verified with the same main key trusted at enrollment); one failure rejects the whole batch, so the console can distribute skills but not change them. Older consoles send no skills and nothing changes
+- Workers can neither read nor write `~/.ticketd/console/`. Codex's sandbox can't block reads yet, so on an enrolled machine tickets routed to Codex won't start and suggest Claude Code or leaving the console instead
 
 ## Development
 
