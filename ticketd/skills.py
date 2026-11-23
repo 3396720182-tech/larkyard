@@ -33,10 +33,10 @@ from . import config, updsig
 
 PATH = "/api/v1/skills"
 PLUGIN = "larkyard"
-PULL_LIMIT = 1024 * 1024                      # 领取响应的上限
+PULL_LIMIT = 4 * 1024 * 1024                  # 领取响应的上限（0.3.7 起放大：gen-image 这类带整套脚本的技能）
 MAX_SKILLS = 8
 MAX_FILES = 64                                # 每个技能
-MAX_BYTES = 512 * 1024                        # 所有技能文件合计
+MAX_BYTES = 2 * 1024 * 1024                   # 所有技能文件合计（0.3.6 及以前是 512KB，控制台按旧上限发）
 MAX_SECRETS = 8                               # 每个技能
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")

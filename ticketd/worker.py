@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
-from . import config, safefs, templates
+from . import config, gateway, safefs, templates
 
 ASSIGNMENT = """# 工单 {id}：{title}
 
@@ -210,6 +210,9 @@ def worker_env(ticket) -> dict:
     env["TICKETD_TICKET"] = ticket["id"]
     env["TICKETD_SPOOL"] = str(Path(ticket["workdir"]) / ".reports")
     env["PATH"] = str(config.bin_dir()) + os.pathsep + env.get("PATH", "")
+    for name in (gateway.ENV_TOKEN, gateway.ENV_URL):
+        env.pop(name, None)  # 只认这一轮签的，不继承守护进程环境里的
+    env.update(gateway.worker_env(ticket["id"]))  # 生图网关的子令牌（spec §12），没入网 / 没领到时为空
     if executor_of(ticket) == "codex" and config.codex_home():
         env["CODEX_HOME"] = config.codex_home()
     return env

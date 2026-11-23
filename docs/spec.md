@@ -456,7 +456,7 @@ cp <工作区>/CLAUDE.md.bak-<时间> <工作区>/CLAUDE.md
 
 **凭据不进 worker**（2026-11-22，T0064 调整，原「已知限制」）：原来 worker 的沙箱只限制写、不限制读，被提示词注入的 worker 能读到 `~/.ticketd/console/device-token`；网关上线后，拿到设备令牌就能领网关令牌、用这台设备主人的额度。现在 Claude worker 对 `~/.ticketd/console/` 禁读禁写，入网的机器上不起 Codex worker（§6「凭据目录」）。规矩：
 - 设备令牌、网关令牌只放在 `console_dir()` 下，不进环境变量、命令行、工单目录和任何输出。
-- 客户端接网关时（另开单），网关令牌由 ticketd 代持；worker 每单只拿一个短时效、只对这一单有效的子令牌（由 ticketd 向控制台换取或自己签发，失效时间不超过单轮时长上限），worker 侧的生图工具只认子令牌。
+- 网关令牌由 ticketd 代持；worker 每单只拿一个短时效、只对这一单有效的子令牌（ticketd 自己签发，失效时间不超过单轮时长上限 + 10 分钟），worker 侧的生图工具只认子令牌。实现见下面「生图网关」（2026-11-23，T0078）。
 - 沙箱外执行（`--run`）的脚本不受这条限制：用户批准前要看脚本有没有读控制台目录。
 
 worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `enroll`（写不了 `~/.ticketd`，最后会失败）。启用条件（信任公钥、受管安装、验签工具）不变。
@@ -464,12 +464,18 @@ worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `e
 **下发技能**（2026-11-22，T0069）：入网的机器上，控制台可以按人给 worker 下发技能（Agent Skills 格式：目录 + `SKILL.md` + 可选脚本）和技能要用的凭据，用来把团队内部的工具（比如只在公司内网、只有一把共用口令的服务）开给指定的人。实现在 `ticketd/skills.py`，控制台一侧不在本仓库。
 - **只给 worker 用**：装在 `$TICKETD_HOME/skills/current/`，这个目录是一个 Claude Code 插件（`.claude-plugin/plugin.json`，插件名 `larkyard`），Claude worker 每轮以 `--plugin-dir` 加载（技能名带 `larkyard:` 前缀；没装任何技能时不加这个参数）。用户自己的 Claude Code 会话和 bridge 主会话不加载。worker 能读（技能脚本要读凭据），不能写：外层 `$TICKETD_HOME/skills/` 进沙箱的 `denyWrite` 和文件工具的 `Edit/Write/NotebookEdit` deny 规则，授权目录再宽也不放开（否则一张单能改掉别的单要加载的技能）；每轮写设置前先建好空目录（Linux 的 bubblewrap 只能遮住已存在的路径）；外层目录一直留着，换装和删除都只动里面的 `current/` 和临时的 `.new-*` / `.old-*`（bubblewrap 的只读绑定挂在目录上，换掉外层本身，正在跑的 worker 看到的新目录就没有只读保护了）。Codex worker 不加载（入网的机器上本来就不起 Codex）。
 - **布局**（`current/` 里）：`skills/<名字>/…`（644）、`secrets/<名字>/<键>`（目录 700、文件 600）、`state.json`（控制台给的摘要、技能名、更新时间）。技能脚本按「本技能目录往上两级的 `secrets/<名字>/`」找凭据。
-- **同步**：心跳成功时响应里多一个 `skills`（控制台算的 64 位十六进制摘要；`ok` / `next_in` 之外唯一会读的字段）。和 `state.json` 里的不同才 `GET /api/v1/skills`（设备令牌，响应上限 1MB），校验、验签后在外层目录里写好整套新的、两次 rename 换掉 `current/`；列表为空也照样换（只剩 `state.json`，不再加 `--plugin-dir`），所以没开通的机器只在第一次心跳后领一次。校验：最多 8 个技能、每个最多 64 个文件、合计 512KB，名字 `[a-z0-9-]`，路径每段不能以点开头、最多 4 层，凭据是可见 ASCII。
+- **同步**：心跳成功时响应里多一个 `skills`（控制台算的 64 位十六进制摘要；`ok` / `next_in` 之外唯一会读的字段）。和 `state.json` 里的不同才 `GET /api/v1/skills`（设备令牌，响应上限见下面「校验」），校验、验签后在外层目录里写好整套新的、两次 rename 换掉 `current/`；列表为空也照样换（只剩 `state.json`，不再加 `--plugin-dir`），所以没开通的机器只在第一次心跳后领一次。校验：最多 8 个技能、每个最多 64 个文件、合计 2MB（0.3.7 起，原来 512KB；响应上限 4MB，原来 1MB），名字 `[a-z0-9-]`，路径每段不能以点开头、最多 4 层，凭据是可见 ASCII。
 - **删除**：控制台给空列表；心跳被拒停止上报（吊销 / 退出 / 不认识，含自动更新发现的；删失败时之后每拍再试）；`ticket enroll --leave`；本机不再入网（手工删了控制台目录）时守护进程下一拍删掉（含换到一半留下的 `.new-*` / `.old-*`）。
 - **不动**：心跳响应里没有 `skills`（旧版控制台）或格式不对、领取失败、内容不合规、签名验不过、写盘失败：本机保持原样，记一条控制台事件（`skills_failed`），心跳结果不受影响。
 - **看得到**：`ticket console status` 列出装着的技能和更新时间；装上、删掉都记控制台事件。
 - **签名**：每个技能都要有发布者的签名，针对 `{"name", "files"}` 的确定性 JSON（`updsig.canonical`），用入网时按指纹信任的 main 发版公钥（`main.allowed_signers`，身份 `larkyard-release`）验，命名空间 `larkyard-skill`（版本清单的签名冒充不了技能）；有一个验不过整批不装，没有信任的公钥也不装。控制台只分发、改不了技能内容；凭据是数据，不签。
 - **信任边界**：被攻破的控制台能做的是：给开通的人换凭据、停发、或者重新下发以前签过的旧版本（签名里没有版本号，接受这个风险）；不能塞没签过的内容。所以技能脚本只从下发的凭据里读口令这类数据，不读会改变行为的配置（比如服务地址）。换 main 公钥（§11 换钥）后旧签名全部失效：发布者要用新钥重签，在那之前本机保留原来装的（含旧凭据）。只给 worker、不给用户自己的会话；采集清单不变（领取不上报任何新内容）。
+
+**生图网关**（2026-11-23，T0078）：入网的机器自动接控制台的模型网关（火山图片 / 视频模型，按人记额度），同事什么都不用做。实现在 `ticketd/gateway.py`；控制台一侧见 larkyard-console 的 openspec `add-genimage-gateway`。
+- **领网关令牌**：心跳成功后，本机没有网关令牌就凭设备令牌 `POST /api/v1/gateway-token`，把响应里的 `gateway_token`、`base_url`、`sub_id`、`sub_key` 存进 `console_dir()/gateway.json`（600，worker 禁读禁写）。没领到（旧版控制台 404、响应里没有 `sub_key`、网络问题、限流）时记控制台事件 `gateway_failed`，最多每小时再领一次（`kv console.gateway_claim_at`）。领到后每 6 小时用网关令牌 `GET /api/v1/gateway/me` 查一次：401（被管理员吊销、同一设备在别处重新领过、人员离职）就删掉，下次心跳马上重新领；其他错误不动。退出控制台时随控制台目录一起删；停止上报后不再签子令牌。
+- **子令牌**：worker 每轮启动时守护进程在本机签（不联网）：`lys_1.<sub_id>.<工单号>.<到期 Unix 秒>.<base64url(HMAC-SHA256(sub_key, 前面这一串))>`，到期 = 现在 + min(单轮时长上限 + 10 分钟, 12 小时)。放进 worker 的环境变量 `LARKYARD_GATEWAY_TOKEN`，网关地址放 `LARKYARD_GATEWAY_URL`（守护进程自己环境里的同名变量不继承）。控制台用令牌摘要和 server-hmac 推出同一把 `sub_key` 验签（库里不存钥匙），用量记到子令牌绑定的工单号；网关令牌失效时子令牌一起失效。子令牌不能提交导演组申请（申请流程已取消）。沙箱外执行的脚本拿不到子令牌。
+- **谁能用**：控制台「网关」页的导演组决定。gen-image（控制台对所有入网的人下发，见上面「下发技能」）看到子令牌就先查 `/api/v1/gateway/me`：在导演组走网关；不在导演组、但本机配了自己的火山 key 才用自己的；都没有回「还没开通生图，找管理员」。
+- **采集清单不变**：领令牌不上报新内容；走网关的调用是同事主动使用的服务，网关按人、按工单号记用量（T0060 起就是这样）。
 
 **出错记录和诊断包**（2026-11-23，T0073 调整）：行为以 `openspec/changes/add-console-problem-reports/` 为准。管理员要能看到「谁、哪台电脑、哪一步坏了」，但不碰同事的工作内容。
 - **清单 c2**：`console.CONSENTS` 里 c1、c2 并存（c1 文本和哈希不变）。新入网用 c2；本机 `console.json` 的 `consent_version` 决定心跳带不带出错记录。已入网的 c1 设备只有本人在终端执行 `ticket console accept`（打印全文 → `yes` → `POST /api/v1/device/consent`，控制台确认后才改本机）才升级；`ticket console accept c1` 改回。c1 设备的 `ticket console status` / `show` 提示怎么开启。

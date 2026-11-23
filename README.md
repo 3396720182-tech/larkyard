@@ -135,7 +135,7 @@ Codex worker 的几点细节：
         → Claude worker 每轮以 --plugin-dir 加载，能读不能写；关掉开通、设备被吊销或退出控制台时删掉
 ```
 
-本机的 `~/.ticketd` 里：`app/versions/<版本>/`（每个版本一个目录）、`app/current`（指向在用的版本）、`app/launcher.py`（启动器，不在版本目录里）、`bridge/current`、`runtime/node`、`bin/lark-cli`、`db/`、`logs/`、`config.env`；入网后还有 `console/`（设备令牌，worker 读不到）和 `skills/`（控制台下发的技能）。
+本机的 `~/.ticketd` 里：`app/versions/<版本>/`（每个版本一个目录）、`app/current`（指向在用的版本）、`app/launcher.py`（启动器，不在版本目录里）、`bridge/current`、`runtime/node`、`bin/lark-cli`、`db/`、`logs/`、`config.env`；入网后还有 `console/`（设备令牌、生图网关令牌，worker 读不到）和 `skills/`（控制台下发的技能）。
 
 ## 工作区约定的核心
 
@@ -355,6 +355,7 @@ ticket enroll https://console.example.com LY-XXXX-XXXX-XXXX \
 - 被管理员吊销后停止上报、`ticket doctor` 会提示，派单不受影响
 - 控制台可以按人给 worker 下发技能（比如团队内部工具）：装在 `~/.ticketd/skills/`，只有 Larkyard 的 Claude worker 加载、能读不能写，你自己的 Claude Code 会话不加载；关掉开通、设备被吊销或退出控制台后本机删掉。`ticket console status` 能看到装了哪些
 - 下发的技能必须有发布者的签名（和版本包同一把主公钥验，入网时按指纹信任的那把），有一个验不过整批不装：控制台只分发，改不了技能内容。旧版控制台不发技能，本机什么都不变。规格见 `docs/spec.md` §12「下发技能」
+- 生图网关：入网后守护进程自动领一枚网关令牌（存在 `console/`，worker 读不到），worker 每轮只拿到一枚只对这一单有效、这一轮结束就过期的子令牌（环境变量 `LARKYARD_GATEWAY_TOKEN`）。控制台下发的 gen-image 默认走网关：在导演组用导演组额度、用量记到人，不在导演组才用自己配的火山 key。规格见 `docs/spec.md` §12「生图网关」
 - worker 读不到也写不了 `~/.ticketd/console/`（设备令牌只在 worker 之外用）。Codex 的沙箱还禁不了读，所以入网的机器上派给 Codex 的单不会启动，会提示改用 Claude Code 或先退出控制台
 
 ## 开发

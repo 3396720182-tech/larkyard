@@ -23,7 +23,7 @@ from unittest import mock
 from helpers import REPO, TicketdTestCase
 import signing
 
-from ticketd import cli, config, console, core, db, host, metrics, telemetry, templates, update, updsig
+from ticketd import cli, config, console, core, db, gateway, host, metrics, telemetry, templates, update, updsig
 
 URL = "https://console.example.com"
 CODE = "LY-ABCD-EFGH-JKMN"
@@ -108,7 +108,9 @@ class ConsoleBase(TicketdTestCase):
         os.environ.pop("TICKETD_UPDATE_URL", None)
         self.fake = FakeConsole(self.k)
         self._patches = [mock.patch.object(console, "_open", self.fake),
-                         mock.patch.object(console, "_stdin_is_tty", return_value=True)]
+                         mock.patch.object(console, "_stdin_is_tty", return_value=True),
+                         # 心跳成功后领生图网关令牌：在 test_gateway 里单独测，其余用例不领（请求顺序不变）
+                         mock.patch.object(gateway, "ensure", return_value=None)]
         for p in self._patches:
             p.start()
         self.out = []

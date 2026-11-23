@@ -1055,6 +1055,7 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
                     "恢复上报" if st == "failing" else "开始上报", dedupe=False)
         metrics.kv_set(con, "console.state", "ok")
         _sync_skills(con, resp.get("skills"), token)
+        _sync_gateway(con, token, now)
     else:
         metrics.kv_set(con, "console.last_error", "%s 控制台没有确认这次上报" % updsig.iso(now))
     return {"sent": True, "ok": ok, "code": None, "next_in": next_in, "stopped": False}
@@ -1077,6 +1078,23 @@ def _sync_skills(con, remote, token: str) -> None:
         _event(con, "skills", "控制台下发的技能已全部删除（开通已关闭）", dedupe=False)
     elif what:
         _event(con, "skills", "已装上控制台下发的技能：%s" % what.split(":", 1)[1], dedupe=False)
+
+
+def _sync_gateway(con, token: str, now: float) -> None:
+    """心跳成功后：没有网关令牌就领，领到的定期查有没有被吊销（spec §12「生图网关」）。出错不影响这次心跳。"""
+    from . import gateway
+    try:
+        what = gateway.ensure(con, token, now)
+    except ConsoleError as e:
+        _event(con, "gateway_failed", "领生图网关令牌失败：%s" % e.text()[:200])
+        return
+    except Exception as e:  # noqa: BLE001
+        _event(con, "gateway_failed", "领生图网关令牌失败：%r" % (e,))
+        return
+    if what == "claimed":
+        _event(con, "gateway", "已领到生图网关令牌：worker 每轮拿只对这一单有效的子令牌", dedupe=False)
+    elif what == "dropped":
+        _event(con, "gateway", "生图网关令牌已被控制台作废，下次心跳重新领", dedupe=False)
 
 
 def _drop_skills(con) -> None:
@@ -1182,7 +1200,13 @@ def status_lines(con, now: Optional[float] = None) -> list:
             "入网时间：%s  同意的采集清单：%s" % (info.get("enrolled_at") or "—", info.get("consent_version") or "—"),
             "最后一次成功上报：%s" % _ts(last_ok_at(con)),
             "最近一次错误：%s" % (metrics.kv_get(con, "console.last_error") or "—"),
-            "控制台下发的技能：%s" % skills_text()] + ([consent_note(con)] if consent_note(con) else [])
+            "控制台下发的技能：%s" % skills_text(),
+            "生图网关：%s" % _gateway_text()] + ([consent_note(con)] if consent_note(con) else [])
+
+
+def _gateway_text() -> str:
+    from . import gateway
+    return gateway.status_text()
 
 
 def skills_text() -> str:
