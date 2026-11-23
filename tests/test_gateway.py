@@ -126,16 +126,30 @@ class GatewayTest(ConsoleBase):
         self.beat(t0 + 3700)
         self.assertIsNotNone(gateway.load())
 
-    def test_response_without_sub_key_not_saved(self):
+    def test_response_without_sub_key_not_saved_and_backs_off_a_day(self):
         self.fake.routes[("POST", gateway.CLAIM_PATH)] = (200, {"gateway_token": GTOK,
                                                                 "base_url": "https://console.example/api/v3"})
-        self.beat()
+        t0 = time.time()
+        self.beat(t0)
         self.assertIsNone(gateway.load())
         self.assertFalse(gateway.path().exists())
+        self.fake.calls.clear()
+        self.beat(t0 + 3 * 3600)
+        self.assertEqual(self.fake.paths(), ["/api/v1/heartbeat"])   # 旧版控制台：一天才再领一次
+        self.beat(t0 + 86400 + 1)
+        self.assertEqual(self.fake.paths()[-1], gateway.CLAIM_PATH)
+
+    def test_leave_during_claim_leaves_nothing(self):
+        def leave_then_answer(body, headers):
+            console.remove_local()
+            return (200, dict(CLAIM))
+        self.fake.routes[("POST", gateway.CLAIM_PATH)] = leave_then_answer
+        console.send_heartbeat(self.con)
+        self.assertFalse(console.console_dir().exists())
 
     def test_bad_response_not_saved(self):
         for bad in ({"base_url": "http://x/api/v3"}, {"sub_key": "short"}, {"sub_id": True}, {"gateway_token": "x"}):
-            self.con.execute("DELETE FROM kv WHERE key='console.gateway_claim_at'")
+            self.con.execute("DELETE FROM kv WHERE key=?", (gateway.NEXT_KEY,))
             self.fake.routes[("POST", gateway.CLAIM_PATH)] = (200, dict(CLAIM, **bad))
             self.beat()
             self.assertIsNone(gateway.load(), bad)
@@ -146,8 +160,8 @@ class GatewayTest(ConsoleBase):
         self.beat(t0)
         self.fake.routes[("GET", gateway.ME_PATH)] = (401, {"error": {"code": "GatewayUnauthorized"}})
         self.fake.calls.clear()
-        self.beat(t0 + 3600)
-        self.assertEqual(self.fake.paths(), ["/api/v1/heartbeat"])  # 不到 6 小时不查
+        self.beat(t0 + 600)
+        self.assertEqual(self.fake.paths(), ["/api/v1/heartbeat"])  # 不到一小时不查
         self.beat(t0 + gateway.CHECK_EVERY + 1)
         self.assertEqual(self.fake.paths()[-1], gateway.ME_PATH)
         self.assertEqual(self.fake.calls[-1]["headers"]["Authorization"], "Bearer " + GTOK)

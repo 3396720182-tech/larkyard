@@ -11,7 +11,7 @@ worker 每一轮启动时，守护进程用 sub_key 在本机给这一单签一�
 gen-image 等技能看到这两个变量就默认走网关（在导演组才能用，额度和用量按人记），见技能自己的说明。
 
 - 没领到（旧版控制台、网络问题、控制台限流）：不设这两个变量，下次心跳再领（最多每小时一次）。
-- 领到后每 6 小时用网关令牌查一次自己（GET /api/v1/gateway/me）：被吊销（401）就删掉，下次心跳重新领。
+- 领到后每小时用网关令牌查一次自己（GET /api/v1/gateway/me）：被吊销（401）就删掉，下次心跳重新领。
 - 退出控制台（--leave）、设备被吊销：控制台目录整个删掉 / 心跳停止，不再签子令牌。
 """
 from __future__ import annotations
@@ -31,12 +31,14 @@ from . import config, console, metrics
 CLAIM_PATH = "/api/v1/gateway-token"
 ME_PATH = "/api/v1/gateway/me"
 CLAIM_EVERY = 3600          # 没领到时最多每小时领一次（控制台限每台设备每小时 10 次）
-CHECK_EVERY = 6 * 3600      # 领到后多久查一次还有没有效
+CHECK_EVERY = 3600          # 领到后多久查一次还有没有效（被作废时，worker 最多这么久拿到的是失效的子令牌）
+OLD_CONSOLE_BACKOFF = 86400 # 旧版控制台（不给子令牌钥匙）一天才再试一次
 TTL_MARGIN = 600            # 子令牌比单轮时长上限多活一点（启动、收尾的时间）
 TTL_MAX = 12 * 3600         # 和控制台的 SUB_TTL_MAX 一致：再长控制台不认
 GW_TOKEN_RE = re.compile(r"^lyg_[A-Za-z0-9_-]{20,90}$")
 SUB_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 TICKET_RE = re.compile(r"^T[0-9]{1,6}$")
+NEXT_KEY = "console.gateway_claim_next"   # kv：没领到时，下一次最早什么时候再领
 ENV_TOKEN = "LARKYARD_GATEWAY_TOKEN"
 ENV_URL = "LARKYARD_GATEWAY_URL"
 
@@ -86,7 +88,8 @@ def claim(token: str, now: float) -> dict:
     obj["base_url"] = obj["base_url"].rstrip("/")
     if obj["sub_key"] is None:
         raise console.ConsoleError("BadResponse", "控制台版本太旧，领网关令牌时没给子令牌钥匙")
-    path().parent.mkdir(parents=True, exist_ok=True)
+    if not console.enrolled():   # 领的时候执行了 --leave：不重建控制台目录、不留令牌
+        raise console.ConsoleError("NotEnrolled", "领网关令牌期间本机退出了控制台")
     console._write_private(path(), (json.dumps(obj, sort_keys=True) + "\n").encode("utf-8"))
     if load() is None:
         remove()
@@ -95,19 +98,25 @@ def claim(token: str, now: float) -> dict:
 
 
 def ensure(con, token: str, now: Optional[float] = None) -> Optional[str]:
-    """心跳成功后调用：没领到就领（每小时最多一次），领到了每 6 小时查一次有没有被吊销。
+    """心跳成功后调用：没领到就领（每小时最多一次），领到了每小时查一次有没有被吊销。
     返回发生了什么："claimed" / "dropped"（被吊销，已删）/ None。网络和控制台的错误照样抛出（调用方记事件）。"""
     now = time.time() if now is None else now
     have = load()
     if have is None:
         try:
-            last = float(metrics.kv_get(con, "console.gateway_claim_at") or 0)
+            nxt = float(metrics.kv_get(con, NEXT_KEY) or 0)
         except ValueError:
-            last = 0.0
-        if 0 <= now - last < CLAIM_EVERY:
+            nxt = 0.0
+        if now < nxt <= now + OLD_CONSOLE_BACKOFF:   # 还没到下一次（比这还远说明时钟被拨过，不认）
             return None
-        metrics.kv_set(con, "console.gateway_claim_at", str(now))
-        claim(token, now)
+        metrics.kv_set(con, NEXT_KEY, str(now + CLAIM_EVERY))
+        try:
+            claim(token, now)
+        except console.ConsoleError as e:
+            if e.code == "BadResponse" and "版本太旧" in e.detail:
+                # 旧版控制台：每领一次都作废上一枚、多一条审计，退到一天一次
+                metrics.kv_set(con, NEXT_KEY, str(now + OLD_CONSOLE_BACKOFF))
+            raise
         return "claimed"
     if not 0 <= now - float(have.get("checked_at") or 0) < CHECK_EVERY:
         try:
@@ -115,7 +124,7 @@ def ensure(con, token: str, now: Optional[float] = None) -> Optional[str]:
         except console.ConsoleError as e:
             if e.status == 401:
                 remove()
-                metrics.kv_set(con, "console.gateway_claim_at", "0")  # 下次心跳马上重新领
+                metrics.kv_set(con, NEXT_KEY, "0")  # 下次心跳马上重新领
                 return "dropped"
             raise
         have["checked_at"] = now
