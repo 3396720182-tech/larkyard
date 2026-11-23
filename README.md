@@ -81,9 +81,15 @@ Codex worker 的几点细节：
 | 一行安装 | `install.sh`、`ticketd/bootstrap.py`、`ticketd/setup.py` | 核对发版公钥和签名 → 装成受管安装 → 装运行时 → `ticket setup` 向导（扫码建应用、工作区、服务、认主人） |
 | 签名自动更新 | `ticketd/update.py`、`ticketd/updsig.py`、`ticketd/launcher.py`、`scripts/release.py` | 发布者本机签名发版；守护进程验签、空闲时安装；版本目录外的启动器管试用期，新版本自检不过自动切回（默认关闭，一行安装的已启用） |
 | 升级旧安装 | `ticketd/migrate.py`、`scripts/upgrade-offline.sh` | 把早期版本或 clone 装的 Larkyard 一条命令转成受管安装 + 打包的 bridge；发布地址打不开时用离线升级包 |
-| 可选的对外连接 | `ticketd/console.py`、`ticketd/telemetry.py`、`server/telemetry/` | 控制台接入（入网后每 5 分钟上报设备状态，服务端不在本仓库）和匿名使用统计（后端是 Cloudflare Worker）；两者默认都关、彼此独立 |
+| 可选的对外连接 | `ticketd/console.py`、`ticketd/skills.py`、`ticketd/telemetry.py`、`server/telemetry/` | 控制台接入（入网后每 5 分钟上报设备状态，并可按人给 worker 下发发布者签过名的技能；服务端不在本仓库）和匿名使用统计（后端是 Cloudflare Worker）；两者默认都关、彼此独立 |
 | 运营指标 | `ticketd/metrics.py` | 每轮成本、关键事件、`ticket stats`、每周概况私信、`ticket doctor` 自检 |
 | 设计规格 | `docs/spec.md`、`openspec/changes/` | 数据模型、权限与沙箱、状态卡、发件箱等设计和每次调整的原因；大一点的变更先在 `openspec/changes/<名字>/` 写提案、规格和任务，审过再写代码 |
+
+**整体**（绿色是装在你电脑上的，紫色是可选、默认关的，灰色是外部服务）：
+
+![Larkyard 架构](docs/assets/architecture.png)
+
+下面两张字符图是同一套东西的细节。
 
 **派单和送达**（一张工单从你的一句话到结果卡）：
 
@@ -108,6 +114,7 @@ Codex worker 的几点细节：
 
 ```
 发布者的电脑（私钥只在这里）
+  技能：同一把主私钥签名（命名空间 larkyard-skill）→ 交给控制台按人分发
   git tag ─▶ scripts/build_bridge.py（按 vendor/bridge.lock.json 构建 bridge）
           ─▶ scripts/release.py release（打包，主私钥签 canary / early / stable 三份清单）
           ─▶ release.py publish / publish-installer
@@ -122,9 +129,13 @@ Codex worker 的几点细节：
           └─▶ 已装的机器：ticketd 每小时检查一次
                 验签、核对 SHA-256 → 空闲时切换 current → 启动器试用期（默认 10 分钟）→ 自检不过自动切回
                 bridge 不随之重启：新版本带的 bridge 在每天 04:07 的窗口换上，90 秒连不上飞书就切回
+
+  已入网的机器（可选）：ticketd 每 5 分钟向控制台报一次心跳
+        技能摘要变了 → 领取 → 用信任的主公钥逐个验签（有一个不过整批不装）→ 换到 ~/.ticketd/skills/current
+        → Claude worker 每轮以 --plugin-dir 加载，能读不能写；关掉开通、设备被吊销或退出控制台时删掉
 ```
 
-本机的 `~/.ticketd` 里：`app/versions/<版本>/`（每个版本一个目录）、`app/current`（指向在用的版本）、`app/launcher.py`（启动器，不在版本目录里）、`bridge/current`、`runtime/node`、`bin/lark-cli`、`db/`、`logs/`、`config.env`。
+本机的 `~/.ticketd` 里：`app/versions/<版本>/`（每个版本一个目录）、`app/current`（指向在用的版本）、`app/launcher.py`（启动器，不在版本目录里）、`bridge/current`、`runtime/node`、`bin/lark-cli`、`db/`、`logs/`、`config.env`；入网后还有 `console/`（设备令牌，worker 读不到）和 `skills/`（控制台下发的技能）。
 
 ## 工作区约定的核心
 
@@ -342,7 +353,8 @@ ticket enroll https://console.example.com LY-XXXX-XXXX-XXXX \
 - `ticket diag [工单号]`：在本机生成诊断包（版本、自检、最近的报错原文、工单的原话和过程日志末尾，密钥打码），只显示不发送；看过、确认后 `ticket diag send <文件> [--note 一句话]` 发给控制台管理员。在飞书里对 bot 说「把诊断包发给管理员」也走这两步
 - `ticket enroll --leave`：通知控制台并删除本机的设备令牌和控制台配置（`~/.ticketd/console/`）；信任的发版公钥保留
 - 被管理员吊销后停止上报、`ticket doctor` 会提示，派单不受影响
-- 控制台可以按人给 worker 下发技能（比如团队内部工具）：装在 `~/.ticketd/skills/`，只有 Larkyard 的 worker 加载、能读不能写，你自己的 Claude Code 会话不加载；关掉开通或退出控制台后本机删掉。`ticket console status` 能看到装了哪些
+- 控制台可以按人给 worker 下发技能（比如团队内部工具）：装在 `~/.ticketd/skills/`，只有 Larkyard 的 Claude worker 加载、能读不能写，你自己的 Claude Code 会话不加载；关掉开通、设备被吊销或退出控制台后本机删掉。`ticket console status` 能看到装了哪些
+- 下发的技能必须有发布者的签名（和版本包同一把主公钥验，入网时按指纹信任的那把），有一个验不过整批不装：控制台只分发，改不了技能内容。旧版控制台不发技能，本机什么都不变。规格见 `docs/spec.md` §12「下发技能」
 - worker 读不到也写不了 `~/.ticketd/console/`（设备令牌只在 worker 之外用）。Codex 的沙箱还禁不了读，所以入网的机器上派给 Codex 的单不会启动，会提示改用 Claude Code 或先退出控制台
 
 ## 开发
