@@ -410,37 +410,31 @@ def cmd_doctor(con, a) -> str:
 
 
 def _bridge_workspace() -> str:
-    """bridge 的默认工作目录：先看 TICKETD_WORKSPACE，再尽力读 bridge 的配置（只读；格式是上游的，读不懂就算了）。"""
-    ws = config.workspace()
-    if ws:
-        return os.path.expanduser(ws)
-    try:
-        import json
-        home = os.environ.get("LARK_CHANNEL_HOME") or os.path.expanduser("~/.lark-channel")
-        cfg = json.loads(Path(home, "config.json").read_text(encoding="utf-8"))
-        return cfg["profiles"][cfg["activeProfile"]]["workspaces"]["default"]
-    except Exception:
-        return ""
+    from . import workspace
+    return workspace.bridge_workspace()
 
 
 def _workspace_drift() -> list:
     """主会话约定（工作目录的 CLAUDE.md）是不是本仓库模板渲染出来的最新版（2026-11-08 发现线上那份停在 11-01）。"""
-    ws = _bridge_workspace()
-    if not ws:
-        return ["⚠️ 找不到 bridge 的工作目录，没检查主会话约定（可以在 config.env 里写 TICKETD_WORKSPACE=<目录>）"]
-    live = Path(ws) / "CLAUDE.md"
+    from . import workspace
     try:
-        from . import update
-        # 受管安装：主会话用的是 ~/.ticketd/app/current/bin/ticket（跟着版本走），不是某个版本目录
-        root = update.current_link() if update.is_managed() else config.REPO
-        want = (config.REPO / "workspace" / "CLAUDE.md.tmpl").read_text(encoding="utf-8").replace("@LARKYARD@", str(root))
-        have = live.read_text(encoding="utf-8")
-    except OSError as e:
-        return ["❌ 读不了主会话约定（%s）：%s" % (live, e)]
-    if have == want:
+        st, live = workspace.state(_bridge_workspace())
+    except (OSError, UnicodeDecodeError) as e:
+        return ["❌ 读不了主会话约定或模板（%s）：%s" % (Path(_bridge_workspace()) / "CLAUDE.md", e)]
+    if st == "nows":
+        return ["⚠️ 找不到 bridge 的工作目录，没检查主会话约定（可以在 config.env 里写 TICKETD_WORKSPACE=<目录>）"]
+    if st == "missing":
+        return ["❌ 读不了主会话约定（%s）：文件不存在" % live]
+    if st == "same":
         return ["✅ 主会话约定和本仓库的模板一致"]
+    if st == "old":
+        from . import update
+        if update.is_managed():
+            return ["⚠️ 主会话约定（%s）是没改过的旧版模板：守护进程下次启动时自动换成新版（先备份）" % live]
+        return ["⚠️ 主会话约定（%s）是没改过的旧版模板：执行 scripts/setup-workspace.sh %s --force 换成新版（会先备份）"
+                % (live, live.parent)]
     return ["❌ 主会话约定（%s）和本仓库的模板不一致，可能落后了：确认没有手改的内容后，执行 "
-            "scripts/setup-workspace.sh %s --force 同步（会先备份）" % (live, ws)]
+            "scripts/setup-workspace.sh %s --force 同步（会先备份）" % (live, live.parent)]
 
 
 def _doctor_dm(con, timeout: float = 45.0):

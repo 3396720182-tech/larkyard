@@ -263,6 +263,18 @@ def _beat() -> None:
         pass
 
 
+def _sync_workspace() -> None:
+    """启动时：主会话约定是没改过的旧版模板就换成本版（ticketd/workspace.py）。出什么错都不影响启动。"""
+    from . import workspace
+    try:
+        bak = workspace.sync()
+    except Exception as e:  # noqa: BLE001
+        print("ticketd: 主会话约定没同步：%r" % (e,), flush=True)
+        return
+    if bak:
+        print("ticketd: 主会话约定已换成本版模板（旧的备份在 %s）" % bak, flush=True)
+
+
 def main(argv=None) -> int:
     config.db_dir().mkdir(parents=True, exist_ok=True)
     lock_file = open(config.db_dir() / "daemon.lock", "w")  # 整个运行期间保持打开
@@ -286,6 +298,7 @@ def main(argv=None) -> int:
     media = MediaLane()
     updater = update.Updater(con)  # 没配置更新源时不发请求；切回后的私信、试用期确认在这里
     beat = console.Heartbeat()  # 没入网时只看一眼 ~/.ticketd/console/，不发请求；入网后每 5 分钟在后台线程报一次
+    _sync_workspace()
     print("ticketd started", flush=True)
     code = 0
     while not stop["flag"]:

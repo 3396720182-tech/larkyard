@@ -19,7 +19,7 @@ class TicketdTestCase(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="ticketd-test-")).resolve()
         self._saved_env = dict(os.environ)
         # 在 worker 里跑测试时会继承这两个变量：不清掉的话，测试里的 `ticket report` 会写进真实工单的待收件
-        for k in ("TICKETD_SPOOL", "TICKETD_TICKET"):
+        for k in ("TICKETD_SPOOL", "TICKETD_TICKET", "TICKETD_WORKSPACE"):  # 工作区：不碰真实的主会话约定
             os.environ.pop(k, None)
         os.environ.update({
             "TICKETD_HOME": str(self.tmp / "home"),

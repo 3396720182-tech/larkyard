@@ -546,4 +546,18 @@ worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `e
 
 **离线升级包**（0.3.2）：`release.py bundle --feed <更新源> --out <目录> [--channel stable] [--readme <文件>]…` 从更新源取一个通道当前的清单、签名、包，加上 `install.sh`、两把公钥、`feed/CHANNEL`（通道名）和入口 `upgrade.sh`（= `scripts/upgrade-offline.sh`），放进 `larkyard-<版本>-upgrade/` 和同名 zip（zip 里记 unix 权限位，解压后可执行位保留）。打包前核对：清单用 feed 里的 `keys/main.pub` 验签，包名合规，包的大小和摘要对得上清单，`install.sh` 内置的两个指纹就是这两把公钥的，`install.sh` 已填发布地址；写进升级包的就是核对过的那几份字节（不从更新源重读）；只打发版清单（回滚清单有有效期）；目标已存在、说明文件和升级包里的文件重名都拒绝，失败不留临时文件。`install.sh` 也在 zip 里，所以 zip 本身的完整性靠传递渠道（`bundle` 打印 zip 的 sha256），不另放 `install.sh.sha256`。`upgrade.sh` 不检查路径：`DIR` 用 `CDPATH='' cd -- … && pwd -P` 求出，通道取 `feed/CHANNEL`（不认识就用 stable），`exec /bin/sh "${DIR}/feed/install.sh" --from-dir "${DIR}/feed" --channel "${CHANNEL}" --upgrade-existing ${1+"$@"}`（`"${@}"` 在 bash 3.2 + `set -u` + 无参数时报 unbound variable）。`install.sh --from-dir <目录>`：找到 Python 之后用 `pathlib.Path(目录).resolve().as_uri()` 转成 `file://` 地址（整条路径按 RFC 3986 转义），不和 `--from` 一起用；`--from file://…` 保留原来只转空格的行为。`install.sh` 里的 shell 变量一律写 `${VAR}`（单引号里的 awk 字段、`"$@"` `$*` 除外）；内联的 Python（`-c`、`- <<PYEOF`）一律 `-I`，当前目录（比如「下载」）里的 `pathlib.py` / `json.py` 顶替不了标准库（`-m ticketd.*` 先 `cd` 进自己解出的临时目录）。测试 `tests/test_offline_upgrade.py`：升级包放在 `下载 含空格`、`a#b %20c?d`、`升级 包（副本）` 下，HOME 和 TMPDIR 也带空格，跑 `--dry-run`（没有旧服务、有旧克隆服务两种）、`--no-setup` 安装、无参数转发、当前目录里放了顶替标准库的模块、`early` 通道的升级包。
 
-**留着的**：主会话约定只改 `ticket` 路径，内容不和模板同步（手写的约定可能有私人内容；`ticket doctor` 会提示，由人决定是否 `setup-workspace.sh --force`）；Node 和 lark-cli 仍要在线下载；`--undo` 之后再迁移会重新认服务、重新备份。
+**留着的**：主会话约定只改 `ticket` 路径，内容不和模板同步（手写的约定可能有私人内容；`ticket doctor` 会提示，由人决定是否 `setup-workspace.sh --force`）——**调整（2026-11-26，T0084）见下面「主会话约定自动同步」**；Node 和 lark-cli 仍要在线下载；`--undo` 之后再迁移会重新认服务、重新备份。
+
+### 主会话约定自动同步（调整 2026-11-26，T0084）
+
+**为什么**：主会话约定只在装机时渲染一次，之后升级不变，模板里新加的规则到不了已经装好的电脑。实测 11-26：发布者自己的电脑停在 11-08 那一版，两位同事的主会话不知道「生图一律派单」，在自己的会话里跑生图工具，拿不到网关子令牌（§12 只发给工单），就回同事「这台电脑还没开通，找管理员加导演组」，还拿聊天里别的网关的令牌去试；同事已经在导演组，却一直出不了片。
+
+**怎么做**（`ticketd/workspace.py`）：守护进程每次启动（升级后由启动器拉起的那次也算）看一眼 bridge 工作目录的 `CLAUDE.md`：
+- 和本版模板渲染结果一致：不动。
+- 把根目录换回 `@LARKYARD@` 后，逐字等于 `workspace/CLAUDE.md.history` 里某一版发过的模板（sha256）：说明没人手改过，备份成 `CLAUDE.md.bak-<时间>`（`O_EXCL`、保留原权限），换成本版模板。根目录先试本机已知的（`current`、本仓库，路径里有空格也认得），再试从 `<根>/bin/ticket` 认出来的；换的时候沿用文件里原来的根目录（它的 `bin/ticket` 不在了才用 `current`），只换内容、不换主会话用的那份 `ticket`。根目录混着两种写法、是符号链接或硬链接、备份后文件又被改了（备份随之删掉）：不动。
+- 只在受管安装里做：开发时从克隆或 worktree 起的守护进程不碰真实的主会话约定（单测也清掉 `TICKETD_WORKSPACE`）。非受管时 doctor 提示用 `setup-workspace.sh --force`。
+- 其他（手改过、没有工作目录）：不动；`ticket doctor` 照旧提示（没改过的旧版提示「下次启动自动换」）。私人约定一直写在 `CLAUDE.local.md`，不受影响。
+- 改模板时把改之前那一版的摘要追加进 `CLAUDE.md.history`；`tests/test_workspace.py` 在完整克隆里核对每个提交过的模板都在里面。
+
+**模板这次加的规则**：生图、生视频、改图一律派单，不在主会话里先试；不说「没开通 / 找管理员」，不找 key、不试别的网关。gen-image 那边配合：不在工单里时报 `NotInTicket`（「这里不是 Larkyard 工单，要派单，不代表没开通」），探测命令不再去探模型。
+

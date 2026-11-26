@@ -1058,4 +1058,5 @@ class DoctorWorkspaceTest(TicketdTestCase):
         (ws / "CLAUDE.md").write_text(tmpl.replace("@LARKYARD@", str(update.current_link())), encoding="utf-8")
         with mock.patch.object(update, "is_managed", return_value=True):
             self.assertTrue(cli._workspace_drift()[0].startswith("✅"))
-        self.assertTrue(cli._workspace_drift()[0].startswith("❌"))
+        # 不是受管安装时根目录对不上：内容是没改过的模板，守护进程启动时会换成本仓库的路径（T0084）
+        self.assertTrue(cli._workspace_drift()[0].startswith("⚠️"))
