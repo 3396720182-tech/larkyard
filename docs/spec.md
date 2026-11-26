@@ -520,6 +520,8 @@ worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `e
 
 **调整（2026-11-21，T0054）**：bridge 服务环境里多一个 `LARKYARD_TICKET_BIN=~/.ticketd/app/current/bin/ticket`（跟着版本走的 `current`，和每天的重启任务用的是同一个路径）。fork 上的会议纪要卡片有「派成工单」按钮（`/meeting todo <存档号>#<序号>`，只有管理员能点），bridge 用它执行 `ticket new`；没有这个变量时 bridge 退回 PATH 上的 `ticket`，而服务的 PATH 里没有它。已装好的机器重新执行一次 `ticket setup`（服务定义变了才重新加载 bridge）或 `ticket bridge adopt` 之后生效。
 
+**调整（2026-11-27，T0093）**：锁文件换到 fork 上会议智能体可靠性第 1 批的提交。bridge 的 `<profile>/meeting-data/` 里多一个 `transcripts/`：每场会的全量逐字稿（字幕 + 会中弹幕，带发言人和时间），以前「不存字幕和弹幕原文」的约定改为默认存（`meeting.transcript.save: false` 关掉），原因是纪要只看最近 200 句、长会丢前半场，重启也会丢内容。和纪要存档一样不自动清理，保留期仍待定。入会时 bot 在会中聊天发一条说明（`meeting.announceOnJoin`）。Larkyard 这边只改锁文件，服务定义不变，不用重新 `ticket setup`；新 bridge 跟着版本更新，在每天的 bridge 重启窗口换上。
+
 **没实测的**（单测和临时 HOME 全流程只用了替身）：真实租户上的扫码建应用、bot 身份查应用所有者、真实 launchd 下的 bridge 重启和在线确认、Linux 上的整套服务。
 
 ## 14. 升级已有安装（2026-11-21，T0056）
