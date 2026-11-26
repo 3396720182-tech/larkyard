@@ -2,6 +2,6 @@
   "_comment": "打包进发版包的 lark-channel-bridge：来自 fork 的这个提交（scripts/build_bridge.py 按它构建，release.py 核对）。升级：fork 上 rebase 到上游新版本、跑测试，再改这里。",
   "repo": "https://github.com/3396720182-tech/lark-coding-agent-bridge.git",
   "branch": "larkyard/vendor",
-  "commit": "801d98f55912bbeba46439218b3a0b43d744db63",
+  "commit": "4bfae2644179025e14b60f62fc3c279e7cffc9cf",
   "version": "0.7.1"
 }
