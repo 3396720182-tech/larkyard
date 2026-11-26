@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
-from . import config, gateway, safefs, templates
+from . import config, gateway, host, safefs, templates
 
 ASSIGNMENT = """# 工单 {id}：{title}
 
@@ -215,7 +215,62 @@ def worker_env(ticket) -> dict:
     env.update(gateway.worker_env(ticket["id"]))  # 生图网关的子令牌（spec §12），没入网 / 没领到时为空
     if executor_of(ticket) == "codex" and config.codex_home():
         env["CODEX_HOME"] = config.codex_home()
+    if host.is_windows():
+        _windows_env(env, ticket)
     return env
+
+
+def _windows_env(env: dict, ticket) -> None:
+    """Windows 上 worker 的附加环境（spec §3.2）：
+    - Python（ticket 命令）输出 UTF-8，Git Bash 里中文不乱码；
+    - Claude：Bash 工具用 Git Bash（不是 System32 里的 WSL 入口）；关掉 PowerShell 工具（它不经过 shell 前缀，
+      等于绕开沙箱）；TICKETD_WIN_SANDBOX=srt 时用 CLAUDE_CODE_SHELL_PREFIX 把每条 Bash 命令套进 sandbox-runtime。"""
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    if executor_of(ticket) != "claude":
+        return
+    bash = host.git_bash()
+    if bash:
+        env["CLAUDE_CODE_GIT_BASH_PATH"] = bash
+        env["TICKETD_BASH"] = bash.replace("\\", "/")
+    env["CLAUDE_CODE_USE_POWERSHELL_TOOL"] = "0"
+    env.pop("CLAUDE_CODE_SHELL_PREFIX", None)
+    if config.win_sandbox() == "srt":
+        from . import perms
+        env["CLAUDE_CODE_SHELL_PREFIX"] = str(config.bin_dir() / "ticketd-wsandbox").replace("\\", "/")
+        env["TICKETD_SRT_SETTINGS"] = str(perms.srt_settings_path(ticket["id"])).replace("\\", "/")
+        env["TICKETD_SRT"] = (srt_path(env.get("PATH")) or config.srt_bin()).replace("\\", "/")
+        # 包装脚本把命令写在这里再交给 srt（srt-sandbox 账户要能读到，所以放在工单目录里）
+        env["TICKETD_SANDBOX_DIR"] = str(Path(ticket["workdir"]) / ".sandbox").replace("\\", "/")
+        # srt 只给命令一份干净的环境：这些变量由包装脚本带进去（ticket report、生图网关、用户白名单里的变量）
+        names = ["TICKETD_TICKET", "TICKETD_SPOOL", "TICKETD_PYTHON", "TICKETD_HOME", "PYTHONUTF8", "PYTHONIOENCODING",
+                 "LARK_CHANNEL", "LARK_CHANNEL_HOME", "LARK_CHANNEL_PROFILE", "LARK_CHANNEL_CONFIG",
+                 "LARKSUITE_CLI_CONFIG_DIR", gateway.ENV_TOKEN, gateway.ENV_URL] + list(config.worker_env_names())
+        env["TICKETD_SANDBOX_ENV"] = " ".join(n for n in dict.fromkeys(names) if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", n))
+
+
+def srt_path(path=None) -> str:
+    """sandbox-runtime 命令行的完整路径；找不到返回空串。"""
+    import shutil
+    b = config.srt_bin()
+    if os.path.dirname(b):
+        return b if os.path.isfile(b) else ""
+    return shutil.which(b, path=path) or ""
+
+
+def windows_preflight(ticket) -> None:
+    """Windows 上起 Claude worker 之前的检查：沙箱要用的东西不在就不起（和 macOS / Linux 的 failIfUnavailable
+    一样宁可不跑也不裸跑），报错原样进「无法启动 worker」的汇报，用户照着装好后回复「继续」。"""
+    if not host.is_windows() or executor_of(ticket) != "claude":
+        return
+    if not host.git_bash():
+        raise OSError("没找到 Git Bash：先装 Git for Windows（https://git-scm.com/download/win），"
+                      "或在 config.env 里设 CLAUDE_CODE_GIT_BASH_PATH")
+    if config.win_sandbox() == "srt" and not srt_path():
+        raise OSError("Windows 沙箱没装好：没找到 sandbox-runtime（srt）。执行 "
+                      "npm install -g @anthropic-ai/sandbox-runtime，再执行一次 npx @anthropic-ai/sandbox-runtime "
+                      "windows-install（会弹一次管理员确认）；"
+                      "确实不要沙箱时在 config.env 里写 TICKETD_WIN_SANDBOX=off")
 
 
 def executor_of(ticket) -> str:

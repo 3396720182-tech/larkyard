@@ -22,6 +22,8 @@ RUN_INTERRUPTED_TEXT = ("## 沙箱外执行结果（R%d）\n服务重启打断�
 
 
 def overlaps(a: str, b: str) -> bool:
+    if procs.host.is_windows():  # 盘符和路径不分大小写，分隔符两种都认
+        a, b = a.replace("\\", "/").lower(), b.replace("\\", "/").lower()
     a, b = a.rstrip("/"), b.rstrip("/")
     return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
@@ -35,19 +37,9 @@ def _pid_matches(pid: int, markers) -> bool:
 def _signal_group(proc_or_pid, sig: int, fallback: bool = True) -> None:
     """给 worker 的整个进程组发信号（worker 以 start_new_session 启动，组号即 pid）；失败时退回只发给该 pid。
     组长已退出时必须传 fallback=False：它的 pid 可能已被复用，只有 killpg 是安全的
-    （组里还有成员时组号不会被复用；没有成员时 killpg 报 ProcessLookupError，忽略即可）。"""
-    pid = getattr(proc_or_pid, "pid", proc_or_pid)
-    try:
-        os.killpg(pid, sig)
-        return
-    except (ProcessLookupError, PermissionError):
-        pass
-    if not fallback:
-        return
-    try:
-        os.kill(pid, sig)
-    except (ProcessLookupError, PermissionError):
-        pass
+    （组里还有成员时组号不会被复用；没有成员时 killpg 报 ProcessLookupError，忽略即可）。
+    Windows 上按作业结束整棵进程树（procs.signal_group）。"""
+    procs.signal_group(getattr(proc_or_pid, "pid", proc_or_pid), sig, fallback)
 
 
 def _short_join(descs) -> str:
@@ -68,7 +60,13 @@ def _sweep_orphans(spool: str, sig: int) -> int:
     macOS 15 起 ps -E 看不到系统自带程序（sh、sleep…）的环境变量，所以再按目录补一道：
     已被收养（macOS：launchd；Linux：PID 1 或 ticketd 的祖先，如 systemd --user）、没有控制终端、当前目录在工单目录内的进程也算残留
     （有终端的是用户自己的 shell / claude --resume，父进程还在的有正常的父进程，都不碰）。
-    进程怎么查见 procs.py。永不抛异常。"""
+    进程怎么查见 procs.py。永不抛异常。
+    Windows：worker 的子孙进程都在按汇报目录命名的作业里，直接结束这个作业（procs.kill_job）。"""
+    if procs.host.is_windows():
+        try:
+            return procs.kill_job(spool)
+        except Exception:
+            return 0
     try:
         targets, orphans = procs.scan(spool)
         if orphans:
@@ -207,6 +205,9 @@ class RunProc:
 
 
 def _bash() -> str:
+    if procs.host.is_windows():
+        # Windows：Git Bash（不是 System32 里那个 WSL 入口）；找不到时启动会失败并如实交代
+        return procs.host.git_bash() or "bash.exe"
     return "/bin/bash" if os.path.exists("/bin/bash") else "bash"
 
 
@@ -239,6 +240,7 @@ class Scheduler:
             alive = bool(run["pid"]) and not procs.is_gone(run["pid"]) and _pid_matches(run["pid"], ["R%d.sh" % run["id"]])
             if alive or exit_path.exists():
                 t = core.get(self.con, run["ticket_id"])
+                procs.adopt(run["pid"] or 0, str(config.runs_dir() / ("R%d.sh" % run["id"])))
                 rp = RunProc(AdoptedProc(run["pid"] or 0, exit_path), run["id"], run["ticket_id"], t["workdir"],
                              Path(t["workdir"]) / ("沙箱外执行-R%d.log" % run["id"]),
                              config.runs_dir() / ("R%d.sh" % run["id"]))
@@ -255,9 +257,9 @@ class Scheduler:
             if t["id"] in self.runs:
                 continue  # 状态是沙箱外执行占着的，不是 worker 被打断
             if t["pid"] and _pid_matches(t["pid"], executors.get(worker.executor_of(t)).pid_markers(t)):
-                _signal_group(t["pid"], signal.SIGKILL)
+                _signal_group(t["pid"], procs.SIGKILL)
                 _wait_exited(t["pid"])
-            _sweep_orphans(_spool_of(t["workdir"]), signal.SIGKILL)
+            _sweep_orphans(_spool_of(t["workdir"]), procs.SIGKILL)
             core.ingest_spool(self.con, t["id"], str(Path(t["workdir"]) / ".reports"))
             with db.tx(self.con):
                 core.touch(self.con, t["id"], state="idle", pid=None, bg_wait=None)
@@ -280,7 +282,7 @@ class Scheduler:
             try:
                 r.proc.wait(timeout=max(0.1, end - time.monotonic()))
             except subprocess.TimeoutExpired:
-                _signal_group(r.proc, signal.SIGKILL)
+                _signal_group(r.proc, procs.SIGKILL)
         self.running.clear()
 
     def tick(self) -> None:
@@ -345,8 +347,8 @@ class Scheduler:
             ferr = safefs.open_append(workdir / ".stderr.log")
             fds.append(ferr)
             so, eo = os.fstat(fout).st_size, os.fstat(ferr).st_size
-            proc = subprocess.Popen(worker.build_compact_command(t), cwd=str(workdir), stdin=subprocess.DEVNULL,
-                                    stdout=fout, stderr=ferr, env=worker.worker_env(t), start_new_session=True)
+            proc = procs.spawn(worker.build_compact_command(t), _spool_of(str(workdir)), cwd=str(workdir),
+                               stdin=subprocess.DEVNULL, stdout=fout, stderr=ferr, env=worker.worker_env(t))
         except Exception as e:
             # 压缩起不来就不压了，照常续做（ctx_tokens 清零，不会每个 tick 都再试）
             core.touch(self.con, tid, ctx_tokens=0)
@@ -406,8 +408,8 @@ class Scheduler:
             ferr = safefs.open_append(workdir / ".stderr.log")
             fds.append(ferr)
             so, eo = os.fstat(fout).st_size, os.fstat(ferr).st_size
-            proc = subprocess.Popen(cmd, cwd=str(workdir), stdin=fin, stdout=fout, stderr=ferr, env=env,
-                                    start_new_session=True)
+            proc = procs.spawn(cmd, _spool_of(str(workdir)), cwd=str(workdir), stdin=fin, stdout=fout, stderr=ferr,
+                               env=env)
         except Exception as e:
             self._start_failed(tid, str(workdir), e)
             return False
@@ -424,7 +426,7 @@ class Scheduler:
                            stall_alerted=0, bg_wait=None)
         except Exception as e:
             # 进程起来了但没记下来（如库被锁）：不能让它没人盯着跑，工单也不能卡在 running。杀掉，按没起来处理
-            _signal_group(proc, signal.SIGKILL)
+            _signal_group(proc, procs.SIGKILL)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -658,7 +660,8 @@ class Scheduler:
             d.mkdir(parents=True, exist_ok=True)
             os.chmod(str(d), 0o700)
             script_path = d / ("R%d.sh" % rid)
-            fd = os.open(str(script_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            fd = os.open(str(script_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+                         | getattr(os, "O_BINARY", 0), 0o600)
             try:
                 os.write(fd, run["script"].encode("utf-8"))
             finally:
@@ -671,9 +674,9 @@ class Scheduler:
                 exit_path.unlink()
             except OSError:
                 pass
-            proc = subprocess.Popen([_bash(), "-c", RUN_WRAPPER, "ticketd-run", str(script_path), str(exit_path)],
-                                    cwd=workdir, stdin=subprocess.DEVNULL, stdout=fout, stderr=subprocess.STDOUT,
-                                    env=env, start_new_session=True)
+            proc = procs.spawn([_bash(), "-c", RUN_WRAPPER, "ticketd-run", str(script_path), str(exit_path)],
+                               str(script_path), cwd=workdir, stdin=subprocess.DEVNULL, stdout=fout,
+                               stderr=subprocess.STDOUT, env=env)
         except Exception as e:
             with db.tx(self.con):
                 self.con.execute("UPDATE runs SET status='done', exit_code=-1, finished_at=? WHERE id=?",
@@ -703,10 +706,11 @@ class Scheduler:
                 rp.term_at = time.monotonic()
                 self.log(rp.workdir, "沙箱外执行 R%d %s" % (rp.run_id, rp.why))
             elif rp.term_at is not None and time.monotonic() - rp.term_at > 10:
-                _signal_group(rp.proc, signal.SIGKILL)
+                _signal_group(rp.proc, procs.SIGKILL)
             return
         del self.runs[tid]
         _signal_group(rp.proc.pid, signal.SIGTERM, fallback=False)  # 脚本留在进程组里的后台进程
+        procs.forget(rp.proc.pid)
         code = rp.proc.returncode
         took = time.monotonic() - rp.started
         tail = _read_from(rp.log_path, 0)
@@ -805,7 +809,7 @@ class Scheduler:
                 r.timed_out = True
                 self._terminate(r, "超时")
             elif r.term_at is not None and time.monotonic() - r.term_at > 10:
-                _signal_group(r.proc, signal.SIGKILL)
+                _signal_group(r.proc, procs.SIGKILL)
             return
         self._handle_events(r)
         self._flush_activity(r)
@@ -819,6 +823,7 @@ class Scheduler:
             swept = _sweep_orphans(_spool_of(core.get(self.con, tid)["workdir"]), signal.SIGTERM)
         except Exception:
             swept = 0
+        procs.forget(r.proc.pid)
         if swept:
             self.log(r.workdir, "清理残留进程 %d 个" % swept)
         try:

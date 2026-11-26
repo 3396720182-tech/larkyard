@@ -5,7 +5,8 @@
 #     已有 CLAUDE.md 时不覆盖，除非加 --force（会先备份为 CLAUDE.md.bak-<时间>）。
 #   - <工作区>/CLAUDE.local.md 不存在时，从 workspace/CLAUDE.local.example.md 复制一份；已存在则不动。
 set -eu
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# pwd -W：Windows 的 Git Bash 里给出 C:/Users/... 形式，Git Bash 和 Windows 程序（claude 的读写工具）都认；其他系统没有 -W
+REPO="$(cd "$(dirname "$0")/.." && { pwd -W 2>/dev/null || pwd; })"
 # 受管安装（ticket update adopt）：本脚本在 <app>/versions/<版本>/ 里，主会话要用跟着版本走的 <app>/current
 LARKYARD="$REPO"
 APPDIR="$(dirname "$(dirname "$REPO")")"

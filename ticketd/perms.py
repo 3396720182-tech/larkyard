@@ -22,6 +22,19 @@ DENY = [
 BASE_ALLOW = ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "Bash", "TodoWrite", "Agent"]
 
 
+def rule_paths(p: str) -> List[str]:
+    """权限规则里的路径写法（规则格式是 Tool(/<路径>/**)，路径自带开头的 "/"）。
+    Windows：Claude Code 先把路径规整成 POSIX 形式再匹配（C:\\Users\\a → /c/Users/a）；盘符大小写两种都写，
+    不赌匹配是否区分大小写。UNC 路径（\\\\srv\\share）写成 //srv/share。其他平台原样。"""
+    if not host.is_windows():
+        return [p]
+    q = p.replace("\\", "/")
+    if len(q) >= 2 and q[1] == ":" and q[0].isalpha():
+        rest = q[2:] if q[2:].startswith("/") else "/" + q[2:]
+        return ["/%s%s" % (q[0].lower(), rest.rstrip("/")), "/%s%s" % (q[0].upper(), rest.rstrip("/"))]
+    return [q.rstrip("/")]
+
+
 def writable_paths(workdir: str, grant_paths: List[str]) -> List[str]:
     return [str(Path(workdir).resolve())] + [str(Path(g).resolve()) for g in grant_paths]
 
@@ -74,16 +87,21 @@ def build_settings(workdir: str, grant_paths: List[str], net: Optional[dict] = N
     allow = list(BASE_ALLOW)
     for p in paths:
         # 规则格式是 Tool(//绝对路径/**)：p 自带开头的 "/"
-        allow += ["Edit(/%s/**)" % p, "Write(/%s/**)" % p, "NotebookEdit(/%s/**)" % p]
+        for r in rule_paths(p):
+            allow += ["Edit(/%s/**)" % r, "Write(/%s/**)" % r, "NotebookEdit(/%s/**)" % r]
     secrets = secret_dirs()
     # 内置文件工具（Read / Grep / Glob / Edit 等）按 permissions 拦，Bash 及其子进程按 sandbox 拦，两边都要写。
     # 写也禁：授权目录很宽（比如整个家目录）时，worker 也不能改 console.json 把令牌引到别的地址
     deny = list(DENY)
     for s in secrets:
-        deny += ["%s(/%s/**)" % (tool, s) for tool in ("Read", "Edit", "Write", "NotebookEdit")]
+        for r in rule_paths(s):
+            deny += ["%s(/%s/**)" % (tool, r) for tool in ("Read", "Edit", "Write", "NotebookEdit")]
     readonly = readonly_dirs()
     for s in readonly:
-        deny += ["%s(/%s/**)" % (tool, s) for tool in ("Edit", "Write", "NotebookEdit")]
+        for r in rule_paths(s):
+            deny += ["%s(/%s/**)" % (tool, r) for tool in ("Edit", "Write", "NotebookEdit")]
+    if host.is_windows():
+        return _windows_settings(allow, deny)
     sandbox_write = paths + [host.lark_cli_data_dir(), host.shared_tmp()]
     tmpdir = os.environ.get("TMPDIR")
     if tmpdir:
@@ -93,7 +111,7 @@ def build_settings(workdir: str, grant_paths: List[str], net: Optional[dict] = N
         sandbox_write.append(str(Path(lark_cfg).resolve()))
     sandbox_write = _existing_on_linux(sandbox_write, len(paths))
     network = {"allowedDomains": ["*"]}
-    if not host.is_linux():
+    if host.system() == "darwin":
         network["allowMachLookup"] = list(MACH_LOOKUP)
     # 用户逐单授权的本机网络 / unix socket（issue #20）。字段名和语义按 Claude Code 2.1.316 内置的沙箱规则核对过：
     # allowLocalBinding 一次放开本机 bind/listen 和连 localhost 的所有端口（不能按端口细分）；
@@ -117,10 +135,56 @@ def build_settings(workdir: str, grant_paths: List[str], net: Optional[dict] = N
     }
 
 
+def _windows_settings(allow: List[str], deny: List[str]) -> dict:
+    """Windows 上给 Claude worker 的设置（spec §3.2）。Claude Code 自带的沙箱不支持原生 Windows：开着它、
+    再加 failIfUnavailable 会让 Claude Code 直接起不来，不加则命令照样在沙箱外跑。所以这里关掉它，
+    Bash 命令的系统级边界改由 worker 环境里的 CLAUDE_CODE_SHELL_PREFIX 套上 sandbox-runtime（见 write_srt_settings、
+    bin/ticketd-wsandbox）。PowerShell 工具不经过 shell 前缀，一律禁用（worker 环境里也关掉了它）。"""
+    deny = list(deny) + ["PowerShell"]
+    return {
+        "permissions": {"allow": allow, "deny": deny},
+        "sandbox": {"enabled": False},
+    }
+
+
+def srt_settings(workdir: str, grant_paths: List[str], net: Optional[dict] = None) -> dict:
+    """Windows：sandbox-runtime（srt）的设置，和 macOS / Linux 上 Claude 沙箱的 allowWrite / denyRead / denyWrite 对齐。
+    临时目录不用写：srt 让命令以专用的 srt-sandbox 账户运行，它自己的 %TEMP% 本来就能写。
+    本机网络（allowLocalBinding）在 Windows 上是 srt 装机时的全机开关（--allow-loopback），不能按单放开，这里照写只是
+    表明意图；unix socket 在 Windows 上没有对应物。"""
+    paths = writable_paths(workdir, grant_paths)
+    allow_write = list(paths)
+    lark_cfg = os.environ.get("LARKSUITE_CLI_CONFIG_DIR")
+    if lark_cfg:
+        allow_write.append(str(Path(lark_cfg).resolve()))
+    secrets = secret_dirs()
+    network = {"allowedDomains": ["*"]}
+    if net and net.get("local"):
+        network["allowLocalBinding"] = True
+    return {
+        "network": network,
+        "filesystem": {"allowWrite": allow_write, "denyRead": list(secrets),
+                       "denyWrite": list(secrets) + readonly_dirs()},
+    }
+
+
+def srt_settings_path(ticket_id: str) -> Path:
+    return config.settings_dir() / ("%s.srt.json" % ticket_id)
+
+
+def write_srt_settings(ticket_id: str, workdir: str, grant_paths: List[str], net: Optional[dict] = None) -> Path:
+    ensure_secret_dirs()
+    p = srt_settings_path(ticket_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(srt_settings(workdir, grant_paths, net), ensure_ascii=False, indent=1),
+                 encoding="utf-8")
+    return p
+
+
 def codex_writable_roots(workdir: str, grant_paths: List[str]) -> List[str]:
     """Codex workspace-write 的可写根：和 Claude 沙箱的 allowWrite 对齐（/tmp、$TMPDIR 是 Codex 默认可写的）。"""
     paths = writable_paths(workdir, grant_paths)
-    roots = paths + [host.lark_cli_data_dir()]
+    roots = paths + [d for d in [host.lark_cli_data_dir()] if d]
     lark_cfg = os.environ.get("LARKSUITE_CLI_CONFIG_DIR")
     if lark_cfg:
         roots.append(str(Path(lark_cfg).resolve()))
@@ -172,4 +236,6 @@ def write_settings(ticket_id: str, workdir: str, grant_paths: List[str], net: Op
     p = d / ("%s.json" % ticket_id)
     p.write_text(json.dumps(build_settings(workdir, grant_paths, net), ensure_ascii=False, indent=1),
                  encoding="utf-8")
+    if host.is_windows():
+        write_srt_settings(ticket_id, workdir, grant_paths, net)
     return p

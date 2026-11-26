@@ -148,7 +148,7 @@ Inside `~/.ticketd`: `app/versions/<version>/` (one directory per version), `app
 
 ## Requirements
 
-- macOS, or Linux (including WSL2 on Windows). On macOS the daemon runs under launchd and workers in the Seatbelt sandbox; on Linux it runs as a systemd user service and workers in the bubblewrap sandbox, with the extra requirements under "Linux / WSL2" below. Native Windows is not supported; use WSL2
+- macOS, or Linux (including WSL2 on Windows). On macOS the daemon runs under launchd and workers in the Seatbelt sandbox; on Linux it runs as a systemd user service and workers in the bubblewrap sandbox, with the extra requirements under "Linux / WSL2" below. Native Windows (10 / 11) is covered under "Native Windows" below: installed from the repo, the service runs from Task Scheduler and worker Bash commands are isolated with Anthropic's sandbox-runtime (first version; no worker has run on a real machine yet)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart), logged in (tested with 2.1.300). Required: the bridge session and the default worker use it
 - Python 3.9+ (standard library only): `/usr/bin/python3` by default (on macOS run `xcode-select --install` if it is missing), or any interpreter set in `TICKETD_PYTHON`
 - `curl`, `tar`, `ssh-keygen` (part of the OS; used to verify signatures)
@@ -252,6 +252,32 @@ sudo loginctl enable-linger "$USER"
 - On Linux lark-cli uses no OS keychain: its credentials and master key are files in `~/.local/share/lark-cli`. ticketd adds that directory to the worker sandbox's writable paths (token refreshes write there).
 - On Linux the repo, home and `TICKETD_HOME` paths must not contain whitespace or `%` `$` `"` `\` (systemd units treat them specially); the install script refuses them.
 
+### Native Windows (first version)
+
+For machines where WSL2 is not allowed. Differences from macOS / Linux: you install from the repo (no one-line install, self-update or bundled bridge yet), Task Scheduler runs the service, and the worker sandbox is Anthropic's sandbox-runtime. Design and trade-offs: `docs/spec.md` §3.2.
+
+Prerequisites: Python 3.9+ (python.org build with the `py` launcher), [Git for Windows](https://git-scm.com/download/win) (Claude Code's Bash tool and workers use Git Bash), Node LTS, `npm install -g @larksuite/cli`, Claude Code (native installer, logged in), lark-channel-bridge (`npm install -g`, then `lark-channel-bridge service install`; it registers its own scheduled task on Windows).
+
+```powershell
+# Worker sandbox: sandbox-runtime (alpha on Windows). windows-install asks for admin once and creates a dedicated
+# srt-sandbox local account and egress firewall rules; without admin rights ask IT to run this step
+npm install -g @anthropic-ai/sandbox-runtime
+npx @anthropic-ai/sandbox-runtime windows-install
+
+git clone https://github.com/3396720182-tech/larkyard.git $HOME\larkyard
+cd $HOME\larkyard
+powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1   # first run creates ~/.ticketd/config.env; fill in TICKETD_OWNER and run again
+# Main-session rules: in Git Bash
+sh scripts/setup-workspace.sh <bridge workspace dir>
+lark-channel-bridge service restart   # so the main session picks up the new PATH (ticket)
+```
+
+- What install does: registers the scheduled task `dev.larkyard.ticketd` (at logon, no run-time limit, runs on battery), falling back to the Startup folder when policy forbids scheduled tasks; adds the repo's `bin` to the user PATH and sets `TICKETD_PYTHON`; the daemon's environment lives in `~/.ticketd/service.env`. Safe to re-run.
+- Manage: `py -3 -m ticketd.winsvc status|stop` (in the repo); start with `schtasks /Run /TN dev.larkyard.ticketd`; logs in `~/.ticketd/logs/`. Uninstall: `scripts\windows\uninstall.ps1` (data and ticket dirs are kept).
+- Update: `git pull`, then re-run `install.ps1`. `ticket update / setup / bridge / migrate` say they are not supported on Windows yet.
+- Worker sandbox: Claude Code's own sandbox does not run on native Windows, so Larkyard runs every worker Bash command through sandbox-runtime (dedicated account + write-restricted token + ACLs + egress fence); Claude's own file tools are still limited by permission rules, and the PowerShell tool is disabled. Without sandbox-runtime or Git Bash the worker does not start and the status card says how to install them; if you really want no sandbox, set `TICKETD_WIN_SANDBOX=off` in `config.env` (permission rules only, Bash commands are not contained). Codex tickets use Codex's own Windows sandbox (`TICKETD_CODEX_WIN_SANDBOX`).
+- Known differences: lark-cli doesn't work inside the worker sandbox (Windows lark-cli keeps credentials in the current user's registry, which the sandbox account can't read); "allow local network" requires installing sandbox-runtime with `--allow-loopback` (machine-wide), not per ticket; stopping a worker terminates it outright (Windows has no gentle termination signal), the session can still be resumed.
+
 **Check**: send the bot something that takes a few minutes. You should get the receipt, then a status card; `ticket ls` lists the ticket (with the one-line install, `ticket` is in `~/.ticketd/app/current/bin/`). Daemon logs are in `~/.ticketd/logs/`, bridge logs in `~/.lark-channel/profiles/<profile>/logs/`. `ticket bridge status` shows the bridge, Node and lark-cli in use.
 
 **Uninstall**: `scripts/uninstall.sh` (removes the launchd agent on macOS, stops and removes the systemd user service on Linux; data and ticket directories are kept); remove the bridge service with the bundled bridge (`~/.ticketd/runtime/node/bin/node ~/.ticketd/bridge/current/bin/lark-channel-bridge.mjs unregister`) and the `dev.larkyard.bridge-restart` job; restore the workspace `CLAUDE.md` from the backup made by `setup-workspace.sh`.
@@ -286,6 +312,9 @@ Everything lives in `~/.ticketd/config.env` (environment variables of the same n
 | `TICKETD_CODEX_MODEL` | empty | Codex worker model; empty means the default in `config.toml` |
 | `TICKETD_CODEX_HOME` | empty | Dedicated `CODEX_HOME` for ticketd (holds the anti-messaging execpolicy rules); empty means `~/.codex` and no rules are written |
 | `TICKETD_CODEX_GIT_WRITABLE` | `1` | Whether Codex workers may `git commit` in granted repos; `0` keeps Codex's built-in read-only `.git` protection |
+| `TICKETD_WIN_SANDBOX` | `srt` | Native Windows: isolate Claude workers' Bash commands with sandbox-runtime; `off` = no isolation (permission rules only) |
+| `TICKETD_SRT` | `srt` | Native Windows: the sandbox-runtime CLI (or its full path) |
+| `TICKETD_CODEX_WIN_SANDBOX` | `unelevated` | Native Windows: Codex's `[windows] sandbox` (`unelevated` / `elevated` / `mxc`) |
 | `TICKETD_VIDEO_FOLDER` | empty | Drive folder token that result videos are uploaded to; empty means the root of your Drive |
 | `TICKETD_MEDIA_WORKERS` | `2` | How many result cards the media lane prepares at once (image/video uploads, document imports, video messages); different tickets run in parallel, each ticket stays in order |
 | `TICKETD_MEDIA_VIDEO_WORKERS` | `1` | How many of those may be uploading video (limits bandwidth, memory and Feishu rate limits); capped at the value above |
@@ -351,7 +380,8 @@ bin/ticket doctor [--dm]                            # config check: environment 
 
 ## Known limitations
 
-- macOS and Linux (including WSL2); native Windows is not supported. A single owner.
+- macOS, Linux (including WSL2) and native Windows (first version). A single owner.
+- Native Windows has only unit tests and CI so far (windows-latest exercises job objects and the file APIs for real and installs the service once); no worker has run on a real machine yet: Claude Code's Bash tool under the sandbox-runtime wrapper, Codex's Windows sandbox and the bridge main session calling `ticket` from Git Bash still need measuring (`docs/spec.md` §3.2).
 - On Linux / WSL2 the only verification so far is the unit tests (mocking the platform) and CI (all unit tests plus a real systemd user-service install on ubuntu-latest); there has been no end-to-end run like on macOS (the sandbox findings in `docs/spec.md` §6 come from macOS). Not yet measured in particular: the read/write boundary of workers under Claude Code's and Codex's bubblewrap sandboxes, whether `.git` in granted repos is read-only under Codex (what `TICKETD_CODEX_GIT_WRITABLE` does on Linux), and read-only lark-cli calls inside the worker sandbox.
 - On Linux, commands in Claude Code's sandbox run in their own network namespace and can't reach services on the host's `localhost`; in WSL2 workers can't launch Windows programs (`cmd.exe`, exes under `/mnt/c/...`) by default either.
 - WSL2 may shut the whole distribution down some time after the last WSL terminal closes, taking ticketd and the bridge with it. To keep them running, keep a WSL terminal open or have Windows Task Scheduler start a long-running `wsl.exe` process at logon. This depends on the WSL version and has not been verified here.

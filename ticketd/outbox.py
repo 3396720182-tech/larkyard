@@ -11,7 +11,7 @@ import threading
 import time
 from typing import Optional, Tuple
 
-from . import config, core, db, safefs, templates
+from . import config, core, db, host, safefs, templates
 
 # 99992361 open_id cross app：收件人的 open_id 不属于发消息的这个应用（TICKETD_OWNER 配错），重试不会好
 PERMANENT_CODES = {230001, 230002, 230011, 230025, 99992361}
@@ -175,7 +175,10 @@ def _read_workdir_image(path: str, workdir: Optional[str]) -> bytes:
 
 
 def _fd_path(fd: int) -> Optional[str]:
-    """已打开文件的真实路径（macOS F_GETPATH / Linux /proc）；拿不到返回 None。"""
+    """已打开文件的真实路径（macOS F_GETPATH / Linux /proc / Windows GetFinalPathNameByHandle）；拿不到返回 None。"""
+    if host.is_windows():
+        from . import winapi
+        return winapi.final_path(fd)
     try:
         import fcntl
         if hasattr(fcntl, "F_GETPATH"):
@@ -497,7 +500,8 @@ def _find_url(obj) -> Optional[str]:
 def _lark_json(cmd, cwd: Optional[str] = None, timeout: float = 30) -> Tuple[bool, Optional[dict], str]:
     """跑 lark-cli，返回 (成功, data 字段, 失败信息)。"""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout, cwd=cwd)
+        p = subprocess.run(host.argv(cmd), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, cwd=cwd)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, None, "调用 lark-cli 失败：%s" % e
     data = _parse_json(p.stdout) or _parse_json(p.stderr)
@@ -558,7 +562,8 @@ def send_video(reply_to: str, video: str, workdir: Optional[str], idem: str) -> 
 
 def _run_lark(cmd, field: str = "message_id", cwd: Optional[str] = None, timeout: float = 30) -> Tuple[bool, str, bool]:
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout, cwd=cwd)
+        p = subprocess.run(host.argv(cmd), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, cwd=cwd)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, "调用 lark-cli 失败：%s" % e, False
     data = _parse_json(p.stdout) or _parse_json(p.stderr)

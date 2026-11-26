@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import List, Tuple
 
-from . import config, db, outbox
+from . import config, db, host, outbox
 
 DOC_TYPES = {".md": "docx", ".markdown": "docx", ".txt": "docx", ".docx": "docx",
              ".xlsx": "sheet", ".csv": "sheet", ".pptx": "slides"}
@@ -82,7 +82,8 @@ def _import(path: Path, name: str) -> str:
     cmd = [config.lark_bin(), "drive", "+import", "--as", "user", "--type", DOC_TYPES[path.suffix.lower()],
            "--file", path.name, "--name", name]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT, cwd=str(path.parent))
+        p = subprocess.run(host.argv(cmd), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=TIMEOUT, cwd=str(path.parent))
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError("调用 lark-cli 失败：%s" % e)
     data = outbox._parse_json(p.stdout) or outbox._parse_json(p.stderr) or {}
@@ -98,7 +99,8 @@ def _overwrite(path: Path, url: str) -> None:
     cmd = [config.lark_bin(), "docs", "+update", "--as", "user", "--doc", url, "--command", "overwrite",
            "--doc-format", "markdown", "--content", "@" + path.name]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT, cwd=str(path.parent))
+        p = subprocess.run(host.argv(cmd), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=TIMEOUT, cwd=str(path.parent))
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError("调用 lark-cli 失败：%s" % e)
     data = outbox._parse_json(p.stdout) or outbox._parse_json(p.stderr) or {}

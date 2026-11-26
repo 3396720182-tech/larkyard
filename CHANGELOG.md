@@ -1,5 +1,10 @@
 # Changelog
 
+## 未发布
+
+- 原生 Windows（10 / 11，第一版）：公司禁用 WSL2 时也能用。从仓库目录安装（`scripts\windows\install.ps1`），服务由计划任务托管（登录时启动、不限运行时长、用电池也跑；不让建计划任务时用「启动」文件夹），守护进程崩溃 10 秒后自动重拉。worker 和沙箱外执行各自在一个作业对象里，停止时整棵进程树一起结束。Claude worker 的每条 Bash 命令经 Anthropic 的 sandbox-runtime 隔离（要管理员装一次），读写工具照旧按权限规则拦，PowerShell 工具禁用；没装沙箱时 worker 不启动并说明怎么装。Codex 单用 Codex 自带的 Windows 沙箱。一行安装、自动更新、打包的 bridge 在 Windows 上还不支持。还没在真机上跑过 worker，见 README「原生 Windows」和 `docs/spec.md` §3.2。
+- 新配置：`TICKETD_WIN_SANDBOX`、`TICKETD_SRT`、`TICKETD_CODEX_WIN_SANDBOX`（只在 Windows 上生效）。
+
 ## 0.3.8 — 2026-11-26
 
 - 主会话约定跟着版本走：守护进程启动时，bridge 工作目录的 `CLAUDE.md` 如果是没改过的旧版模板（逐字等于发过的某一版），先备份成 `CLAUDE.md.bak-<时间>` 再换成本版；手改过的不动，`ticket doctor` 照旧提示。以前模板只在装机时写一次，之后的新规则到不了已经装好的电脑。规格见 `docs/spec.md` §14「主会话约定自动同步」。

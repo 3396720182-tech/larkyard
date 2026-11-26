@@ -176,8 +176,10 @@ class LauncherTest(ManagedBase):
 
     def test_launcher_imports_nothing_from_version_dirs(self):
         src = (REPO / "ticketd" / "launcher.py").read_text(encoding="utf-8")
-        imports = {l.split()[1].split(".")[0] for l in src.splitlines() if l.startswith(("import ", "from "))}
-        self.assertEqual(imports, {"fcntl", "json", "os", "signal", "sys", "time"})
+        imports = {l.split()[1].split(".")[0] for l in (x.strip() for x in src.splitlines())
+                   if l.startswith(("import ", "from "))}
+        # fcntl 在 macOS / Linux 上用，msvcrt 在 Windows 上用（只为模块能被导入，spec §3.2）
+        self.assertEqual(imports, {"fcntl", "json", "msvcrt", "os", "signal", "sys", "time"})
         self.assertNotIn("ticketd", imports)
 
     def test_crash_three_starts_rolls_back(self):

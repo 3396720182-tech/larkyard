@@ -148,7 +148,7 @@ Codex worker 的几点细节：
 
 ## 环境要求
 
-- macOS，或 Linux（含 Windows 上的 WSL2）。macOS 用 launchd 托管服务、用 Seatbelt 沙箱限制 worker；Linux 用 systemd 用户服务托管、用 bubblewrap 沙箱限制 worker，额外要求见下面的「Linux / WSL2」。原生 Windows 不支持，请用 WSL2
+- macOS，或 Linux（含 Windows 上的 WSL2）。macOS 用 launchd 托管服务、用 Seatbelt 沙箱限制 worker；Linux 用 systemd 用户服务托管、用 bubblewrap 沙箱限制 worker，额外要求见下面的「Linux / WSL2」。原生 Windows（10 / 11）见下面的「原生 Windows」：从仓库目录安装，计划任务托管服务，worker 的 Bash 命令用 Anthropic 的 sandbox-runtime 隔离（第一版，还没在真机上跑过 worker）
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart)（`claude` 已登录；在 2.1.300 上验证）：必需，主会话和默认 worker 都用它
 - Python 3.9+（只用标准库）：默认用 `/usr/bin/python3`（macOS 没有就 `xcode-select --install`），别的解释器用 `TICKETD_PYTHON` 指定
 - `curl`、`tar`、`ssh-keygen`（系统自带；验签用）
@@ -252,6 +252,32 @@ sudo loginctl enable-linger "$USER"
 - Linux 上 lark-cli 不用系统钥匙串，凭据和主密钥是 `~/.local/share/lark-cli` 里的文件；ticketd 已把这个目录放进 worker 沙箱的可写范围（令牌刷新要写）。
 - Linux 上本仓库、家目录、`TICKETD_HOME` 等路径里不能有空白和 `%` `$` `"` `\`（systemd unit 会把它们当成特殊字符），安装脚本遇到会拒绝。
 
+### 原生 Windows（第一版）
+
+公司禁用 WSL2 时用这个。和 macOS / Linux 的区别：从仓库目录安装（还不支持一行安装、自动更新和打包的 bridge），服务由计划任务托管，worker 沙箱换成 Anthropic 的 sandbox-runtime。设计和取舍见 `docs/spec.md` §3.2。
+
+先装好：Python 3.9+（[python.org](https://www.python.org/downloads/windows/) 版，带 `py` 启动器）、[Git for Windows](https://git-scm.com/download/win)（Claude Code 的 Bash 工具和 worker 都用 Git Bash）、Node LTS、`npm install -g @larksuite/cli`、Claude Code（原生安装版，`claude` 已登录）、lark-channel-bridge（`npm install -g` 后 `lark-channel-bridge service install`，它在 Windows 上自己注册计划任务）。
+
+```powershell
+# worker 沙箱：sandbox-runtime（Windows 版为 alpha）。windows-install 会弹一次管理员确认，
+# 建一个专用的 srt-sandbox 本地账户和出网防火墙规则；没有管理员权限就请 IT 代为执行这一步
+npm install -g @anthropic-ai/sandbox-runtime
+npx @anthropic-ai/sandbox-runtime windows-install
+
+git clone https://github.com/3396720182-tech/larkyard.git $HOME\larkyard
+cd $HOME\larkyard
+powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1   # 第一次会生成 ~/.ticketd/config.env，填好 TICKETD_OWNER 后再执行一次
+# 主会话约定：在 Git Bash 里执行
+sh scripts/setup-workspace.sh <bridge 的工作区目录>
+lark-channel-bridge service restart   # 让主会话用上新的 PATH（ticket 命令）
+```
+
+- 安装做了什么：注册计划任务 `dev.larkyard.ticketd`（登录时启动、不限运行时长、用电池也跑），公司策略不让建计划任务时改用「启动」文件夹；把仓库的 `bin` 加进用户 PATH、设 `TICKETD_PYTHON`；守护进程的环境写在 `~/.ticketd/service.env`。可重复执行。
+- 管理服务：`py -3 -m ticketd.winsvc status|stop`（在仓库目录里）；启动 `schtasks /Run /TN dev.larkyard.ticketd`；日志在 `~/.ticketd/logs/`。卸载：`scripts\windows\uninstall.ps1`（数据目录和工单目录保留）。
+- 更新：`git pull` 后重新执行 `install.ps1`。`ticket update / setup / bridge / migrate` 在 Windows 上会提示暂不支持。
+- worker 沙箱：Claude Code 自带的沙箱不支持原生 Windows，Larkyard 把 worker 的每条 Bash 命令经 sandbox-runtime 运行（专用账户 + 写受限令牌 + ACL + 出网围栏），Claude 自己的读写工具照旧按权限规则拦，PowerShell 工具禁用。没装 sandbox-runtime 或 Git Bash 时 worker 不会启动，状态卡上会说明怎么装；确实不要沙箱时在 `config.env` 写 `TICKETD_WIN_SANDBOX=off`（只剩权限规则，管不住 Bash 命令）。Codex 单用 Codex 自带的 Windows 沙箱（`TICKETD_CODEX_WIN_SANDBOX`）。
+- 已知差别：worker 沙箱里调不了 lark-cli（Windows 版 lark-cli 的凭据在当前用户的注册表里，沙箱账户读不到）；「放开本机网络」要在装 sandbox-runtime 时加 `--allow-loopback`（全机生效），不能按单放开；停止 worker 是直接结束进程（Windows 没有温和的终止信号），会话照常可续。
+
 **验证**：在飞书里给 bot 发一件要做几分钟的事。应该先收到开单回执，接着出现状态卡；在终端里 `ticket ls` 能看到这张单（一行安装的 `ticket` 在 `~/.ticketd/app/current/bin/`）。服务日志在 `~/.ticketd/logs/`，bridge 的在 `~/.lark-channel/profiles/<profile>/logs/`。
 
 **bridge**：`ticket bridge status` 看在用的 bridge、Node、lark-cli 版本和服务入口；Larkyard 自动更新只重启 ticketd，不打断主会话，新版本带的 bridge 在每天 04:07 的重启窗口换上（版本没变就不重启），急用可以 `ticket bridge restart`（会打断进行中的回复）。重启后 90 秒内没连上飞书会自动切回原来的 bridge 并私信你。
@@ -288,6 +314,9 @@ sudo loginctl enable-linger "$USER"
 | `TICKETD_CODEX_MODEL` | 空 | Codex worker 的模型，空为 `config.toml` 里的默认 |
 | `TICKETD_CODEX_HOME` | 空 | ticketd 专用的 `CODEX_HOME`（放防误发的 execpolicy 规则）；空则沿用 `~/.codex` 且不写规则 |
 | `TICKETD_CODEX_GIT_WRITABLE` | `1` | Codex worker 能否在授权仓库里 `git commit`；`0` = 保留 Codex 自带的 `.git` 只读保护 |
+| `TICKETD_WIN_SANDBOX` | `srt` | 原生 Windows：Claude worker 的 Bash 命令用 sandbox-runtime 隔离；`off` = 不隔离（只剩权限规则） |
+| `TICKETD_SRT` | `srt` | 原生 Windows：sandbox-runtime 命令行（或它的完整路径） |
+| `TICKETD_CODEX_WIN_SANDBOX` | `unelevated` | 原生 Windows：Codex 的 `[windows] sandbox`（`unelevated` / `elevated` / `mxc`） |
 | `TICKETD_VIDEO_FOLDER` | 空 | 结果里的视频传到你云空间的哪个文件夹（文件夹 token）；空为云空间根目录 |
 | `TICKETD_MEDIA_WORKERS` | `2` | 媒体通道最多同时准备几张结果卡（图片/视频上传、稿子导入、视频消息）；不同工单并行，同一工单仍按顺序 |
 | `TICKETD_MEDIA_VIDEO_WORKERS` | `1` | 其中最多几个在传视频（限制带宽、内存和飞书限流），不超过上一项 |
@@ -376,7 +405,8 @@ bin/ticket doctor [--dm]                            # 配置自检：和守护�
 
 ## 已知限制
 
-- 支持 macOS 和 Linux（含 WSL2），不支持原生 Windows；只服务一个主用户。
+- 支持 macOS、Linux（含 WSL2）和原生 Windows（第一版）；只服务一个主用户。
+- 原生 Windows 目前只有单测和 CI（windows-latest 上真调作业对象、文件接口，真装一次服务），还没在真机上跑过 worker：sandbox-runtime 包装下 Claude Code 的 Bash 工具、Codex 的 Windows 沙箱、bridge 主会话在 Git Bash 里调 `ticket` 都待实测（`docs/spec.md` §3.2）。
 - Linux / WSL2 上的验证目前只有单测（mock 平台分支）和 CI（ubuntu-latest 上跑全部单测、真装一次 systemd 用户服务），还没有像 macOS 那样端到端实测过（`docs/spec.md` §6 的沙箱结论来自 macOS）。尤其没实测：Claude Code / Codex 的 bubblewrap 沙箱下 worker 的读写边界、Codex 授权仓库里 `.git` 是否只读（`TICKETD_CODEX_GIT_WRITABLE` 在 Linux 上的效果）、worker 沙箱里 lark-cli 的只读操作。
 - Linux 上 Claude Code 沙箱里的命令在独立的网络命名空间里，连不到宿主机 `localhost` 上的服务；WSL2 里 worker 默认也调不了 Windows 程序（`cmd.exe`、`/mnt/c/...` 下的 exe）。
 - WSL2 可能在所有 WSL 终端都关掉一段时间后停掉整个发行版，ticketd 和 bridge 也随之停止；要常驻就保持一个 WSL 终端开着，或用 Windows 任务计划在登录时启动一个常驻的 `wsl.exe` 进程。这一条随 WSL 版本变化，本仓库没有验证。

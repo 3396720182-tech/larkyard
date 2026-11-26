@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import card, config, core, db, executors, metrics, safefs, templates, worker
+from . import card, config, core, db, executors, host, metrics, safefs, templates, worker
 
 HEARTBEAT_STALE = 60
 
@@ -596,6 +596,18 @@ COMMANDS = {
 }
 
 
+# 原生 Windows 第一版（spec §3.2）只支持从仓库目录安装（scripts\windows\install.ps1）：受管安装、自动更新、
+# 打包的 bridge 都靠符号链接和 launchd / systemd，还没做
+_WIN_UPDATE = "（原生 Windows 暂不支持：在仓库目录里 git pull，再运行 scripts\\windows\\install.ps1）"
+WINDOWS_UNSUPPORTED = {
+    "update": "ticket update" + _WIN_UPDATE,
+    "migrate": "ticket migrate" + _WIN_UPDATE,
+    "setup": "ticket setup（原生 Windows 暂不支持：bridge 用 npm 装、lark-channel-bridge service install 装成服务；"
+             "工作区约定用 Git Bash 执行 scripts/setup-workspace.sh <工作区目录>；ticketd 用 scripts\\windows\\install.ps1）",
+    "bridge": "ticket bridge（原生 Windows 暂不支持：bridge 自己管服务，用 lark-channel-bridge service status / restart）",
+}
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     con = None
@@ -613,6 +625,8 @@ def main(argv=None) -> int:
                 print("沙箱外执行的申请已登记（%s）。现在结束本轮：用户批准后 ticketd 会执行它，"
                       "退出码和输出会作为下一轮的输入交给你。" % run["path"])
             return 0
+        if args.cmd in WINDOWS_UNSUPPORTED and host.is_windows():
+            raise core.TicketError(WINDOWS_UNSUPPORTED[args.cmd])
         if args.cmd == "migrate":
             # 在打开数据库之前：--dry-run 不能改库，旧守护进程可能还在跑
             from . import bridge, migrate, update

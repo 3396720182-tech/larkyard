@@ -1,0 +1,9 @@
+# Windows 上 clone（core.autocrlf=true）时：Git Bash 要执行的脚本必须保持 LF，cmd / PowerShell 脚本用 CRLF（spec §3.2）
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary
+*.gif binary
+*.webp binary
+*.mp4 binary

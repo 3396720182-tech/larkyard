@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import stat
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -287,9 +288,77 @@ def _read_spool_file(dfd: int, name: str) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
+def _ingest_spool_windows(con: sqlite3.Connection, ticket_id: str, spool_dir: str, limit: int) -> int:
+    """Windows 版 ingest_spool（spec §3.2）：没有 dir_fd，按路径操作。每次改名 / 读之前都确认汇报目录本身不是
+    联接点、真实路径没变；读文件经 safefs 按句柄的真实路径核对在汇报目录之内。残余窗口：两次核对之间把目录换成
+    联接点，能让一次改名落到别的目录里名为 *.json 的文件上（只会改成 .claimed-* / *.bad，不读不发）。"""
+    from . import safefs
+    spool_dir = os.path.abspath(spool_dir)
+    if not os.path.isdir(spool_dir) or safefs._is_reparse(spool_dir):
+        return 0
+    real = os.path.normcase(os.path.realpath(spool_dir))
+
+    def same() -> bool:
+        return not safefs._is_reparse(spool_dir) and os.path.normcase(os.path.realpath(spool_dir)) == real
+
+    def at(name: str) -> str:
+        return os.path.join(spool_dir, name)
+
+    def mark_bad(name: str, src: Optional[str] = None) -> None:
+        if same():
+            try:
+                os.rename(at(src or name), at(name + ".bad"))
+            except OSError:
+                pass
+
+    n = 0
+    try:
+        names = sorted(x for x in os.listdir(spool_dir) if x.endswith(".json") and not x.startswith("."))
+    except OSError:
+        return 0
+    for name in names:
+        if n >= limit:
+            mark_bad(name)
+            continue
+        claimed = ".claimed-" + name
+        if not same():
+            return n
+        try:
+            os.rename(at(name), at(claimed))
+        except OSError:
+            continue
+        try:
+            fd = safefs.open_read_under(spool_dir, claimed)
+            if fd is None:
+                raise OSError("认领后不见了")
+            with os.fdopen(fd, "rb") as fh:
+                st = os.fstat(fh.fileno())
+                if st.st_size > SPOOL_MAX_BYTES:
+                    raise ValueError("too large")
+                raw = fh.read(SPOOL_MAX_BYTES + 1)
+            if len(raw) > SPOOL_MAX_BYTES:
+                raise ValueError("too large")
+            data = json.loads(raw.decode("utf-8"))
+            _check_spool_schema(data)
+            add_report(con, ticket_id, data["status"], data["summary"],
+                       data.get("artifacts") or [], data.get("ask"), run=data.get("run"))
+        except (OSError, ValueError, KeyError, TypeError, TicketError):
+            mark_bad(name, claimed)
+            continue
+        if same():
+            try:
+                os.unlink(at(claimed))
+            except OSError:
+                pass
+        n += 1
+    return n
+
+
 def ingest_spool(con: sqlite3.Connection, ticket_id: str, spool_dir: str, limit: int = SPOOL_MAX_FILES) -> int:
     # spool 目录由 worker 控制：一律当作敌对输入（不跟随符号链接、不读大文件、不按路径字符串改名/删除）。
     # 运行中每个 tick 都会调用：先把文件改名为点文件「认领」再入库，删不掉也不会被重复收件。
+    if sys.platform == "win32":
+        return _ingest_spool_windows(con, ticket_id, spool_dir, limit)
     try:
         dfd = os.open(str(spool_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
