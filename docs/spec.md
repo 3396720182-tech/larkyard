@@ -522,6 +522,8 @@ worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `e
 
 **调整（2026-11-27，T0093）**：锁文件换到 fork 上会议智能体可靠性第 1 批的提交。bridge 的 `<profile>/meeting-data/` 里多一个 `transcripts/`：每场会的全量逐字稿（字幕 + 会中弹幕，带发言人和时间），以前「不存字幕和弹幕原文」的约定改为默认存（`meeting.transcript.save: false` 关掉），原因是纪要只看最近 200 句、长会丢前半场，重启也会丢内容。和纪要存档一样不自动清理，保留期仍待定。入会时 bot 在会中聊天发一条说明（`meeting.announceOnJoin`）。Larkyard 这边只改锁文件，服务定义不变，不用重新 `ticket setup`；新 bridge 跟着版本更新，在每天的 bridge 重启窗口换上。
 
+**调整（2026-11-27，T0095）**：锁文件换到 fork 上会议智能体第 2、3 批的提交。数据上的变化：`meeting-data/archive/*.json` 的待办多了 `dueDate`、`ownerId`、`taskGuid` / `taskUrl` / `taskAt`，存档多了 `participants`（会上出现过的人名）；`qa/<会议ID>.jsonl` 每条多了 `said`（回答里引用的会上原话出处，对上的和没对上的）。新的读取：私聊问过去的会时，bridge 读本机所有纪要存档挑几场交给只读 agent（不读逐字稿）；入会时用机器人身份读会议详情、主持人和主人的主日历、日程描述里的文档。新的写入：「建成飞书任务」用机器人身份在飞书任务里建任务。应用要多开 `task:task:write`、`vc:meeting:readonly`、`calendar:calendar:readonly`（不开只是这几项用不了）。主动插话和语音点名默认关。Larkyard 这边只改锁文件，服务定义不变，不用重新 `ticket setup`。
+
 **没实测的**（单测和临时 HOME 全流程只用了替身）：真实租户上的扫码建应用、bot 身份查应用所有者、真实 launchd 下的 bridge 重启和在线确认、Linux 上的整套服务。
 
 ## 14. 升级已有安装（2026-11-21，T0056）
