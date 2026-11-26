@@ -71,7 +71,8 @@ class ConsentAcceptTest(ProblemsBase):
         self.round_(tid, "failed")
         items = console.build_heartbeat(self.con)["problems"]["items"]
         self.assertEqual([(i["ticket"], i["step"], i["code"]) for i in items], [(tid, "round", "failed")])
-        self.assertIsNone(console.consent_note(self.con))
+        self.assertNotIn("usage", console.build_heartbeat(self.con))  # c2 不带用量统计
+        self.assertIn("用量统计不上报", console.consent_note(self.con))  # 还提醒一句有更新的 c3
 
     def test_decline_sends_nothing(self):
         """场景：不同意。"""

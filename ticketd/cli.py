@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import card, config, core, db, executors, metrics, safefs, templates, worker
+from . import card, config, core, db, executors, metrics, safefs, templates, usage, worker
 
 HEARTBEAT_STALE = 60
 
@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--note")
     n.add_argument("--grant", action="append", default=[])
     n.add_argument("--sender")
+    n.add_argument("--cat", help="大类（用量统计用，7 选 1：%s）；不给或认不出时本机按关键词判断" % " / ".join(
+        "%s=%s" % (k, usage.CAT_TEXT[k]) for k in usage.CATS))
     n.add_argument("--executor", choices=executors.NAMES,
                    help="worker 用哪个 agent（默认 TICKETD_EXECUTOR，未设为 claude）")
 
@@ -96,10 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
     en.add_argument("--backup-key", help="备份发版公钥的指纹 SHA256:…")
     en.add_argument("--hostname", help="上报的主机名（默认本机主机名，只保留字母、数字和 . _ -）")
     en.add_argument("--leave", action="store_true", help="退出控制台：通知控制台并删除本机的设备令牌和控制台配置")
-    cs = sub.add_parser("console", help="控制台接入：status / show（下一次心跳的完整内容）/ accept [c1|c2]（换采集清单，"
+    cs = sub.add_parser("console", help="控制台接入：status / show（下一次心跳的完整内容）/ accept [c1|c2|c3]（换采集清单，"
                                         "只由本人在终端执行）")
-    cs.add_argument("action", nargs="?", default="status", choices=("status", "show", "accept"))
-    cs.add_argument("version", nargs="?", help="accept：要换成的采集清单版本（默认最新的 c2；c1 = 不再上报出错记录）")
+    cs.add_argument("action", nargs="?", default="status", choices=("status", "show", "accept", "agree"))
+    cs.add_argument("version", nargs="?", help="accept：要换成的采集清单版本（默认最新的 c3；c2 = 不报用量统计；"
+                                               "c1 = 出错记录也不报）")
+    cs.add_argument("--message", help="agree（主会话用）：用户在新清单私信里回复「同意」的那条消息 id；守护进程核对后才换")
     dg = sub.add_parser("diag", help="诊断包：ticket diag [工单号] 生成并显示（不发送）；ticket diag send <文件> [--note 一句话] "
                                      "在本人看过、确认后发给控制台管理员")
     dg.add_argument("args", nargs="*", help="[工单号] 或 send <文件>")
@@ -146,7 +150,7 @@ def _with_warning(out: str) -> str:
 def cmd_new(con, a) -> str:
     tid = core.create_ticket(con, chat_id=a.chat, message_id=a.message, title=a.title, slug=a.slug,
                              request_text=_text(a, "request"), ack_text=a.ack, note=a.note,
-                             grant_paths=a.grant, sender=a.sender, executor=a.executor)
+                             grant_paths=a.grant, sender=a.sender, executor=a.executor, cat=a.cat)
     return _with_warning(templates.ack_message(tid, a.title))
 
 
@@ -485,8 +489,10 @@ def cmd_console(con, a) -> str:
     from . import console
     if a.version and a.action != "accept":
         raise core.TicketError("只有 accept 带清单版本")
+    if a.action == "agree" and not a.message:
+        raise core.TicketError("agree 要带 --message <用户回复「同意」的那条消息 id>")
     try:
-        return console.command_console(con, a.action, a.version)
+        return console.command_console(con, a.action, a.version, a.message)
     except (PermissionError, ValueError, console.ConsoleError) as e:
         raise core.TicketError(e.text() if isinstance(e, console.ConsoleError) else str(e))
     except (KeyboardInterrupt, EOFError):

@@ -352,7 +352,7 @@ class EnrollTest(ConsoleBase):
         self.assertIn(console.CONSENT_TEXT[:-1], self.out)
         start = self.fake.bodies("/api/v1/enroll/start")[0]
         self.assertEqual(set(start), {"code", "hostname", "os", "larkyard_version", "bot_open_id", "consent"})
-        self.assertEqual(start["consent"], {"version": "c2", "sha256": console.consent_sha256("c2")})
+        self.assertEqual(start["consent"], {"version": "c3", "sha256": console.consent_sha256("c3")})
         self.assertRegex(start["consent"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual((start["code"], start["hostname"], start["bot_open_id"]), (CODE, "test-host", OWNER))
         self.assertEqual(set(start["os"]), {"name", "version", "arch"})
@@ -365,7 +365,7 @@ class EnrollTest(ConsoleBase):
         self.assertTrue(any("不要告诉任何人" in o for o in self.out))
         info = json.loads(console.info_path().read_text(encoding="utf-8"))
         self.assertEqual(set(info), {"url", "device_id", "enrolled_at", "consent_version"})
-        self.assertEqual((info["url"], info["device_id"], info["consent_version"]), (URL, DEVICE, "c2"))
+        self.assertEqual((info["url"], info["device_id"], info["consent_version"]), (URL, DEVICE, "c3"))
         # 入网之前的出错记录不上报：游标从入网时算起
         self.assertIsNotNone(console._cursor(self.con))
         self.assertEqual(console.read_token(), TOKEN)
@@ -655,8 +655,14 @@ class HeartbeatTest(ConsoleBase):
         self.assertEqual(c["timeout"], 15.0)
         self.assertTrue(console.connected(self.con))
         self.assertEqual(console.state(self.con), "ok")
+        # 这台是 c1：上报成功后私信一次新清单 c3 全文（只发一次）
         self.assertEqual([r["code"] for r in self.con.execute("SELECT code FROM events WHERE kind='console'")],
-                         ["started"])
+                         ["started", "consent_offer"])
+        dm = self.con.execute("SELECT text FROM outbox").fetchall()
+        self.assertEqual(len(dm), 1)
+        self.assertIn(console.CONSENT_C3, dm[0]["text"])
+        console.send_heartbeat(self.con)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
 
     def test_show_matches_what_is_sent(self):
         """场景：对照。"""
@@ -1050,13 +1056,26 @@ class ConsentTest(unittest.TestCase):
         d = (REPO / "openspec" / "changes" / "add-console-problem-reports" / "design.md").read_text(encoding="utf-8")
         block = re.search(r"### D1.*?```\n(.*?)```", d, re.S).group(1)
         self.assertEqual(block, console.CONSENT_C2)
-        self.assertEqual(console.CONSENT_VERSION, "c2")
-        self.assertEqual(console.CONSENT_TEXT, console.CONSENT_C2)
         self.assertEqual(len(console.CONSENT_C2.splitlines()), 6)
         self.assertTrue(console.CONSENT_C2.endswith("。\n"))
         # 和控制台仓库登记的 c2 逐字一致（两边对照这个哈希）
         self.assertEqual(console.consent_sha256("c2"),
                          "4f85ce4332334dc76eb8c4870e2fe646866f4fe6b7f4c6b979fa3f0027760ccd")
+
+    def test_c3_matches_design(self):
+        import re
+        d = (REPO / "openspec" / "changes" / "add-usage-report" / "design.md").read_text(encoding="utf-8")
+        block = re.search(r"### D1.*?```\n(.*?)```", d, re.S).group(1)
+        self.assertEqual(block, console.CONSENT_C3)
+        self.assertEqual(console.CONSENT_VERSION, "c3")
+        self.assertEqual(console.CONSENT_TEXT, console.CONSENT_C3)
+        self.assertTrue(console.CONSENT_C3.endswith("。\n"))
+        self.assertTrue(console.CONSENT_C3.startswith(console.CONSENT_C2.split("\n")[0][:-1]))
+        # 和控制台仓库登记的 c3 逐字一致（两边对照这个哈希）
+        self.assertEqual(console.consent_sha256("c3"),
+                         "0bf2d5b8f4e4ac0c40df730cb8480ed789d9faf9f75bced7d4c7e92392841b26")
+        self.assertEqual([v for v in sorted(console.CONSENTS) if console.reports_problems(v)], ["c2", "c3"])
+        self.assertEqual([v for v in sorted(console.CONSENTS) if console.reports_usage(v)], ["c3"])
 
 
 if __name__ == "__main__":

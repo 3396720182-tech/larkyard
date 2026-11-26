@@ -75,6 +75,11 @@ CREATE TABLE IF NOT EXISTS runs(
   status TEXT NOT NULL DEFAULT 'pending',  -- pending / approved / running / done / superseded / expired / interrupted
   exit_code INTEGER, pid INTEGER, created_at REAL NOT NULL, approved_at REAL, started_at REAL, finished_at REAL
 );
+-- 能力调用（openspec add-usage-report）：worker 调用控制台下发的技能脚本，按过程日志记一次；只有技能名和写死的归类码
+CREATE TABLE IF NOT EXISTS cap_calls(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id TEXT NOT NULL, cap TEXT NOT NULL, ok INTEGER NOT NULL, code TEXT, created_at REAL NOT NULL
+);
 -- 视频传到云空间后的链接（按工单 + 内容哈希）：同一个视频再次汇报时复用，不重复上传
 CREATE TABLE IF NOT EXISTS drive_links(
   ticket_id TEXT NOT NULL, sha256 TEXT NOT NULL, url TEXT NOT NULL, created_at REAL NOT NULL,
@@ -111,6 +116,7 @@ MIGRATIONS = [
     ("events", "code", "TEXT NOT NULL DEFAULT ''"),
     ("events", "seconds", "REAL"),                                # 媒体上传 / 导入用了多久
     ("events", "size", "INTEGER"),                                # 媒体文件多大（字节）
+    ("tickets", "cat", "TEXT"),                                   # 大类代号（usage.CATS）：建单时定，用量统计只读这一列
 ]
 
 

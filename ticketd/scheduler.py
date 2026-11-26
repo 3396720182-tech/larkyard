@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import card as status_card, config, core, db, executors, metrics, procs, safefs, templates, worker
+from . import card as status_card, config, core, db, executors, metrics, procs, safefs, templates, usage, worker
 
 RECOVERY_TEXT = ("服务重启打断了上一轮。先检查工单目录和已发出的消息，确认哪些外部动作已经完成，"
                  "再决定是否重做；不要重复发送或重复创建。")
@@ -158,6 +158,7 @@ class Running:
         self.started_wall = db.now()               # 这一轮（含压缩轮）真实的开始时刻，rounds 表用
         self.compact = False                       # 这是一轮会话压缩（不投递输入、不要求汇报）
         self.compacted = False                     # 看到了 compact_boundary
+        self.cap_pending: Dict[str, str] = {}      # 调用了技能脚本、还没看到结果的工具调用：tool_use_id → 技能名
 
 
 def _halted(r: "Running", t) -> Optional[str]:
@@ -454,6 +455,13 @@ class Scheduler:
         if step:
             r.last_step = step
             r.activity_dirty = True
+        for use_id, cap in usage.tool_calls(ev):  # 能力用量（c3）：只记技能名、成没成、归类码
+            r.cap_pending[use_id] = cap
+        if r.cap_pending:
+            for use_id, ok, code in usage.tool_results(ev):
+                cap = r.cap_pending.pop(use_id, None)
+                if cap:
+                    usage.record_call(self.con, r.ticket_id, cap, ok, code)
         r.ctx_max = max(r.ctx_max, worker.context_tokens(ev))
         if ev.get("type") == "system" and ev.get("subtype") == "compact_boundary":
             r.compacted = True

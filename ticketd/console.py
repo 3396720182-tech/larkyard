@@ -28,7 +28,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, config, db, host, metrics, skills, updsig
+from . import __version__, config, db, host, metrics, skills, updsig, usage
 
 # ---------- 采集清单 ----------
 # 逐字和 openspec 的 design 一致：UTF-8、\n 换行、每行（含最后一行）以 \n 结尾。打印的就是参与哈希的这段文本；
@@ -53,10 +53,36 @@ CONSENT_C2 = (
     "诊断包：只有你本人确认发送时才发，发之前先给你看完整内容。\n"
     "谁能看：只有控制台管理员。随时查看下一次上报的内容：ticket console show。退出：ticket enroll --leave。\n"
 )
-CONSENTS = {"c1": CONSENT_C1, "c2": CONSENT_C2}
-CONSENT_VERSION = "c2"                       # 新入网用的版本
+# c3：add-usage-report（多了用量统计：大类和能力都是写死的代号，仍然不收任何文字）。和控制台 console/consent.py 的 C3 逐字一致。
+CONSENT_C3 = (
+    "控制台会收集（0 级：设备状态；1 级里只收出错记录和用量统计）\n"
+    "入网时一次：主机名；系统名称、版本和架构；Larkyard 版本；本机 bot 的 open_id（TICKETD_OWNER）；你同意的这份清单的版本。\n"
+    "每 5 分钟一次：Larkyard 版本；系统名称、版本和架构；ticket doctor 的结论（是否通过、不通过的检查项名称）；运行中和排队中的工单数量；"
+    "自动更新是否启用、更新通道、最近一次更新结果和时间、本机暂停更新的到期时间；"
+    "上次上报以来的出错记录（时间、工单号、出错的环节、错误归类码，都是代码里写死的代号，不含任何文字）；"
+    "每天各大类的工单数和做成的数量（大类由本机判断，是代码里写死的 7 个代号：生图生视频、找素材、写文档、查资料、做表格、写代码、其他）；"
+    "每天各项能力的调用次数、成功次数和失败归类码；最近连续没做成的工单数；正在运行的工单里最久没有进展的分钟数。\n"
+    "不会收集：工单标题、原话、追问、产物、文件、过程日志、成本、报错原文。\n"
+    "诊断包：只有你本人确认发送时才发，发之前先给你看完整内容。\n"
+    "谁能看：只有控制台管理员。随时查看下一次上报的内容：ticket console show。退出：ticket enroll --leave。\n"
+)
+CONSENTS = {"c1": CONSENT_C1, "c2": CONSENT_C2, "c3": CONSENT_C3}
+CONSENT_VERSION = "c3"                       # 新入网用的版本
 CONSENT_TEXT = CONSENTS[CONSENT_VERSION]
-PROBLEMS_FROM = "c2"                         # 本机记的清单是这个版本时，心跳才带出错记录
+PROBLEMS_FROM = "c2"                         # 本机记的清单是这个版本或更新时，心跳才带出错记录
+USAGE_FROM = "c3"                            # 本机记的清单是这个版本或更新时，心跳才带用量统计
+
+
+def _vnum(version: Optional[str]) -> int:
+    return int(version[1:]) if version in CONSENTS else -1  # 按数字比：c10 也比 c2 新
+
+
+def reports_problems(version: Optional[str]) -> bool:
+    return version in CONSENTS and _vnum(version) >= _vnum(PROBLEMS_FROM)
+
+
+def reports_usage(version: Optional[str]) -> bool:
+    return version in CONSENTS and _vnum(version) >= _vnum(USAGE_FROM)
 
 
 def consent_sha256(version: str = CONSENT_VERSION) -> str:
@@ -89,7 +115,7 @@ TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{16,512}$")  # 只要能原样放进 
 HINTS = {
     "CodeInvalid": "入网码无效（不存在、已过期、已使用或已作废），请向管理员要一个新的",
     "CodeStartLimit": "这个入网码的提交次数已用完，请向管理员要一个新的",
-    "ConsentUnknown": "控制台不认识这份采集清单的版本，请先升级 Larkyard 或联系管理员",
+    "ConsentUnknown": "控制台还不认识这份采集清单的版本（多半是控制台要先升级），请联系管理员",
     "ConfirmDeliveryFailed": "确认码发不出去，请联系管理员",
     "ConfirmWrong": "确认码不对，请核对飞书私信后重新输入",
     "EnrollExpired": "这次入网已失效（超时或输错次数太多），请重新执行 ticket enroll",
@@ -651,8 +677,10 @@ def enroll(con, url: str, code: str, release_fp: str, backup_fp: str, hostname: 
         raise ValueError("控制台已登记这台设备（设备 id：%s），但本机写入失败（%r）：请管理员在控制台吊销这台设备后重新入网"
                          % (device_id, e))
     _clear_kv(con)
-    if CONSENT_VERSION == PROBLEMS_FROM:
+    if reports_problems(CONSENT_VERSION):
         set_problems_baseline(con)  # 入网之前的出错记录不上报
+    if reports_usage(CONSENT_VERSION):
+        set_usage_baseline(con)     # 入网之前的工单不进用量统计
     _event(con, "enrolled", "已接入控制台 %s，设备 %s" % (url, device_id), dedupe=False)
     lines = ["✅ 已接入控制台 %s（设备 %s）" % (url, device_id),
              "发版公钥：%s" % ("本机原来就信任这一对，信任不变" if same else "已按你给的指纹信任主公钥和备份公钥"),
@@ -712,44 +740,65 @@ def leave(con, out=print) -> list:
 
 
 def accept(con, version: str = CONSENT_VERSION, out=print) -> list:
-    """`ticket console accept [c1|c2]`：已入网的设备换一份采集清单（本人在终端里看完全文、输入 yes 才发）。
-    升到 c2 才开始上报出错记录（PRD §7.1：1 级数据要本人重新确认）；改回 c1 就不再上报。"""
+    """`ticket console accept [c1|c2|c3]`：已入网的设备换一份采集清单（本人在终端里看完全文、输入 yes 才发）。
+    c2 起上报出错记录、c3 起上报用量统计（PRD §7.1：1 级数据要本人重新确认）；改回低版本就不再上报对应的部分。
+    不碰终端的同事走机器人私信：见 offer_consent / agree。"""
     if _in_worker():
         raise PermissionError("worker 里不能执行 ticket console accept：只能由用户本人在终端执行")
     version = (version or CONSENT_VERSION).strip()
     if version not in CONSENTS:
         raise ValueError("没有这份采集清单：%s（可选：%s）" % (version, "、".join(sorted(CONSENTS))))
-    info = load()
-    if info is None or not token_path().is_file():
-        raise ValueError("本机没有入网（或控制台文件不完整），没有清单可换")
-    st = state(con)
-    if st.startswith("stopped:") or stopped_path().exists():
-        raise ValueError("这台设备在控制台已失效，已停止上报：不用再换清单")
+    info = _switchable()
     if info.get("consent_version") == version:
         return ["本机同意的采集清单已经是 %s，不用再换" % version]
     if not _stdin_is_tty():
-        raise PermissionError("ticket console accept 要在终端里由本人确认采集清单，不能在管道或脚本里执行")
+        raise PermissionError("ticket console accept 要在终端里由本人确认采集清单，不能在管道或脚本里执行"
+                              "（不碰终端的话：在飞书里引用控制台采集清单那条私信回复「同意」）")
     out("采集清单 %s（SHA-256 %s）：" % (version, consent_sha256(version)))
     out(CONSENTS[version][:-1])
     answer = _ask("同意上面的清单（替换现在的 %s）？输入 yes 继续：" % (info.get("consent_version") or "—"))
     if answer.strip() != "yes":
         return ["没有同意，清单不变（%s），没有发出任何请求" % (info.get("consent_version") or "—")]
+    return [switch_consent(con, info, version)]
+
+
+def _switchable() -> dict:
+    """能换清单的本机入网信息；没入网、文件不完整、已失效时抛 ValueError。"""
+    info = load()
+    if info is None or not token_path().is_file():
+        raise ValueError("本机没有入网（或控制台文件不完整），没有清单可换")
+    if stopped_path().exists():
+        raise ValueError("这台设备在控制台已失效，已停止上报：不用再换清单")
+    return info
+
+
+def switch_consent(con, info: dict, version: str, how: str = "") -> str:
+    """真正换清单：先请控制台登记，再改本机 console.json，最后调整出错记录 / 用量统计的起点。返回给人看的一句话。"""
+    st = state(con)
+    if st.startswith("stopped:"):
+        raise ValueError("这台设备在控制台已失效，已停止上报：不用再换清单")
+    old = info.get("consent_version")
     local_only = False
     try:
         resp = request("POST", "/api/v1/device/consent", {"version": version, "sha256": consent_sha256(version)},
                        token=read_token())
     except ConsoleError as e:
         # 收窄采集（改回 c1）不需要控制台同意：控制台是不认识这个接口的旧版本时，只改本机（少报不会多收）
-        if version != PROBLEMS_FROM and e.status == 404 and e.code in ("NotFound", "HttpError"):
+        if not reports_problems(version) and e.status == 404 and e.code in ("NotFound", "HttpError"):
             local_only, resp = True, {"ok": True, "consent_version": version}
+        elif e.status == 400 and e.code == "ConsentUnknown":
+            raise ValueError("换清单失败：控制台还不认识清单 %s（控制台要先升级）。本机清单不变" % version)
         else:
             raise ValueError("换清单失败：%s。本机清单不变" % e.text())
     if resp.get("ok") is not True or resp.get("consent_version") != version:
         raise ValueError("换清单失败：控制台没有确认。本机清单不变")
-    if version == PROBLEMS_FROM:
+    if reports_problems(version) and not reports_problems(old):
         set_problems_baseline(con)  # 同意之前的出错记录不上报
-    else:
+    elif not reports_problems(version):
         bump_problems_epoch(con)    # 在途的心跳回来也不再动游标
+    if reports_usage(version) and not reports_usage(old):
+        set_usage_baseline(con)     # 同意之前的工单不进用量统计
+    metrics.kv_set(con, SWITCHED_KEY, str(time.time()))  # 之前发的「同意」不能再拿来换回去
     new = dict(info, consent_version=version)
     try:
         _write_private(info_path(), (json.dumps(new, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
@@ -757,23 +806,29 @@ def accept(con, version: str = CONSENT_VERSION, out=print) -> list:
     except OSError as e:
         where = "本机" if local_only else "控制台已改成 %s，但本机" % version
         raise ValueError("%s没写进去（%s）：请重试 ticket console accept %s" % (where, e.__class__.__name__, version))
-    _event(con, "consent", "采集清单 %s → %s%s" % (info.get("consent_version") or "—", version,
-                                                 "（只改了本机）" if local_only else ""), dedupe=False)
+    _event(con, "consent", "采集清单 %s → %s%s%s" % (old or "—", version, how,
+                                                   "（只改了本机）" if local_only else ""), dedupe=False)
     if local_only:
-        return ["✅ 已换成采集清单 %s：不再上报出错记录。控制台是旧版本、不认识换清单的接口，只改了本机；"
-                "控制台那边仍记着你原来同意的版本" % version]
-    if version == PROBLEMS_FROM:
-        return ["✅ 已换成采集清单 %s：从现在起心跳里多一份出错记录（只有时间、工单号、出错环节和归类码）。"
-                "下一次上报的内容：ticket console show" % version]
-    return ["✅ 已换成采集清单 %s：不再上报出错记录" % version]
+        return ("✅ 已换成采集清单 %s：不再上报出错记录和用量统计。控制台是旧版本、不认识换清单的接口，只改了本机；"
+                "控制台那边仍记着你原来同意的版本" % version)
+    if reports_usage(version):
+        extra = "出错记录和用量统计（只有大类、能力的次数和几个数字）" if not reports_problems(old) else "用量统计（只有大类、能力的次数和几个数字）"
+        return "✅ 已换成采集清单 %s：从现在起心跳里多一份%s。下一次上报的内容：ticket console show" % (version, extra)
+    if reports_problems(version):
+        tail = "不再上报用量统计" if reports_usage(old) else "从现在起心跳里多一份出错记录（只有时间、工单号、出错环节和归类码）"
+        return "✅ 已换成采集清单 %s：%s。下一次上报的内容：ticket console show" % (version, tail)
+    return "✅ 已换成采集清单 %s：不再上报出错记录和用量统计" % version
 
 
 def consent_note(con=None) -> Optional[str]:
     """本机清单还是不带出错记录的旧版本时，给 status / show 的一句提示。"""
     v = consent_version()
-    if v is None or v == PROBLEMS_FROM:
+    if v is None or v == CONSENT_VERSION:
         return None
-    return ("采集清单是 %s：出错记录不上报，管理员看不到这台电脑哪一步出了错。"
+    if reports_problems(v):
+        return ("采集清单是 %s：用量统计不上报，管理员那边「使用情况」里没有你。要开启：在飞书里引用控制台采集清单那条私信"
+                "回复「同意」，或者执行 ticket console accept（都会先给你看新清单全文）" % v)
+    return ("采集清单是 %s：出错记录和用量统计都不上报，管理员看不到这台电脑哪一步出了错。"
             "执行 ticket console accept 可以开启（会先给你看新清单全文）" % v)
 
 
@@ -912,6 +967,206 @@ def set_problems_baseline(con) -> None:
     metrics.kv_set(con, CURSOR_KEY, json.dumps(_max_ids(con), sort_keys=True))
 
 
+# ---------- 用量统计（清单 c3，openspec add-usage-report） ----------
+USAGE_SINCE_KEY = "console.usage_since"    # 同意 c3 的时刻：之前建的单、之前的能力调用不进用量统计
+
+
+def set_usage_baseline(con, now: Optional[float] = None) -> None:
+    metrics.kv_set(con, USAGE_SINCE_KEY, str(time.time() if now is None else now))
+
+
+def _usage_since(con) -> float:
+    try:
+        return float(metrics.kv_get(con, USAGE_SINCE_KEY) or 0)
+    except ValueError:
+        return 0.0
+
+
+# ---------- 机器人私信同意新清单（不碰终端的同事用） ----------
+# 守护进程给主用户私信一次新清单全文；本人引用那条私信回复「同意」，主会话执行 ticket console agree --message <那条回复>。
+# 守护进程自己去飞书取回这条消息核对：发消息的是主用户本人、在同一个私聊里、在私信之后、内容就是「同意」，才换清单。
+# 主会话只负责转交消息 id，换不换由这里核对决定；核对不过不换，并私信说明。
+OFFER_KEY = "console.consent_offer"        # {"outbox": 发件箱行号, "at": 时间, "version": 清单版本}
+AGREE_KEY = "console.consent_agree"        # {"message": 回复的消息 id, "at": 时间}：等守护进程核对
+AGREE_WORDS = ("同意", "我同意", "同意采集清单", "同意新的采集清单", "同意c3", "同意清单")
+MESSAGE_ID_RE = re.compile(r"^om_[A-Za-z0-9_-]{1,80}$")
+SWITCHED_KEY = "console.consent_switched_at"  # 最近一次换清单的时刻
+AGREE_WITHIN = 30 * 86400.0                # 私信发出 30 天后再回复不算（清单可能又变了），要重新发
+
+
+def _kv_json(con, key: str) -> Optional[dict]:
+    try:
+        v = json.loads(metrics.kv_get(con, key) or "")
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def offer_text(version: str = CONSENT_VERSION, current: Optional[str] = None) -> str:
+    extra = ("「用量统计」：每天各大类（生图生视频、找素材、写文档等 7 类）的工单数和做成几单、"
+             "各项能力用了几次和成没成、最近连续没做成几单、正在跑的单最久多久没动静")
+    if not reports_problems(current):
+        extra = "「出错记录」（时间、工单号、出错环节和归类码）和" + extra
+    return ("📋 控制台的采集清单有新版本 %s，请你看一下。\n"
+            "比你现在同意的（%s）多了%s。只有数字和代码里写死的代号，不收工单标题、原话和内容。"
+            "管理员用它看大家主要拿机器人做什么、谁卡住了需要帮忙。\n\n"
+            "完整清单（%s，SHA-256 %s）：\n%s\n"
+            "同意：引用（回复）这条消息说「同意」。不同意不用管，照常只报现在的内容。"
+            "以后想退回：终端里执行 ticket console accept %s。" % (
+                version, current or "—", extra, version, consent_sha256(version)[:16], CONSENTS[version],
+                current or "c1"))
+
+
+def maybe_offer_consent(con, now: Optional[float] = None) -> bool:
+    """本机清单比最新版旧、还没私信过：私信主用户一次新清单全文。返回这次是否发了。"""
+    now = time.time() if now is None else now
+    v = consent_version()
+    if v is None or v == CONSENT_VERSION or not config.owner().startswith("ou_"):
+        return False
+    old = _kv_json(con, OFFER_KEY)
+    if old and old.get("version") == CONSENT_VERSION:
+        row = con.execute("SELECT status FROM outbox WHERE id=?", (old.get("outbox"),)).fetchone()
+        try:
+            age = now - float(old.get("at") or 0)
+        except (TypeError, ValueError):
+            age = 0.0
+        # 发过了、没过期就不再发；私信发不出去（dead / 行没了）或过了 30 天（回复不再算数）才重发
+        if row is not None and row["status"] != "dead" and age <= AGREE_WITHIN:
+            return False
+    rid = metrics.send_owner(con, offer_text(current=v))
+    metrics.kv_set(con, OFFER_KEY, json.dumps({"outbox": rid, "at": now, "version": CONSENT_VERSION}, sort_keys=True))
+    _event(con, "consent_offer", "私信了新采集清单 %s，等本人回复「同意」" % CONSENT_VERSION, dedupe=False)
+    return True
+
+
+def agree(con, message_id: str) -> str:
+    """`ticket console agree --message <id>`（主会话用）：只登记，不换清单；守护进程下一次心跳前核对后再换。"""
+    if _in_worker():
+        raise PermissionError("worker 里不能执行 ticket console agree")
+    message_id = (message_id or "").strip()
+    if not MESSAGE_ID_RE.match(message_id):
+        raise ValueError("消息 id 不对：要用户回复「同意」的那条消息的 id（om_ 开头）")
+    info = _switchable()
+    if info.get("consent_version") == CONSENT_VERSION:
+        return "这台电脑同意的采集清单已经是 %s，不用再换" % CONSENT_VERSION
+    offer = _kv_json(con, OFFER_KEY)
+    if not offer or offer.get("version") != CONSENT_VERSION:
+        raise ValueError("还没给你私信过新清单 %s，没有可以同意的（守护进程接上控制台后会私信全文）" % CONSENT_VERSION)
+    metrics.kv_set(con, AGREE_KEY, json.dumps({"message": message_id, "at": time.time()}, sort_keys=True))
+    return "收到。守护进程核对是你本人引用那条私信回复的「同意」后换成采集清单 %s，几分钟内私信你结果" % CONSENT_VERSION
+
+
+def _fetch_message(message_id: str, timeout: float = 30) -> dict:
+    """用机器人身份取回一条消息（GET /im/v1/messages/:id）。取不到抛 ValueError（不带原文）。"""
+    import subprocess
+    from . import outbox
+    try:
+        p = subprocess.run([config.lark_bin(), "api", "GET", "/open-apis/im/v1/messages/" + message_id, "--as", "bot"],
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ValueError("调用 lark-cli 失败（%s）" % e.__class__.__name__)
+    data = outbox._parse_json(p.stdout) or outbox._parse_json(p.stderr)
+    if not data or data.get("ok") is not True:
+        err = (data or {}).get("error") if isinstance(data, dict) else None
+        code = err.get("code") if isinstance(err, dict) else None
+        raise ValueError("飞书没给这条消息%s" % ("（错误码 %s）" % code if code else ""))
+    body = data.get("data")
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        body = body["data"]
+    items = body.get("items") if isinstance(body, dict) else None
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        raise ValueError("飞书返回的消息格式不认识")
+    return items[0]
+
+
+def _agree_text(msg: dict) -> str:
+    if msg.get("msg_type") != "text":
+        return ""
+    try:
+        content = json.loads((msg.get("body") or {}).get("content") or "")
+    except (ValueError, AttributeError):
+        return ""
+    text = content.get("text") if isinstance(content, dict) else ""
+    return re.sub(r"[\s。．.!！~～,，「」\"'“”]+", "", text if isinstance(text, str) else "").lower()
+
+
+def _switched_at(con) -> float:
+    try:
+        return float(metrics.kv_get(con, SWITCHED_KEY) or 0)
+    except ValueError:
+        return 0.0
+
+
+def _ms(v) -> float:
+    try:
+        return float(v) / 1000.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def check_agree(con, req: dict, fetch=None) -> Optional[str]:
+    """核对一次「同意」：通过返回 None，不通过返回原因（给本人看的一句话）。"""
+    fetch = fetch or _fetch_message
+    offer = _kv_json(con, OFFER_KEY)
+    if not offer or offer.get("version") != CONSENT_VERSION:
+        return "没找到给你发过的新清单私信"
+    row = con.execute("SELECT sent_message_id FROM outbox WHERE id=?", (offer.get("outbox"),)).fetchone()
+    offer_mid = row["sent_message_id"] if row else None
+    if not offer_mid:
+        return "新清单的私信还没发出去"
+    owner = config.owner()
+    if not owner.startswith("ou_"):
+        return "这台电脑没配置主用户（TICKETD_OWNER）"
+    try:
+        msg = fetch(req["message"])
+        sent = fetch(offer_mid)
+    except ValueError as e:
+        return "没能从飞书取回消息核对：%s" % e
+    sender = msg.get("sender") if isinstance(msg.get("sender"), dict) else {}
+    if sender.get("id") != owner or sender.get("sender_type") != "user":
+        return "回复「同意」的不是你本人"
+    if not msg.get("chat_id") or msg.get("chat_id") != sent.get("chat_id"):
+        return "「同意」不是回复在发新清单的那个私聊里"
+    if offer_mid not in (msg.get("parent_id"), msg.get("root_id")):
+        return "「同意」没有引用新清单那条私信（私聊里别的「同意」不算）"
+    if _ms(msg.get("create_time")) < _ms(sent.get("create_time")):
+        return "「同意」是在新清单私信之前发的"
+    if _ms(msg.get("create_time")) <= _switched_at(con):
+        return "这条「同意」早于你上一次换清单，不再算数"
+    if _ms(msg.get("create_time")) - _ms(sent.get("create_time")) > AGREE_WITHIN:
+        return "离新清单私信超过 30 天了"
+    if _agree_text(msg) not in AGREE_WORDS:
+        return "那条回复的内容不是「同意」"
+    return None
+
+
+def process_agree(con, fetch=None) -> Optional[str]:
+    """守护进程：有待核对的「同意」就核对，通过就换清单。结果私信主用户，返回那句话（没有待核对的返回 None）。"""
+    raw = metrics.kv_get(con, AGREE_KEY)
+    req = _kv_json(con, AGREE_KEY)
+    if not req:
+        return None
+    # 只核对一次（不通过要本人重新回复）；按原值删，期间又登记了新的就留给下一次
+    if con.execute("DELETE FROM kv WHERE key=? AND value=?", (AGREE_KEY, raw)).rowcount != 1:
+        return None
+    if not MESSAGE_ID_RE.match(str(req.get("message") or "")):
+        return None
+    try:
+        info = _switchable()
+        if info.get("consent_version") == CONSENT_VERSION:
+            return None
+        why = check_agree(con, req, fetch)
+        if why is None:
+            text = switch_consent(con, info, CONSENT_VERSION, how="（飞书私信里本人回复同意）")
+        else:
+            _event(con, "consent_rejected", why, dedupe=False)
+            text = "没有换成采集清单 %s：%s。要换的话，在发新清单的那个私聊里再回复一次「同意」。" % (CONSENT_VERSION, why)
+    except ValueError as e:
+        text = "没有换成采集清单 %s：%s" % (CONSENT_VERSION, e)
+    metrics.send_owner(con, text)
+    return text
+
+
 def _advance_cursor(con, advance: dict) -> None:
     """心跳被控制台确认后前移游标：构造之后换过清单（epoch 变了）就不写；平时每个键只往前走（取大），
     除非构造时发现游标作废（库换过 / 没有游标），那时直接写成当时的上界。"""
@@ -970,11 +1225,14 @@ def build_heartbeat(con, now: Optional[float] = None, cursor_out: Optional[dict]
         "tickets": {"running": count("running"), "queued": count("queued")},
         "update": _update_part(con, now),
     }
-    if consent_version() == PROBLEMS_FROM:
+    v = consent_version()
+    if reports_problems(v):
         epoch = _epoch(con)
         hb["problems"], top = _problems_part(con)
         if cursor_out is not None:
             cursor_out.update(top, epoch=epoch)
+    if reports_usage(v):
+        hb["usage"] = usage.build(con, now, since=_usage_since(con))
     return hb
 
 
@@ -1012,18 +1270,34 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
         _drop_skills(con)
         return {"sent": False, "ok": False, "code": code, "next_in": None, "stopped": True}
     try:
+        process_agree(con)  # 本人在私聊里回复了「同意」：先核对、换清单，这一次心跳就按新清单报
+    except Exception as e:  # 核对出意外不能挡住心跳
+        _event(con, "consent_rejected", "核对「同意」出错：%s" % e.__class__.__name__, dedupe=False)
+    try:
         token = read_token()
         advance: dict = {}
         payload = build_heartbeat(con, now, cursor_out=advance)
         try:
             resp = request("POST", "/api/v1/heartbeat", payload, token=token)
         except ConsoleError as e:
-            if not (e.status == 400 and e.code == "UnknownField" and "problems" in payload):
+            if not (e.status == 400 and e.code == "UnknownField" and ("problems" in payload or "usage" in payload)):
                 raise
-            # 控制台不认识 problems（退回了旧版本）：去掉它再报一次设备状态，游标不动，控制台恢复后照报
-            payload = {k: v for k, v in payload.items() if k != "problems"}
-            _event(con, "problems_rejected", "控制台不认识出错记录（多半退回了旧版本），这一阵只报设备状态")
-            resp = request("POST", "/api/v1/heartbeat", payload, token=token)
+            # 控制台不认识 problems / usage（退回了旧版本）：先只去掉 usage 再试，还不行再去掉 problems；游标不动，控制台恢复后照报
+            if "usage" in payload:
+                payload = {k: v for k, v in payload.items() if k != "usage"}
+                _event(con, "usage_rejected", "控制台不认识用量统计（多半退回了旧版本），这一阵不报用量")
+                try:
+                    resp = request("POST", "/api/v1/heartbeat", payload, token=token)
+                except ConsoleError as e2:
+                    if not (e2.status == 400 and e2.code == "UnknownField" and "problems" in payload):
+                        raise
+                    payload = {k: v for k, v in payload.items() if k != "problems"}
+                    _event(con, "problems_rejected", "控制台不认识出错记录（多半退回了旧版本），这一阵只报设备状态")
+                    resp = request("POST", "/api/v1/heartbeat", payload, token=token)
+            else:
+                payload = {k: v for k, v in payload.items() if k != "problems"}
+                _event(con, "problems_rejected", "控制台不认识出错记录（多半退回了旧版本），这一阵只报设备状态")
+                resp = request("POST", "/api/v1/heartbeat", payload, token=token)
     except ConsoleError as e:
         if not enrolled():  # 发送期间执行了 --leave：什么都不记
             return {"sent": True, "ok": False, "code": e.code, "next_in": None, "stopped": True}
@@ -1055,6 +1329,10 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
                     "恢复上报" if st == "failing" else "开始上报", dedupe=False)
         metrics.kv_set(con, "console.state", "ok")
         _sync_skills(con, resp.get("skills"), token)
+        try:
+            maybe_offer_consent(con, now)
+        except Exception:
+            pass
         _sync_gateway(con, token, now)
     else:
         metrics.kv_set(con, "console.last_error", "%s 控制台没有确认这次上报" % updsig.iso(now))
@@ -1260,13 +1538,15 @@ def doctor_line(con, now: Optional[float] = None) -> str:
     return "❌ 控制台：最近 30 分钟没有成功上报（最近的错误：%s）%s" % (err or "无，守护进程可能没在运行", suffix)
 
 
-def command_console(con, action: str, version: Optional[str] = None) -> str:
+def command_console(con, action: str, version: Optional[str] = None, message: Optional[str] = None) -> str:
     if _in_worker():
-        if action == "accept":
-            raise PermissionError("worker 里不能执行 ticket console accept：只能由用户本人在终端执行")
+        if action in ("accept", "agree"):
+            raise PermissionError("worker 里不能执行 ticket console %s：只能由用户本人确认" % action)
         return "控制台：" + IN_WORKER_NOTE
     if action == "accept":
         return "\n".join(accept(con, version or CONSENT_VERSION))
+    if action == "agree":
+        return agree(con, message or "")
     if action == "show":
         return show_text(con)
     return "\n".join(status_lines(con))

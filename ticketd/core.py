@@ -117,7 +117,7 @@ def add_input(con: sqlite3.Connection, ticket_id: str, kind: str, text: str,
 def create_ticket(con: sqlite3.Connection, *, chat_id: str, message_id: str, title: str, slug: str,
                   request_text: str, ack_text: str, note: Optional[str] = None,
                   grant_paths: Iterable[str] = (), sender: Optional[str] = None,
-                  executor: Optional[str] = None) -> str:
+                  executor: Optional[str] = None, cat: Optional[str] = None) -> str:
     if sender is not None:
         if not config.owner():
             raise TicketError("没有配置主用户：在 %s 里写 TICKETD_OWNER=<你的 open_id>" % config.config_file())
@@ -133,6 +133,9 @@ def create_ticket(con: sqlite3.Connection, *, chat_id: str, message_id: str, tit
     if executor not in ("claude", "codex"):  # 与 executors.NAMES 一致；core 不 import executors，保持轻量
         raise TicketError("未知执行器：%r（可选 claude / codex）" % executor)
     paths = [_norm_grant(p) for p in grant_paths]
+    from . import usage
+    # 大类：主会话给的认不出就按本机关键词判断（只存代号，用量统计用；不影响派单本身）
+    cat = usage.norm_cat(cat) or usage.classify(title, request_text)
     with db.tx(con):
         if con.execute("SELECT 1 FROM bindings WHERE message_id=?", (message_id,)).fetchone():
             raise TicketError("消息 %s 已绑定工单" % message_id)
@@ -141,10 +144,10 @@ def create_ticket(con: sqlite3.Connection, *, chat_id: str, message_id: str, tit
         t = db.now()
         con.execute(
             "INSERT INTO tickets(id, slug, title, chat_id, origin_message_id, request_text, router_note,"
-            " ack_text, workdir, session_id, state, card_wanted, created_at, updated_at, executor)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
+            " ack_text, workdir, session_id, state, card_wanted, created_at, updated_at, executor, cat)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)",
             (tid, slug, title, chat_id, message_id, request_text, note, ack_text, workdir,
-             str(uuid.uuid4()), "queued", t, t, executor))
+             str(uuid.uuid4()), "queued", t, t, executor, cat))
         for p in paths:
             con.execute("INSERT INTO grants VALUES(?,?,?)", (tid, p, t))
         con.execute("INSERT INTO bindings VALUES(?,?)", (message_id, tid))
