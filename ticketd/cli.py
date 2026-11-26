@@ -100,10 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
     en.add_argument("--leave", action="store_true", help="退出控制台：通知控制台并删除本机的设备令牌和控制台配置")
     cs = sub.add_parser("console", help="控制台接入：status / show（下一次心跳的完整内容）/ accept [c1|c2|c3]（换采集清单，"
                                         "只由本人在终端执行）")
-    cs.add_argument("action", nargs="?", default="status", choices=("status", "show", "accept", "agree"))
+    cs.add_argument("action", nargs="?", default="status", choices=("status", "show", "accept"))
     cs.add_argument("version", nargs="?", help="accept：要换成的采集清单版本（默认最新的 c3；c2 = 不报用量统计；"
                                                "c1 = 出错记录也不报）")
-    cs.add_argument("--message", help="agree（主会话用）：用户在新清单私信里回复「同意」的那条消息 id；守护进程核对后才换")
     dg = sub.add_parser("diag", help="诊断包：ticket diag [工单号] 生成并显示（不发送）；ticket diag send <文件> [--note 一句话] "
                                      "在本人看过、确认后发给控制台管理员")
     dg.add_argument("args", nargs="*", help="[工单号] 或 send <文件>")
@@ -489,10 +488,8 @@ def cmd_console(con, a) -> str:
     from . import console
     if a.version and a.action != "accept":
         raise core.TicketError("只有 accept 带清单版本")
-    if a.action == "agree" and not a.message:
-        raise core.TicketError("agree 要带 --message <用户回复「同意」的那条消息 id>")
     try:
-        return console.command_console(con, a.action, a.version, a.message)
+        return console.command_console(con, a.action, a.version)
     except (PermissionError, ValueError, console.ConsoleError) as e:
         raise core.TicketError(e.text() if isinstance(e, console.ConsoleError) else str(e))
     except (KeyboardInterrupt, EOFError):

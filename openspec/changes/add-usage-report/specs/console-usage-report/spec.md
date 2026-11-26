@@ -1,6 +1,6 @@
 ## ADDED Requirements
 
-### Requirement: 用量统计只在本人同意 c3 后上报
+### Requirement: 用量统计只在本机清单是 c3 时上报
 
 心跳 SHALL 只在本机 `console.json` 的 `consent_version` 是 c3（或更新）时带 `usage`，且只包含代号和数字。
 
@@ -20,10 +20,18 @@
 - **WHEN** `ticket new` 没带 `--cat`，原话是「帮我出一张海报」
 - **THEN** `tickets.cat` 是 media
 
-### Requirement: 私信同意要守护进程核对
+### Requirement: c2 直接升到 c3，只升一次
 
-`ticket console agree` SHALL 只登记消息 id；守护进程取回消息核对通过（本人、同一私聊、私信之后、内容是同意）才换清单，结果私信本人。
+守护进程 SHALL 在心跳前把清单是 c2、还没自动升过的设备换成 c3，并私信本人一句说明；本人之后换过清单（含退回 c2）SHALL NOT 再自动升；c1 SHALL NOT 自动升。
 
-#### Scenario: 别人发的「同意」
-- **WHEN** 消息的发送人不是 `TICKETD_OWNER`
-- **THEN** 清单不变，私信说明原因
+#### Scenario: c2 设备升级后第一次心跳
+- **WHEN** 本机清单是 c2，控制台认识 c3
+- **THEN** 换成 c3，这一次心跳带 `usage`，私信本人一次
+
+#### Scenario: 本人退回 c2
+- **WHEN** 自动升过之后本人执行 `ticket console accept c2`
+- **THEN** 之后的心跳不再自动升
+
+#### Scenario: 控制台还不认识 c3
+- **WHEN** 换清单时控制台回 ConsentUnknown
+- **THEN** 本机留在 c2，这次心跳照常发，下一次再试

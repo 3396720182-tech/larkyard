@@ -741,8 +741,8 @@ def leave(con, out=print) -> list:
 
 def accept(con, version: str = CONSENT_VERSION, out=print) -> list:
     """`ticket console accept [c1|c2|c3]`：已入网的设备换一份采集清单（本人在终端里看完全文、输入 yes 才发）。
-    c2 起上报出错记录、c3 起上报用量统计（PRD §7.1：1 级数据要本人重新确认）；改回低版本就不再上报对应的部分。
-    不碰终端的同事走机器人私信：见 offer_consent / agree。"""
+    c2 起上报出错记录、c3 起上报用量统计；改回低版本就不再上报对应的部分。c2 → c3 由守护进程自动升（见 maybe_auto_upgrade），
+    这里主要用来退回或从 c1 升上来。"""
     if _in_worker():
         raise PermissionError("worker 里不能执行 ticket console accept：只能由用户本人在终端执行")
     version = (version or CONSENT_VERSION).strip()
@@ -752,8 +752,7 @@ def accept(con, version: str = CONSENT_VERSION, out=print) -> list:
     if info.get("consent_version") == version:
         return ["本机同意的采集清单已经是 %s，不用再换" % version]
     if not _stdin_is_tty():
-        raise PermissionError("ticket console accept 要在终端里由本人确认采集清单，不能在管道或脚本里执行"
-                              "（不碰终端的话：在飞书里引用控制台采集清单那条私信回复「同意」）")
+        raise PermissionError("ticket console accept 要在终端里由本人确认采集清单，不能在管道或脚本里执行")
     out("采集清单 %s（SHA-256 %s）：" % (version, consent_sha256(version)))
     out(CONSENTS[version][:-1])
     answer = _ask("同意上面的清单（替换现在的 %s）？输入 yes 继续：" % (info.get("consent_version") or "—"))
@@ -798,7 +797,6 @@ def switch_consent(con, info: dict, version: str, how: str = "") -> str:
         bump_problems_epoch(con)    # 在途的心跳回来也不再动游标
     if reports_usage(version) and not reports_usage(old):
         set_usage_baseline(con)     # 同意之前的工单不进用量统计
-    metrics.kv_set(con, SWITCHED_KEY, str(time.time()))  # 之前发的「同意」不能再拿来换回去
     new = dict(info, consent_version=version)
     try:
         _write_private(info_path(), (json.dumps(new, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
@@ -806,6 +804,7 @@ def switch_consent(con, info: dict, version: str, how: str = "") -> str:
     except OSError as e:
         where = "本机" if local_only else "控制台已改成 %s，但本机" % version
         raise ValueError("%s没写进去（%s）：请重试 ticket console accept %s" % (where, e.__class__.__name__, version))
+    metrics.kv_set(con, AUTO_KEY, CONSENT_VERSION)  # 换过一次（自动或本人）之后不再自动升：本人退回 c2 就一直是 c2
     _event(con, "consent", "采集清单 %s → %s%s%s" % (old or "—", version, how,
                                                    "（只改了本机）" if local_only else ""), dedupe=False)
     if local_only:
@@ -826,8 +825,8 @@ def consent_note(con=None) -> Optional[str]:
     if v is None or v == CONSENT_VERSION:
         return None
     if reports_problems(v):
-        return ("采集清单是 %s：用量统计不上报，管理员那边「使用情况」里没有你。要开启：在飞书里引用控制台采集清单那条私信"
-                "回复「同意」，或者执行 ticket console accept（都会先给你看新清单全文）" % v)
+        return ("采集清单是 %s：用量统计不上报，管理员那边「使用情况」里没有你。要开启：执行 ticket console accept"
+                "（会先给你看新清单全文）" % v)
     return ("采集清单是 %s：出错记录和用量统计都不上报，管理员看不到这台电脑哪一步出了错。"
             "执行 ticket console accept 可以开启（会先给你看新清单全文）" % v)
 
@@ -982,188 +981,31 @@ def _usage_since(con) -> float:
         return 0.0
 
 
-# ---------- 机器人私信同意新清单（不碰终端的同事用） ----------
-# 守护进程给主用户私信一次新清单全文；本人引用那条私信回复「同意」，主会话执行 ticket console agree --message <那条回复>。
-# 守护进程自己去飞书取回这条消息核对：发消息的是主用户本人、在同一个私聊里、在私信之后、内容就是「同意」，才换清单。
-# 主会话只负责转交消息 id，换不换由这里核对决定；核对不过不换，并私信说明。
-OFFER_KEY = "console.consent_offer"        # {"outbox": 发件箱行号, "at": 时间, "version": 清单版本}
-AGREE_KEY = "console.consent_agree"        # {"message": 回复的消息 id, "at": 时间}：等守护进程核对
-AGREE_WORDS = ("同意", "我同意", "同意采集清单", "同意新的采集清单", "同意c3", "同意清单")
-MESSAGE_ID_RE = re.compile(r"^om_[A-Za-z0-9_-]{1,80}$")
-SWITCHED_KEY = "console.consent_switched_at"  # 最近一次换清单的时刻
-AGREE_WITHIN = 30 * 86400.0                # 私信发出 30 天后再回复不算（清单可能又变了），要重新发
+# ---------- 小迭代直接升级（c2 → c3） ----------
+# 管理员决定：c3 只比 c2 多了用量统计（写死的代号和数字，不收任何文字），算小迭代，不再逐人确认。
+# 本机是 c2 的，守护进程在心跳前直接换成 c3，私信本人一句说明（多了什么、怎么退回）。
+# 只自动升一次：本人之后用 ticket console accept 换过（包括退回 c2），就不再动。c1 不自动升（出错记录要本人确认）。
+AUTO_FROM = ("c2",)
+AUTO_KEY = "console.consent_auto"          # 自动升级 / 本人换清单后记下当时的最新版本：之后不再自动升
 
 
-def _kv_json(con, key: str) -> Optional[dict]:
-    try:
-        v = json.loads(metrics.kv_get(con, key) or "")
-    except ValueError:
+def auto_upgrade_text(old: str) -> str:
+    return ("📋 控制台采集清单已从 %s 更新到 %s：心跳里多了用量统计——每天各大类（生图生视频、找素材、写文档等 7 类）"
+            "的工单数和做成几单、各项能力用了几次和成没成、最近连续没做成几单、正在跑的单最久多久没动静。"
+            "只有数字和代码里写死的代号，不收工单标题、原话和内容。"
+            "查看下一次上报的内容：ticket console show；想退回：终端里执行 ticket console accept %s。"
+            % (old, CONSENT_VERSION, old))
+
+
+def maybe_auto_upgrade(con) -> Optional[str]:
+    """守护进程：本机清单是 c2、还没自动升过 → 换成最新版并私信本人。返回换后的那句话；没换返回 None。
+    控制台还不认识新版本（ConsentUnknown）等失败抛 ValueError，下一次心跳再试。"""
+    old = consent_version()
+    if old not in AUTO_FROM or metrics.kv_get(con, AUTO_KEY) == CONSENT_VERSION:
         return None
-    return v if isinstance(v, dict) else None
-
-
-def offer_text(version: str = CONSENT_VERSION, current: Optional[str] = None) -> str:
-    extra = ("「用量统计」：每天各大类（生图生视频、找素材、写文档等 7 类）的工单数和做成几单、"
-             "各项能力用了几次和成没成、最近连续没做成几单、正在跑的单最久多久没动静")
-    if not reports_problems(current):
-        extra = "「出错记录」（时间、工单号、出错环节和归类码）和" + extra
-    return ("📋 控制台的采集清单有新版本 %s，请你看一下。\n"
-            "比你现在同意的（%s）多了%s。只有数字和代码里写死的代号，不收工单标题、原话和内容。"
-            "管理员用它看大家主要拿机器人做什么、谁卡住了需要帮忙。\n\n"
-            "完整清单（%s，SHA-256 %s）：\n%s\n"
-            "同意：引用（回复）这条消息说「同意」。不同意不用管，照常只报现在的内容。"
-            "以后想退回：终端里执行 ticket console accept %s。" % (
-                version, current or "—", extra, version, consent_sha256(version)[:16], CONSENTS[version],
-                current or "c1"))
-
-
-def maybe_offer_consent(con, now: Optional[float] = None) -> bool:
-    """本机清单比最新版旧、还没私信过：私信主用户一次新清单全文。返回这次是否发了。"""
-    now = time.time() if now is None else now
-    v = consent_version()
-    if v is None or v == CONSENT_VERSION or not config.owner().startswith("ou_"):
-        return False
-    old = _kv_json(con, OFFER_KEY)
-    if old and old.get("version") == CONSENT_VERSION:
-        row = con.execute("SELECT status FROM outbox WHERE id=?", (old.get("outbox"),)).fetchone()
-        try:
-            age = now - float(old.get("at") or 0)
-        except (TypeError, ValueError):
-            age = 0.0
-        # 发过了、没过期就不再发；私信发不出去（dead / 行没了）或过了 30 天（回复不再算数）才重发
-        if row is not None and row["status"] != "dead" and age <= AGREE_WITHIN:
-            return False
-    rid = metrics.send_owner(con, offer_text(current=v))
-    metrics.kv_set(con, OFFER_KEY, json.dumps({"outbox": rid, "at": now, "version": CONSENT_VERSION}, sort_keys=True))
-    _event(con, "consent_offer", "私信了新采集清单 %s，等本人回复「同意」" % CONSENT_VERSION, dedupe=False)
-    return True
-
-
-def agree(con, message_id: str) -> str:
-    """`ticket console agree --message <id>`（主会话用）：只登记，不换清单；守护进程下一次心跳前核对后再换。"""
-    if _in_worker():
-        raise PermissionError("worker 里不能执行 ticket console agree")
-    message_id = (message_id or "").strip()
-    if not MESSAGE_ID_RE.match(message_id):
-        raise ValueError("消息 id 不对：要用户回复「同意」的那条消息的 id（om_ 开头）")
     info = _switchable()
-    if info.get("consent_version") == CONSENT_VERSION:
-        return "这台电脑同意的采集清单已经是 %s，不用再换" % CONSENT_VERSION
-    offer = _kv_json(con, OFFER_KEY)
-    if not offer or offer.get("version") != CONSENT_VERSION:
-        raise ValueError("还没给你私信过新清单 %s，没有可以同意的（守护进程接上控制台后会私信全文）" % CONSENT_VERSION)
-    metrics.kv_set(con, AGREE_KEY, json.dumps({"message": message_id, "at": time.time()}, sort_keys=True))
-    return "收到。守护进程核对是你本人引用那条私信回复的「同意」后换成采集清单 %s，几分钟内私信你结果" % CONSENT_VERSION
-
-
-def _fetch_message(message_id: str, timeout: float = 30) -> dict:
-    """用机器人身份取回一条消息（GET /im/v1/messages/:id）。取不到抛 ValueError（不带原文）。"""
-    import subprocess
-    from . import outbox
-    try:
-        p = subprocess.run([config.lark_bin(), "api", "GET", "/open-apis/im/v1/messages/" + message_id, "--as", "bot"],
-                           capture_output=True, text=True, errors="replace", timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise ValueError("调用 lark-cli 失败（%s）" % e.__class__.__name__)
-    data = outbox._parse_json(p.stdout) or outbox._parse_json(p.stderr)
-    if not data or data.get("ok") is not True:
-        err = (data or {}).get("error") if isinstance(data, dict) else None
-        code = err.get("code") if isinstance(err, dict) else None
-        raise ValueError("飞书没给这条消息%s" % ("（错误码 %s）" % code if code else ""))
-    body = data.get("data")
-    if isinstance(body, dict) and isinstance(body.get("data"), dict):
-        body = body["data"]
-    items = body.get("items") if isinstance(body, dict) else None
-    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
-        raise ValueError("飞书返回的消息格式不认识")
-    return items[0]
-
-
-def _agree_text(msg: dict) -> str:
-    if msg.get("msg_type") != "text":
-        return ""
-    try:
-        content = json.loads((msg.get("body") or {}).get("content") or "")
-    except (ValueError, AttributeError):
-        return ""
-    text = content.get("text") if isinstance(content, dict) else ""
-    return re.sub(r"[\s。．.!！~～,，「」\"'“”]+", "", text if isinstance(text, str) else "").lower()
-
-
-def _switched_at(con) -> float:
-    try:
-        return float(metrics.kv_get(con, SWITCHED_KEY) or 0)
-    except ValueError:
-        return 0.0
-
-
-def _ms(v) -> float:
-    try:
-        return float(v) / 1000.0
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def check_agree(con, req: dict, fetch=None) -> Optional[str]:
-    """核对一次「同意」：通过返回 None，不通过返回原因（给本人看的一句话）。"""
-    fetch = fetch or _fetch_message
-    offer = _kv_json(con, OFFER_KEY)
-    if not offer or offer.get("version") != CONSENT_VERSION:
-        return "没找到给你发过的新清单私信"
-    row = con.execute("SELECT sent_message_id FROM outbox WHERE id=?", (offer.get("outbox"),)).fetchone()
-    offer_mid = row["sent_message_id"] if row else None
-    if not offer_mid:
-        return "新清单的私信还没发出去"
-    owner = config.owner()
-    if not owner.startswith("ou_"):
-        return "这台电脑没配置主用户（TICKETD_OWNER）"
-    try:
-        msg = fetch(req["message"])
-        sent = fetch(offer_mid)
-    except ValueError as e:
-        return "没能从飞书取回消息核对：%s" % e
-    sender = msg.get("sender") if isinstance(msg.get("sender"), dict) else {}
-    if sender.get("id") != owner or sender.get("sender_type") != "user":
-        return "回复「同意」的不是你本人"
-    if not msg.get("chat_id") or msg.get("chat_id") != sent.get("chat_id"):
-        return "「同意」不是回复在发新清单的那个私聊里"
-    if offer_mid not in (msg.get("parent_id"), msg.get("root_id")):
-        return "「同意」没有引用新清单那条私信（私聊里别的「同意」不算）"
-    if _ms(msg.get("create_time")) < _ms(sent.get("create_time")):
-        return "「同意」是在新清单私信之前发的"
-    if _ms(msg.get("create_time")) <= _switched_at(con):
-        return "这条「同意」早于你上一次换清单，不再算数"
-    if _ms(msg.get("create_time")) - _ms(sent.get("create_time")) > AGREE_WITHIN:
-        return "离新清单私信超过 30 天了"
-    if _agree_text(msg) not in AGREE_WORDS:
-        return "那条回复的内容不是「同意」"
-    return None
-
-
-def process_agree(con, fetch=None) -> Optional[str]:
-    """守护进程：有待核对的「同意」就核对，通过就换清单。结果私信主用户，返回那句话（没有待核对的返回 None）。"""
-    raw = metrics.kv_get(con, AGREE_KEY)
-    req = _kv_json(con, AGREE_KEY)
-    if not req:
-        return None
-    # 只核对一次（不通过要本人重新回复）；按原值删，期间又登记了新的就留给下一次
-    if con.execute("DELETE FROM kv WHERE key=? AND value=?", (AGREE_KEY, raw)).rowcount != 1:
-        return None
-    if not MESSAGE_ID_RE.match(str(req.get("message") or "")):
-        return None
-    try:
-        info = _switchable()
-        if info.get("consent_version") == CONSENT_VERSION:
-            return None
-        why = check_agree(con, req, fetch)
-        if why is None:
-            text = switch_consent(con, info, CONSENT_VERSION, how="（飞书私信里本人回复同意）")
-        else:
-            _event(con, "consent_rejected", why, dedupe=False)
-            text = "没有换成采集清单 %s：%s。要换的话，在发新清单的那个私聊里再回复一次「同意」。" % (CONSENT_VERSION, why)
-    except ValueError as e:
-        text = "没有换成采集清单 %s：%s" % (CONSENT_VERSION, e)
-    metrics.send_owner(con, text)
+    text = switch_consent(con, info, CONSENT_VERSION, how="（版本升级自动更新）")
+    metrics.send_owner(con, auto_upgrade_text(old))
     return text
 
 
@@ -1270,9 +1112,10 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
         _drop_skills(con)
         return {"sent": False, "ok": False, "code": code, "next_in": None, "stopped": True}
     try:
-        process_agree(con)  # 本人在私聊里回复了「同意」：先核对、换清单，这一次心跳就按新清单报
-    except Exception as e:  # 核对出意外不能挡住心跳
-        _event(con, "consent_rejected", "核对「同意」出错：%s" % e.__class__.__name__, dedupe=False)
+        maybe_auto_upgrade(con)  # c2 → c3 小迭代直接升：先换，这一次心跳就按新清单报
+    except Exception as e:  # 换不成（控制台还没升级等）不能挡住心跳，下一次再试
+        _event(con, "consent_auto_failed", "自动更新采集清单没成：%s" % (str(e)[:120] if isinstance(e, ValueError)
+                                                                      else e.__class__.__name__))
     try:
         token = read_token()
         advance: dict = {}
@@ -1329,10 +1172,6 @@ def send_heartbeat(con, now: Optional[float] = None) -> dict:
                     "恢复上报" if st == "failing" else "开始上报", dedupe=False)
         metrics.kv_set(con, "console.state", "ok")
         _sync_skills(con, resp.get("skills"), token)
-        try:
-            maybe_offer_consent(con, now)
-        except Exception:
-            pass
         _sync_gateway(con, token, now)
     else:
         metrics.kv_set(con, "console.last_error", "%s 控制台没有确认这次上报" % updsig.iso(now))
@@ -1538,15 +1377,13 @@ def doctor_line(con, now: Optional[float] = None) -> str:
     return "❌ 控制台：最近 30 分钟没有成功上报（最近的错误：%s）%s" % (err or "无，守护进程可能没在运行", suffix)
 
 
-def command_console(con, action: str, version: Optional[str] = None, message: Optional[str] = None) -> str:
+def command_console(con, action: str, version: Optional[str] = None) -> str:
     if _in_worker():
-        if action in ("accept", "agree"):
-            raise PermissionError("worker 里不能执行 ticket console %s：只能由用户本人确认" % action)
+        if action == "accept":
+            raise PermissionError("worker 里不能执行 ticket console accept：只能由用户本人确认")
         return "控制台：" + IN_WORKER_NOTE
     if action == "accept":
         return "\n".join(accept(con, version or CONSENT_VERSION))
-    if action == "agree":
-        return agree(con, message or "")
     if action == "show":
         return show_text(con)
     return "\n".join(status_lines(con))

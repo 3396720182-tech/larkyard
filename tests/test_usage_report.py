@@ -1,5 +1,5 @@
-"""用量统计（清单 c3）和机器人私信同意。对应 openspec/changes/add-usage-report/specs/ 的各个场景。
-用 test_console 的假控制台（不起服务、不碰网络）；取回飞书消息用假的 fetch。"""
+"""用量统计（清单 c3）和 c2 → c3 自动升级。对应 openspec/changes/add-usage-report/specs/ 的各个场景。
+用 test_console 的假控制台（不起服务、不碰网络）。"""
 from __future__ import annotations
 
 import json
@@ -8,17 +8,6 @@ from unittest import mock
 
 from test_console import DEVICE, OWNER, TOKEN, URL, ConsoleBase, err
 from ticketd import cli, console, scheduler, skills, updsig, usage
-
-DM_ID = "om_offer1"
-REPLY_ID = "om_reply1"
-
-
-def msg(text="同意", sender=OWNER, chat="oc_p2p", at=None, msg_type="text", sender_type="user", parent=DM_ID):
-    at = time.time() if at is None else at
-    return {"msg_type": msg_type, "chat_id": chat, "create_time": str(int(at * 1000)), "parent_id": parent,
-            "sender": {"id": sender, "id_type": "open_id", "sender_type": sender_type},
-            "body": {"content": json.dumps({"text": text}, ensure_ascii=False)}}
-
 
 class UsageBase(ConsoleBase):
     def setUp(self):
@@ -176,112 +165,71 @@ class CapCallsTest(UsageBase):
         self.assertNotIn("日落", json.dumps(caps, ensure_ascii=False))
 
 
-class AgreeTest(UsageBase):
+class AutoUpgradeTest(UsageBase):
+    """c2 → c3 是小迭代：守护进程直接升，私信本人一句说明；只升一次，本人退回后不再动。"""
     def setUp(self):
         super().setUp()
         self.enrolled_as("c2")
-        self.assertTrue(console.maybe_offer_consent(self.con))
-        self.assertFalse(console.maybe_offer_consent(self.con))  # 只私信一次
-        self.offer_at = time.time()
-        self.con.execute("UPDATE outbox SET status='sent', sent_message_id=?", (DM_ID,))
 
-    def fetch(self, reply):
-        def f(mid):
-            if mid == DM_ID:
-                return msg(text="📋 …", sender="ou_bot", at=self.offer_at - 1)
-            if mid == REPLY_ID:
-                return reply
-            raise ValueError("没有")
-        return f
+    def dms(self):
+        return [r[0] for r in self.con.execute("SELECT text FROM outbox ORDER BY id")]
 
-    def agree_and_process(self, reply):
-        self.assertIn("收到", console.agree(self.con, REPLY_ID))
-        return console.process_agree(self.con, fetch=self.fetch(reply))
-
-    def test_offer_dm_has_full_text(self):
-        text = self.con.execute("SELECT text FROM outbox").fetchone()[0]
-        self.assertIn(console.CONSENT_C3, text)
-        self.assertIn("引用（回复）这条消息说「同意」", text)
-        self.assertNotIn("出错记录」（", text)  # c2 已经在报出错记录，不说成新增
-        self.assertIn("出错记录」（", console.offer_text(current="c1"))
-
-    def test_reoffer_when_dm_dead_or_expired(self):
-        self.assertFalse(console.maybe_offer_consent(self.con))
-        self.con.execute("UPDATE outbox SET status='dead'")
-        self.assertTrue(console.maybe_offer_consent(self.con))
-        self.assertFalse(console.maybe_offer_consent(self.con, time.time() + 86400))
-        self.assertTrue(console.maybe_offer_consent(self.con, time.time() + 31 * 86400))
-        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 3)
-
-    def test_replayed_agree_after_downgrade_is_refused(self):
-        reply = msg(at=self.offer_at - 0.5)  # 本人回复「同意」在换清单之前
-        self.assertIn("已换成采集清单 c3", self.agree_and_process(reply))
-        time.sleep(0.01)
-        with mock.patch.object(console, "_ask", side_effect=["yes"]):
-            console.accept(self.con, "c2", out=self.say)
-        self.assertEqual(console.consent_version(), "c2")
-        out = self.agree_and_process(reply)  # 拿原来那条「同意」再换回去
-        self.assertIn("早于你上一次换清单", out)
-        self.assertEqual(console.consent_version(), "c2")
-
-    def test_owner_reply_switches_to_c3(self):
-        out = self.agree_and_process(msg(text="同意。"))
-        self.assertIn("已换成采集清单 c3", out)
+    def test_heartbeat_upgrades_c2_and_reports_usage(self):
+        old = self.ticket(1)
+        self.con.execute("UPDATE tickets SET created_at=? WHERE id=?", (time.time() - 60, old))
+        console.send_heartbeat(self.con)
         self.assertEqual(console.consent_version(), "c3")
         self.assertEqual(self.fake.bodies("/api/v1/device/consent"),
                          [{"version": "c3", "sha256": console.consent_sha256("c3")}])
-        self.assertIn("usage", console.build_heartbeat(self.con))
-        self.assertIn("已换成采集清单 c3", self.con.execute("SELECT text FROM outbox ORDER BY id DESC").fetchone()[0])
-        self.assertIsNone(console.process_agree(self.con, fetch=self.fetch(msg())))  # 只核对一次
+        hb = self.fake.bodies("/api/v1/heartbeat")[-1]
+        self.assertEqual(hb["usage"]["cats"], [])  # 这一次心跳就按 c3 报；升级之前建的单不算
+        dms = self.dms()
+        self.assertEqual(len(dms), 1)
+        self.assertIn("从 c2 更新到 c3", dms[0])
+        self.assertIn("ticket console accept c2", dms[0])
+        console.send_heartbeat(self.con)
+        self.assertEqual(len(self.fake.bodies("/api/v1/device/consent")), 1)
+        self.assertEqual(len(self.dms()), 1)  # 只私信一次
 
-    def test_rejections_keep_consent(self):
-        """场景：别人发的「同意」。"""
-        for reply, why in ((msg(sender="ou_" + "f" * 32), "不是你本人"),
-                           (msg(sender=OWNER, sender_type="app"), "不是你本人"),
-                           (msg(chat="oc_group"), "不是回复在"),
-                           (msg(parent=None), "没有引用"),
-                           (msg(parent="om_other"), "没有引用"),
-                           (msg(sender_type=None), "不是你本人"),
-                           (msg(at=self.offer_at - 100), "之前发的"),
-                           (msg(text="不同意"), "不是「同意」"),
-                           (msg(msg_type="post"), "不是「同意」")):
-            out = self.agree_and_process(reply)
-            self.assertIn(why, out)
-            self.assertEqual(console.consent_version(), "c2")
+    def test_no_reupgrade_after_owner_goes_back(self):
+        self.assertIsNotNone(console.maybe_auto_upgrade(self.con))
+        with mock.patch.object(console, "_ask", side_effect=["yes"]):
+            console.accept(self.con, "c2", out=self.say)
+        self.assertEqual(console.consent_version(), "c2")
+        self.assertIsNone(console.maybe_auto_upgrade(self.con))
+        console.send_heartbeat(self.con)
+        self.assertEqual(console.consent_version(), "c2")
+        self.assertNotIn("usage", self.fake.bodies("/api/v1/heartbeat")[-1])
+
+    def test_c3_enrollment_going_back_to_c2_stays(self):
+        self.enrolled_as("c3")
+        with mock.patch.object(console, "_ask", side_effect=["yes"]):
+            console.accept(self.con, "c2", out=self.say)
+        self.assertIsNone(console.maybe_auto_upgrade(self.con))
+
+    def test_c1_is_not_upgraded(self):
+        self.enrolled_as("c1")
+        self.assertIsNone(console.maybe_auto_upgrade(self.con))
+        console.send_heartbeat(self.con)
+        self.assertEqual(console.consent_version(), "c1")
         self.assertEqual(self.fake.bodies("/api/v1/device/consent"), [])
 
-    def test_agree_needs_offer_and_valid_id(self):
-        with self.assertRaises(ValueError):
-            console.agree(self.con, "not-an-id")
-        self.con.execute("DELETE FROM kv WHERE key=?", (console.OFFER_KEY,))
-        with self.assertRaises(ValueError):
-            console.agree(self.con, REPLY_ID)
-
-    def test_agree_refused_in_worker_and_via_cli(self):
-        with mock.patch.dict("os.environ", {"TICKETD_TICKET": "T0001"}):
-            with self.assertRaises(PermissionError):
-                console.command_console(self.con, "agree", message=REPLY_ID)
-        code, out = self.cli("console", "agree")
-        self.assertNotEqual(code, 0)
-        self.assertIn("--message", out)
-        code, out = self.cli("console", "agree", "--message", REPLY_ID)
-        self.assertEqual(code, 0, out)
-        self.assertIn("收到", out)
-
-    def test_heartbeat_processes_pending_agree(self):
-        console.agree(self.con, REPLY_ID)
-        with mock.patch.object(console, "_fetch_message", side_effect=self.fetch(msg())):
-            console.send_heartbeat(self.con)
-        self.assertEqual(console.consent_version(), "c3")
-        hb = self.fake.bodies("/api/v1/heartbeat")[-1]
-        self.assertIn("usage", hb)  # 换完这一次心跳就按新清单报
-
-    def test_console_without_c3_tells_to_upgrade(self):
+    def test_old_console_keeps_c2_and_retries(self):
         self.fake.routes[("POST", "/api/v1/device/consent")] = \
             (400, {"error": {"code": "ConsentUnknown", "message": ""}})
-        out = self.agree_and_process(msg())
-        self.assertIn("控制台要先升级", out)
+        console.send_heartbeat(self.con)
         self.assertEqual(console.consent_version(), "c2")
+        self.assertEqual(console.state(self.con), "ok")  # 换不成不挡心跳
+        self.assertNotIn("usage", self.fake.bodies("/api/v1/heartbeat")[-1])
+        self.assertEqual(self.dms(), [])
+        self.fake.routes[("POST", "/api/v1/device/consent")] = \
+            lambda body, h: (200, {"ok": True, "consent_version": body["version"]})
+        console.send_heartbeat(self.con)  # 控制台升级后下一次心跳就换上
+        self.assertEqual(console.consent_version(), "c3")
+
+    def test_chat_agree_flow_is_gone(self):
+        for name in ("agree", "process_agree", "maybe_offer_consent"):
+            self.assertFalse(hasattr(console, name), name)
 
 
 class VersionCompareTest(UsageBase):
@@ -304,9 +252,9 @@ class AcceptC3Test(UsageBase):
         self.assertEqual(console.build_heartbeat(self.con)["usage"]["cats"], [])
         self.assertIsNone(console.consent_note(self.con))
 
-    def test_non_tty_accept_points_to_chat(self):
+    def test_non_tty_accept_refused(self):
         self.enrolled_as("c2")
         with mock.patch.object(console, "_stdin_is_tty", return_value=False):
             with self.assertRaises(PermissionError) as cm:
                 console.accept(self.con, "c3", out=self.say)
-        self.assertIn("回复「同意」", str(cm.exception))
+        self.assertIn("终端", str(cm.exception))

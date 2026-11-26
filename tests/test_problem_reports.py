@@ -432,6 +432,7 @@ class ReviewFixesTest(ProblemsBase):
     # 3. 控制台退回旧版本
     def test_unknown_field_retries_without_problems(self):
         self.round_(self.tid, "failed")
+        self.fake.routes[("POST", "/api/v1/device/consent")] = err("ConsentUnknown")  # 旧控制台：也不认识 c3，留在 c2
         self.fake.routes[("POST", "/api/v1/heartbeat")] = [err("UnknownField"), (200, {"ok": True, "next_in": 300})]
         res = console.send_heartbeat(self.con)
         self.assertTrue(res["ok"])

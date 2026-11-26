@@ -655,14 +655,11 @@ class HeartbeatTest(ConsoleBase):
         self.assertEqual(c["timeout"], 15.0)
         self.assertTrue(console.connected(self.con))
         self.assertEqual(console.state(self.con), "ok")
-        # 这台是 c1：上报成功后私信一次新清单 c3 全文（只发一次）
+        # 这台是 c1：不自动升级（只有 c2 → c3 自动升），也不私信
         self.assertEqual([r["code"] for r in self.con.execute("SELECT code FROM events WHERE kind='console'")],
-                         ["started", "consent_offer"])
-        dm = self.con.execute("SELECT text FROM outbox").fetchall()
-        self.assertEqual(len(dm), 1)
-        self.assertIn(console.CONSENT_C3, dm[0]["text"])
+                         ["started"])
         console.send_heartbeat(self.con)
-        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
 
     def test_show_matches_what_is_sent(self):
         """场景：对照。"""
