@@ -256,7 +256,8 @@ def preflight(found, missing) -> List[str]:
     return warns
 
 
-def install(run=subprocess.run, popen=subprocess.Popen, wait: float = 20.0) -> int:
+def install(run=subprocess.run, popen=subprocess.Popen, wait: float = 20.0, guided: bool = False) -> int:
+    """guided=True：由一键安装向导（winsetup）调用，认主人和重启 bridge 它接着就做，这里不再提示。"""
     if not host.is_windows():
         raise InstallError("这是 Windows 的安装程序；macOS / Linux 用 scripts/install.sh")
     found, missing = find_tools()
@@ -267,7 +268,7 @@ def install(run=subprocess.run, popen=subprocess.Popen, wait: float = 20.0) -> i
     if not config.config_file().exists():
         shutil.copyfile(str(REPO / "config.example.env"), str(config.config_file()))
         print("created: %s（先填好 TICKETD_OWNER）" % config.config_file())
-    if not config.owner():
+    if not guided and not config.owner():
         print("install: ⚠️ %s 里还没有 TICKETD_OWNER，派单会被拒绝" % config.config_file(), file=sys.stderr)
     config.workroot().mkdir(parents=True, exist_ok=True)
     env = service_env(found)
@@ -289,8 +290,10 @@ def install(run=subprocess.run, popen=subprocess.Popen, wait: float = 20.0) -> i
               file=sys.stderr)
     print("installed: %s（%s）" % (label(), "计划任务" if how == "task" else "「启动」文件夹"))
     print("workroot: %s" % config.workroot())
-    print("PATH: 已把 %s 加进用户 PATH；重开终端，并重启 bridge（lark-channel-bridge service restart）让主会话用上 ticket"
-          % (REPO / "bin"))
+    if guided:
+        return 0
+    print("PATH: 已把 %s 加进用户 PATH；重开终端，并重新执行 lark-channel-bridge start 让主会话用上 ticket"
+          "（bridge 的启动脚本在 start 时记下 PATH，restart 不会更新它）" % (REPO / "bin"))
     return 0
 
 

@@ -42,7 +42,7 @@ jobs:
           python-version: "3.12"
       # 真调 Windows 接口的用例（作业对象、进程、文件真实路径、联接点、文件锁、收汇报）+ mock 的平台分支
       - name: Windows unit tests
-        run: python -m unittest discover -s tests -p "test_windows.py" -v
+        run: python -m unittest discover -s tests -p "test_windows*.py" -v
       - name: Stand-ins for claude and lark-cli
         # 只验证服务能装、能起、能停；不跑 worker，也不发消息
         run: |
@@ -91,6 +91,42 @@ jobs:
         run: |
           Get-ChildItem (Join-Path $HOME '.ticketd\logs') -ErrorAction SilentlyContinue | ForEach-Object { "== $_"; Get-Content $_.FullName -Tail 50 }
           schtasks /Query /V /FO LIST /TN dev.larkyard.ticketd 2>$null
+
+  windows-bootstrap:
+    # 一行安装（scripts/windows/bootstrap.ps1）在 Windows PowerShell 5.1 里按 irm | iex 的方式真跑：真装 npm 工具和
+    # Claude Code、真 clone 这个分支。CI 里没有终端，向导应停在「建飞书应用要扫码」；跑两遍，第二遍只快进、不重装
+    name: one-line install (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell
+    env:
+      LARKYARD_BRANCH: ${{ github.head_ref || github.ref_name }}
+      LARKYARD_REPO: ${{ github.event.pull_request.head.repo.clone_url || format('https://github.com/{0}.git', github.repository) }}
+      TICKETD_WIN_SANDBOX: "off"   # 不在 CI 里真装 sandbox-runtime 的系统账户和 WFP 规则
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the one-liner twice
+        run: |
+          $env:LARKYARD_DIR = Join-Path $env:RUNNER_TEMP 'larkyard'
+          foreach ($i in 1, 2) {
+            $log = Join-Path $env:RUNNER_TEMP "bootstrap-$i.log"
+            Invoke-Expression (Get-Content -Raw scripts\windows\bootstrap.ps1) *>&1 | Tee-Object -FilePath $log
+            $text = Get-Content -Raw $log
+            if ($text -match 'Stopped:|Traceback') { Write-Error "bootstrap or winsetup crashed on run $i"; exit 1 }
+            # 退出码 3 只用于「要在终端里扫码」：崩溃、其他失败都是 1
+            if ($text -notmatch 'Not finished yet \(exit 3\)') { Write-Error "winsetup did not stop at the QR step on run $i"; exit 1 }
+          }
+          if ((Get-Content -Raw (Join-Path $env:RUNNER_TEMP 'bootstrap-2.log')) -match 'npm install -g|Installing Claude Code|Cloning') {
+            Write-Error 'second run reinstalled something'; exit 1
+          }
+          foreach ($t in 'claude', 'lark-cli', 'lark-channel-bridge', 'srt') {
+            if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { Write-Error "$t missing after bootstrap"; exit 1 }
+          }
+          if (-not (Test-Path (Join-Path $env:LARKYARD_DIR '.git'))) { Write-Error 'repo not cloned'; exit 1 }
+          if (Get-Command Install-Larkyard -ErrorAction SilentlyContinue) { Write-Error 'function leaked into the session'; exit 1 }
+          exit 0
 
   telemetry-worker:
     name: telemetry backend (node)

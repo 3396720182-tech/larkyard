@@ -254,27 +254,23 @@ sudo loginctl enable-linger "$USER"
 
 ### 原生 Windows（第一版）
 
-公司禁用 WSL2 时用这个。和 macOS / Linux 的区别：从仓库目录安装（还不支持一行安装、自动更新和打包的 bridge），服务由计划任务托管，worker 沙箱换成 Anthropic 的 sandbox-runtime。设计和取舍见 `docs/spec.md` §3.2。
+公司禁用 WSL2 时用这个。和 macOS / Linux 的区别：从仓库目录运行（还不支持签名发版的受管安装、自动更新和打包的 bridge），服务由计划任务托管，worker 沙箱换成 Anthropic 的 sandbox-runtime。设计和取舍见 `docs/spec.md` §3.2。
 
-先装好：Python 3.9+（[python.org](https://www.python.org/downloads/windows/) 版，带 `py` 启动器）、[Git for Windows](https://git-scm.com/download/win)（Claude Code 的 Bash 工具和 worker 都用 Git Bash）、Node LTS、`npm install -g @larksuite/cli`、Claude Code（原生安装版，`claude` 已登录）、lark-channel-bridge（`npm install -g` 后 `lark-channel-bridge service install`，它在 Windows 上自己注册计划任务）。
+**一行安装**：在普通（不用管理员）PowerShell 窗口里执行
 
 ```powershell
-# worker 沙箱：sandbox-runtime（Windows 版为 alpha）。windows-install 会弹一次管理员确认，
-# 建一个专用的 srt-sandbox 本地账户和出网防火墙规则；没有管理员权限就请 IT 代为执行这一步
-npm install -g @anthropic-ai/sandbox-runtime
-npx @anthropic-ai/sandbox-runtime windows-install
-
-git clone https://github.com/3396720182-tech/larkyard.git $HOME\larkyard
-cd $HOME\larkyard
-powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1   # 第一次会生成 ~/.ticketd/config.env，填好 TICKETD_OWNER 后再执行一次
-# 主会话约定：在 Git Bash 里执行
-sh scripts/setup-workspace.sh <bridge 的工作区目录>
-lark-channel-bridge service restart   # 让主会话用上新的 PATH（ticket 命令）
+irm https://raw.githubusercontent.com/3396720182-tech/larkyard/sanr/T0094-windows-native/scripts/windows/bootstrap.ps1 | iex
 ```
+
+它先补齐缺的 Python 3.9+、Git for Windows、Node 20.12+（用 winget；Git、Node 可能各弹一次管理员确认）、npm 上的 `@larksuite/cli`、`lark-channel-bridge`、`@anthropic-ai/sandbox-runtime` 和 Claude Code（官方原生安装版），把仓库 clone 到 `~\larkyard`，然后交给 `ticketd/winsetup.py` 依次：① 没登录就 `claude auth login`（用 API 密钥 / 网关的跳过）→ ② `srt windows-install`（弹一次 UAC；第一次给沙箱账户开放读用户目录，要几分钟）→ ③ 没有 bridge profile 就扫码建飞书应用（建议这台电脑单独建一个，一个应用连两台电脑消息会随机落到其中一台）→ ④ 写工作区约定 → ⑤ 装 ticketd 服务 → ⑥ `lark-channel-bridge start`（bridge 的启动脚本在 start 时记下 PATH，主会话靠它找到 `ticket`；restart 不会更新）→ ⑦ 认主人（查应用所有者问「是你吗」，查不到就请你私聊 bot 发验证码）→ ⑧ `ticket doctor`。
+
+**中途停了或要更新：重跑同一行**，做过的步骤会跳过，仓库只快进。可选环境变量（在同一行前面写 `$env:名字='值';`）：`LARKYARD_OWNER`（直接给主人 open_id）、`LARKYARD_ALLOW_LOOPBACK=1`（装沙箱时放开本机端口，全机生效）、`LARKYARD_DIR`（仓库位置）、`LARKYARD_BRANCH`、`LARK_CHANNEL_PROFILE`、`LARKYARD_WORKSPACE`。没有管理员权限时，请 IT 用管理员身份执行一次 `srt windows-install`，你自己再重跑这一行（补上读用户目录的授权）。
+
+手动安装（不用一行命令时）：装好上面那些工具后，在仓库目录里 `py -3 -m ticketd.winsetup`；只装 ticketd 服务用 `powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1`。
 
 - 安装做了什么：注册计划任务 `dev.larkyard.ticketd`（登录时启动、不限运行时长、用电池也跑），公司策略不让建计划任务时改用「启动」文件夹；把仓库的 `bin` 加进用户 PATH、设 `TICKETD_PYTHON`；守护进程的环境写在 `~/.ticketd/service.env`。可重复执行。
 - 管理服务：`py -3 -m ticketd.winsvc status|stop`（在仓库目录里）；启动 `schtasks /Run /TN dev.larkyard.ticketd`；日志在 `~/.ticketd/logs/`。卸载：`scripts\windows\uninstall.ps1`（数据目录和工单目录保留）。
-- 更新：`git pull` 后重新执行 `install.ps1`。`ticket update / setup / bridge / migrate` 在 Windows 上会提示暂不支持。
+- 更新：重跑一行安装命令（或 `git pull` 后重新执行 `install.ps1`）。`ticket update / setup / bridge / migrate` 在 Windows 上会提示暂不支持。
 - worker 沙箱：Claude Code 自带的沙箱不支持原生 Windows，Larkyard 把 worker 的每条 Bash 命令经 sandbox-runtime 运行（专用账户 + 写受限令牌 + ACL + 出网围栏），Claude 自己的读写工具照旧按权限规则拦，PowerShell 工具禁用。没装 sandbox-runtime 或 Git Bash 时 worker 不会启动，状态卡上会说明怎么装；确实不要沙箱时在 `config.env` 写 `TICKETD_WIN_SANDBOX=off`（只剩权限规则，管不住 Bash 命令）。Codex 单用 Codex 自带的 Windows 沙箱（`TICKETD_CODEX_WIN_SANDBOX`）。
 - 已知差别：worker 沙箱里调不了 lark-cli（Windows 版 lark-cli 的凭据在当前用户的注册表里，沙箱账户读不到）；「放开本机网络」要在装 sandbox-runtime 时加 `--allow-loopback`（全机生效），不能按单放开；停止 worker 是直接结束进程（Windows 没有温和的终止信号），会话照常可续。
 

@@ -254,27 +254,23 @@ sudo loginctl enable-linger "$USER"
 
 ### Native Windows (first version)
 
-For machines where WSL2 is not allowed. Differences from macOS / Linux: you install from the repo (no one-line install, self-update or bundled bridge yet), Task Scheduler runs the service, and the worker sandbox is Anthropic's sandbox-runtime. Design and trade-offs: `docs/spec.md` §3.2.
+For machines where WSL2 is not allowed. Differences from macOS / Linux: it runs from a repo clone (no signed managed install, self-update or bundled bridge yet), Task Scheduler runs the service, and the worker sandbox is Anthropic's sandbox-runtime. Design and trade-offs: `docs/spec.md` §3.2.
 
-Prerequisites: Python 3.9+ (python.org build with the `py` launcher), [Git for Windows](https://git-scm.com/download/win) (Claude Code's Bash tool and workers use Git Bash), Node LTS, `npm install -g @larksuite/cli`, Claude Code (native installer, logged in), lark-channel-bridge (`npm install -g`, then `lark-channel-bridge service install`; it registers its own scheduled task on Windows).
+**One-line install**: in a normal (non-admin) PowerShell window run
 
 ```powershell
-# Worker sandbox: sandbox-runtime (alpha on Windows). windows-install asks for admin once and creates a dedicated
-# srt-sandbox local account and egress firewall rules; without admin rights ask IT to run this step
-npm install -g @anthropic-ai/sandbox-runtime
-npx @anthropic-ai/sandbox-runtime windows-install
-
-git clone https://github.com/3396720182-tech/larkyard.git $HOME\larkyard
-cd $HOME\larkyard
-powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1   # first run creates ~/.ticketd/config.env; fill in TICKETD_OWNER and run again
-# Main-session rules: in Git Bash
-sh scripts/setup-workspace.sh <bridge workspace dir>
-lark-channel-bridge service restart   # so the main session picks up the new PATH (ticket)
+irm https://raw.githubusercontent.com/3396720182-tech/larkyard/sanr/T0094-windows-native/scripts/windows/bootstrap.ps1 | iex
 ```
+
+It installs whatever is missing of Python 3.9+, Git for Windows, Node 20.12+ (via winget; Git and Node may each ask for admin once), `@larksuite/cli`, `lark-channel-bridge`, `@anthropic-ai/sandbox-runtime` from npm and Claude Code (official native installer), clones the repo to `~\larkyard`, then hands over to `ticketd/winsetup.py`: ① `claude auth login` if not logged in (skipped with an API key / gateway) → ② `srt windows-install` (one UAC prompt; the first run makes the user profile readable to the sandbox account, which takes minutes) → ③ scan a QR code to create the Feishu app if there is no bridge profile (create a separate app for this PC: with one app on two machines, messages land on either at random) → ④ workspace rules → ⑤ ticketd service → ⑥ `lark-channel-bridge start` (the bridge's Windows launcher records PATH on start, which is how the main session finds `ticket`; restart does not refresh it) → ⑦ owner (asks whether the app owner is you, otherwise asks you to DM the bot a code) → ⑧ `ticket doctor`.
+
+**If it stopped, or to update: run the same line again**; finished steps are skipped and the repo is only fast-forwarded. Optional env vars (prefix the line with `$env:NAME='value';`): `LARKYARD_OWNER` (owner open_id), `LARKYARD_ALLOW_LOOPBACK=1` (let sandboxed commands reach localhost, machine-wide), `LARKYARD_DIR`, `LARKYARD_BRANCH`, `LARK_CHANNEL_PROFILE`, `LARKYARD_WORKSPACE`. Without admin rights, ask IT to run `srt windows-install` once as administrator, then run the line again yourself (to add the profile read grant).
+
+Manual install: with those tools in place, run `py -3 -m ticketd.winsetup` in the repo; for the ticketd service alone, `powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1`.
 
 - What install does: registers the scheduled task `dev.larkyard.ticketd` (at logon, no run-time limit, runs on battery), falling back to the Startup folder when policy forbids scheduled tasks; adds the repo's `bin` to the user PATH and sets `TICKETD_PYTHON`; the daemon's environment lives in `~/.ticketd/service.env`. Safe to re-run.
 - Manage: `py -3 -m ticketd.winsvc status|stop` (in the repo); start with `schtasks /Run /TN dev.larkyard.ticketd`; logs in `~/.ticketd/logs/`. Uninstall: `scripts\windows\uninstall.ps1` (data and ticket dirs are kept).
-- Update: `git pull`, then re-run `install.ps1`. `ticket update / setup / bridge / migrate` say they are not supported on Windows yet.
+- Update: run the one-line install again (or `git pull`, then re-run `install.ps1`). `ticket update / setup / bridge / migrate` say they are not supported on Windows yet.
 - Worker sandbox: Claude Code's own sandbox does not run on native Windows, so Larkyard runs every worker Bash command through sandbox-runtime (dedicated account + write-restricted token + ACLs + egress fence); Claude's own file tools are still limited by permission rules, and the PowerShell tool is disabled. Without sandbox-runtime or Git Bash the worker does not start and the status card says how to install them; if you really want no sandbox, set `TICKETD_WIN_SANDBOX=off` in `config.env` (permission rules only, Bash commands are not contained). Codex tickets use Codex's own Windows sandbox (`TICKETD_CODEX_WIN_SANDBOX`).
 - Known differences: lark-cli doesn't work inside the worker sandbox (Windows lark-cli keeps credentials in the current user's registry, which the sandbox account can't read); "allow local network" requires installing sandbox-runtime with `--allow-loopback` (machine-wide), not per ticket; stopping a worker terminates it outright (Windows has no gentle termination signal), the session can still be resumed.
 

@@ -2,7 +2,8 @@
 
 ## 未发布
 
-- 原生 Windows（10 / 11，第一版）：公司禁用 WSL2 时也能用。从仓库目录安装（`scripts\windows\install.ps1`），服务由计划任务托管（登录时启动、不限运行时长、用电池也跑；不让建计划任务时用「启动」文件夹），守护进程崩溃 10 秒后自动重拉。worker 和沙箱外执行各自在一个作业对象里，停止时整棵进程树一起结束。Claude worker 的每条 Bash 命令经 Anthropic 的 sandbox-runtime 隔离（要管理员装一次），读写工具照旧按权限规则拦，PowerShell 工具禁用；没装沙箱时 worker 不启动并说明怎么装。Codex 单用 Codex 自带的 Windows 沙箱。一行安装、自动更新、打包的 bridge 在 Windows 上还不支持。还没在真机上跑过 worker，见 README「原生 Windows」和 `docs/spec.md` §3.2。
+- 原生 Windows（10 / 11，第一版）：公司禁用 WSL2 时也能用。从仓库目录安装（`scripts\windows\install.ps1`），服务由计划任务托管（登录时启动、不限运行时长、用电池也跑；不让建计划任务时用「启动」文件夹），守护进程崩溃 10 秒后自动重拉。worker 和沙箱外执行各自在一个作业对象里，停止时整棵进程树一起结束。Claude worker 的每条 Bash 命令经 Anthropic 的 sandbox-runtime 隔离（要管理员装一次），读写工具照旧按权限规则拦，PowerShell 工具禁用；没装沙箱时 worker 不启动并说明怎么装。Codex 单用 Codex 自带的 Windows 沙箱。自动更新、打包的 bridge 在 Windows 上还不支持。还没在真机上跑过 worker，见 README「原生 Windows」和 `docs/spec.md` §3.2。
+- 原生 Windows 一行安装：在 PowerShell 里执行 README「原生 Windows」那一行（`irm …/scripts/windows/bootstrap.ps1 | iex`），缺的 Python / Git / Node / npm 工具 / Claude Code 自动装，接着登录 Claude、装 worker 沙箱（一次管理员确认）、扫码建飞书应用、写工作区约定、装服务、启动 bridge、认主人、自检。中途停了或要更新就重跑同一行，做过的步骤跳过。也可以在仓库里 `py -3 -m ticketd.winsetup`。
 - 新配置：`TICKETD_WIN_SANDBOX`、`TICKETD_SRT`、`TICKETD_CODEX_WIN_SANDBOX`（只在 Windows 上生效）。
 
 ## 0.3.8 — 2026-11-26

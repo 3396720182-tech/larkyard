@@ -598,13 +598,13 @@ COMMANDS = {
 
 # 原生 Windows 第一版（spec §3.2）只支持从仓库目录安装（scripts\windows\install.ps1）：受管安装、自动更新、
 # 打包的 bridge 都靠符号链接和 launchd / systemd，还没做
-_WIN_UPDATE = "（原生 Windows 暂不支持：在仓库目录里 git pull，再运行 scripts\\windows\\install.ps1）"
+_WIN_UPDATE = "（原生 Windows 暂不支持：重跑一行安装命令（README「原生 Windows」），或在仓库目录里 git pull 再运行 scripts\\windows\\install.ps1）"
 WINDOWS_UNSUPPORTED = {
     "update": "ticket update" + _WIN_UPDATE,
     "migrate": "ticket migrate" + _WIN_UPDATE,
-    "setup": "ticket setup（原生 Windows 暂不支持：bridge 用 npm 装、lark-channel-bridge service install 装成服务；"
-             "工作区约定用 Git Bash 执行 scripts/setup-workspace.sh <工作区目录>；ticketd 用 scripts\\windows\\install.ps1）",
-    "bridge": "ticket bridge（原生 Windows 暂不支持：bridge 自己管服务，用 lark-channel-bridge service status / restart）",
+    "setup": "ticket setup（原生 Windows 用安装向导：在仓库目录里执行 py -3 -m ticketd.winsetup，或重跑一行安装命令）",
+    "bridge": "ticket bridge（原生 Windows 暂不支持：bridge 自己管服务，用 lark-channel-bridge status / start；"
+              "换了 PATH 要用 start，restart 不会更新启动脚本里的 PATH）",
 }
 
 
