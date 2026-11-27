@@ -586,3 +586,63 @@ class AdoptLinuxTest(AdoptTestMixin, BridgeTestBase):
         self.assertIn("05:15:00", timer)
         bridge.undo_adopt(services=self.svc)
         self.assertEqual(self.snapshot(), before)
+
+
+class ServiceEnvRefreshMixin:
+    """较早接管的机器 bridge 服务里没有 LARKYARD_TICKET_BIN（会议待办派单、工单快速通道都靠它）：
+    服务文件只在 setup / adopt 时写，自动更新不重写——所以重启 bridge 时补上，保留原有 PATH 和日志位置。"""
+
+    def setUp(self):
+        super().setUp()
+        self.v1 = self.make_current("0.3.0", commit="1" * 40)
+        bridge.ensure_runtime(self.v1, plat=self.plat(), fetch=self.fetch)
+        bridge.link_bridge(self.v1)
+        self.sf = bridge.bridge_service_file("claude")
+        self.path = "/custom/bin:/usr/bin:/bin"
+        bridge._write(self.sf, self._without_ticket_bin(bridge.render_bridge_service("claude", self.path)))
+        self.logs = bridge.service_logs(self.sf)
+        self.svc = FakeServices()
+        p = mock.patch("ticketd.bridge.platform_key", return_value=self.plat())
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _without_ticket_bin(self, data: bytes) -> bytes:
+        if self.platform == "darwin":
+            doc = plistlib.loads(data)
+            del doc["EnvironmentVariables"][bridge.TICKET_BIN_ENV]
+            return plistlib.dumps(doc, sort_keys=False)
+        return b"\n".join(l for l in data.split(b"\n") if bridge.TICKET_BIN_ENV.encode() not in l)
+
+    def _restart(self, **kw):
+        return bridge.restart("claude", services=self.svc, fetch=self.fetch, wait=lambda *a, **k: True, **kw)
+
+    def test_restart_adds_the_missing_ticket_bin_and_reloads(self):
+        self.assertNotIn(bridge.TICKET_BIN_ENV, bridge.service_env(self.sf))
+        self._restart()
+        env = bridge.service_env(self.sf)
+        self.assertEqual(env[bridge.TICKET_BIN_ENV], str(update.app_dir() / "current" / "bin" / "ticket"))
+        self.assertEqual(env["PATH"], self.path)  # 原来的 PATH 保留
+        self.assertEqual(bridge.service_logs(self.sf), self.logs)
+        # 改了服务文件要重新加载：光重启进程（kickstart）读不到新的环境变量
+        self.assertEqual([c[0] for c in self.svc.calls], ["load"])
+
+    def test_daily_if_stale_restart_still_applies_it(self):
+        out = self._restart(if_stale=True)
+        self.assertIn(bridge.TICKET_BIN_ENV, bridge.service_env(self.sf))
+        self.assertEqual([c[0] for c in self.svc.calls], ["load"])
+        self.assertNotIn("不用重启", " ".join(out))
+
+    def test_current_env_restarts_without_rewriting(self):
+        bridge._write(self.sf, bridge.render_bridge_service("claude", self.path))
+        before = self.sf.read_bytes()
+        self._restart()
+        self.assertEqual(self.sf.read_bytes(), before)
+        self.assertEqual([c[0] for c in self.svc.calls], ["restart"])
+
+
+class ServiceEnvRefreshDarwinTest(ServiceEnvRefreshMixin, BridgeTestBase):
+    platform = "darwin"
+
+
+class ServiceEnvRefreshLinuxTest(ServiceEnvRefreshMixin, BridgeTestBase):
+    platform = "linux"

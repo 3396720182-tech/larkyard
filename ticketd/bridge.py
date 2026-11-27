@@ -724,6 +724,21 @@ def stale(app_current: Optional[Path] = None) -> Optional[tuple]:
     return cur.resolve(), new, old
 
 
+def refresh_service(profile: str, sf: Path) -> bool:
+    """Larkyard 写的 bridge 服务文件缺了它该有的环境（目前是 LARKYARD_TICKET_BIN：会议待办派单、工单快速通道都靠它）时
+    按现在的模板重写，原有的 PATH、LARK_CHANNEL_HOME 和日志位置照旧。服务文件只在 setup / adopt 时写、自动更新不重写，
+    较早接管的机器一直缺这个变量。返回是否重写了（重写了要重新加载服务，光重启进程读不到新环境）。"""
+    from . import update
+    env = service_env(sf)
+    want = str(update.app_dir() / "current" / "bin" / "ticket")
+    if env.get(TICKET_BIN_ENV) == want:
+        return False
+    out, err = service_logs(sf)
+    _write(sf, render_bridge_service(profile, env.get("PATH") or service_path(),
+                                     home=Path(env.get("LARK_CHANNEL_HOME") or lc_home()), stdout=out, stderr=err))
+    return True
+
+
 def restart(profile: str = "", if_stale: bool = False, services: Optional[Services] = None,
             fetch=fetch_verified, wait=wait_online, notify=None) -> list:
     """切到当前版本带的 bridge（必要时）、确保运行时、重启 bridge 服务、确认在线；不在线就切回再重启一次。"""
@@ -742,8 +757,11 @@ def restart(profile: str = "", if_stale: bool = False, services: Optional[Servic
         target = None
     else:
         target = stale()
-    if if_stale and not target:
+    refreshed = refresh_service(profile, sf)
+    if if_stale and not target and not refreshed:
         return ["bridge 已是当前版本带的那一份，不用重启"]
+    if refreshed:
+        out.append("bridge 服务补上了 %s（重新加载服务）" % TICKET_BIN_ENV)
     home = Path(service_env(sf).get("LARK_CHANNEL_HOME") or lc_home())
     cur = Path(update.current_link()).resolve()
     out += ensure_runtime(cur, fetch=fetch)
@@ -757,7 +775,10 @@ def restart(profile: str = "", if_stale: bool = False, services: Optional[Servic
         out.append("bridge → %s（%s）" % (target[1].get("version"), str(target[1].get("commit"))[:12]))
     started = time.time()
     try:
-        services.restart(bridge_label(profile))
+        if refreshed:
+            services.load(bridge_label(profile), sf)
+        else:
+            services.restart(bridge_label(profile))
     except BaseException as e:
         if old:  # 链接已切、重启没成：切回，免得下一个窗口当成「已是这个版本」不再重启
             _swap_link(bridge_link(), old)
