@@ -545,6 +545,22 @@ worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `e
 
 **没实测的**（单测和临时 HOME 全流程只用了替身）：真实租户上的扫码建应用、bot 身份查应用所有者、真实 launchd 下的 bridge 重启和在线确认、Linux 上的整套服务。
 
+
+### 13.x 工单快速通道（2026-11-27，fork 提交 804f150）
+
+起因：主会话 9 天 $78.7 里约 $27 花在纯派单 / 转发 / 查询上；其中「引用工单卡片回复」「停 T0005」这类消息结构是确定的，不需要模型判断。fork 是我们自己的，所以在 bridge 里加了一条确定性的快速通道（`src/larkyard/ticket-fast-path.ts`，只在 `larkyard/vendor` 分支上；对上游代码只改了 `intakeMessage` 里斜杠命令之后的一行调用和一个 import）。
+
+- 启用条件：bridge 服务的环境里有 `LARKYARD_TICKET_BIN`（Larkyard 生成的 bridge 服务定义本来就带，会议纪要的「派成工单」也用它）。和会议纪要不同，这里没有退回 PATH 里 `ticket` 的兜底：不由 Larkyard 管理的 bridge 行为和上游完全一样。
+- 处理范围（访问控制、群聊 @ 规则、斜杠命令都在它之前照常生效；带附件的消息不处理）：
+  - 引用了一条消息、且 `ticket lookup --message <被引用的消息>` 命中：整条消息恰好是控制词时执行控制——停 / 停止 / 不做了 / 别做了 → `stop`；先别动 / 暂停 / 等我确认 → `hold`；继续 / 可以了 / 恢复 / 接着做 → `release`（工单既没暂停也没停止时改为追问）；执行 / 批准 / 可以执行 → `approve`（没有待批准的沙箱外执行时改为追问）；换新会话重来 / 会话坏了重开 → `restart`。其余一律 `ticket send <工单> --message <这条消息> --text <去掉开头 @ 的原话>`。话题群里话题根消息不算引用（和 bridge 的规则一致）。
+  - 没有引用、整条消息是「控制词 + 工单号」（停 T0005、先别动t0012）：对这个工单执行控制；被拒绝的「继续」「执行」没有引用可作上下文，交回主会话判断。
+  - 其他（没引用也没工单号、引用的不是工单消息、只是提到工单号的句子）交回主会话。
+- 回复：命令的标准输出，被拒绝时是它的报错行（「错误：…」），作为文字回复到用户这条消息下（话题群里回复在话题内），和主会话原样转告的效果一样。
+- 失败兜底：`ticket` 起不来或 15 秒内没结束（会被杀掉）就交回主会话；命令已经执行、只是回复发送失败时不交回（避免执行两次）。
+- 存量机器补环境变量：bridge 服务文件只在 `ticket setup` / `ticket bridge adopt` 时生成，自动更新不重写，较早接管的机器上一直没有 `LARKYARD_TICKET_BIN`（会议纪要的「派成工单」靠 PATH 兜底才能用，快速通道则不会启用）。`bridge.refresh_service` 在每次 `ticket bridge restart`（含每天 `--if-stale` 的定时重启和升级后的重启）时检查：缺这个变量或路径不对就按现在的模板重写，原有的 PATH、`LARK_CHANNEL_HOME`、日志位置照旧，并用 `load`（macOS bootout + bootstrap，Linux daemon-reload + restart）让新环境生效——光 kickstart 读不到改过的 plist；即使 bridge 已是当前版本，`--if-stale` 也会为此重启一次。两个平台都有单测。
+- 还没覆盖：原生 Windows（PR #43）用的是 npm 上的上游 bridge，没有这条快速通道；以后 Windows 改用打包的 bridge 时，`ticket.cmd` 不能被 Node 直接 spawn（新版 Node 拒绝不经 shell 执行 .cmd / .bat），执行器要改成经 shell 调用，并在 windows-latest 上补测试。
+- 测试（先写测试）：fork 里意图判断、路由、真实进程的执行器的单测，以及经 `startChannel` 跑完整收消息流程、用真实可执行的假 `ticket` 验证主会话一次都没启动的集成测试；fork 全部 837 个测试、类型检查、构建通过。
+
 ## 14. 升级已有安装（2026-11-21，T0056）
 
 行为以 `openspec/changes/migrate-existing-install/specs/migrate-existing/spec.md` 为准，取舍见同目录 `design.md`。
