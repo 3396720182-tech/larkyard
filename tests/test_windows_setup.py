@@ -20,6 +20,12 @@ def on_windows():
     return mock.patch.object(host, "system", lambda: "windows")
 
 
+def off_windows():
+    """CI 也在真 Windows 上跑这些用例：「其他平台」的分支要显式 mock，不能靠宿主不是 Windows。"""
+    from ticketd import host
+    return mock.patch.object(host, "system", lambda: "darwin")
+
+
 class FakeRunner:
     """记下每条命令；按命令决定输出，必要时改文件（扫码建 profile）。"""
 
@@ -207,7 +213,7 @@ class WinSetupTest(TicketdTestCase):
 
     def test_refuses_in_worker_bridge_session_and_off_windows(self):
         from ticketd import winsetup
-        with self.assertRaises(winsetup.WinSetupError):
+        with off_windows(), self.assertRaises(winsetup.WinSetupError):
             winsetup.run(ws=object())
         with on_windows():
             for k in ("TICKETD_TICKET", "LARK_CHANNEL"):
@@ -263,9 +269,10 @@ class WinSetupTest(TicketdTestCase):
 
     def test_service_path_dedups_case_insensitively(self):
         from ticketd import winsetup
-        p = winsetup.service_path({"node": "/n/node.exe", "lark-cli": "/npm/lark-cli.cmd"},
+        n, npm = Path("/n"), Path("/npm")  # 真 Windows 上 Path 会把 / 写成 \
+        p = winsetup.service_path({"node": str(n / "node.exe"), "lark-cli": str(npm / "lark-cli.cmd")},
                                   os.pathsep.join(["/npm", "/other", str(REPO / "bin")]))
-        self.assertEqual(p.split(os.pathsep), [str(REPO / "bin"), "/n", "/npm", "/other"])
+        self.assertEqual(p.split(os.pathsep), [str(REPO / "bin"), str(n), str(npm), "/other"])
 
     def test_setup_lark_json_on_windows(self):
         """认主人复用 ticket setup 的 lark-cli 调用：Windows 上走 npm 装的 lark-cli、沿用 PATH，不用受管安装的路径。"""
@@ -281,7 +288,8 @@ class WinSetupTest(TicketdTestCase):
         self.assertEqual(seen["argv"][:3], ["node", "lark.js", "api"])
         self.assertEqual(seen["path"], os.environ["PATH"])
         seen.clear()
-        setup.app_owner("claude", "cli_x", runner)  # 其他平台不变
+        with off_windows():
+            setup.app_owner("claude", "cli_x", runner)  # 其他平台不变
         self.assertTrue(seen["argv"][0].endswith("lark-cli"))
         self.assertIn("/usr/bin", seen["path"].split(":"))
 
