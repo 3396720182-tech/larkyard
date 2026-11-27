@@ -308,6 +308,13 @@ class BootstrapScriptTest(TicketdTestCase):
         self.assertIn("-m ticketd.winsetup", code)
         self.assertIn("Remove-Item Function:\\Install-Larkyard", code)
         self.assertIn("-notlike '*WindowsApps*'", code)  # 应用商店版 Python 的注册表 / AppData 写入是隔离的
-        # 安装说明里的一行命令指向的就是这个文件
+        # 向导跑完刷新本窗口的 PATH：控制台给 Windows 同事的第二行 `ticket enroll …` 在同一个窗口里执行
+        self.assertRegex(code, r"-m ticketd\.winsetup[\s\S]*finally[\s\S]*Update-SessionPath")
+        # 安装说明里的一行命令指向的就是这个文件；「安装」一开头就按 macOS / Windows 分开（T0097 追问）
         for doc in ("README.md", "README.en.md"):
-            self.assertIn("scripts/windows/bootstrap.ps1 | iex", (REPO / doc).read_text(encoding="utf-8"), doc)
+            readme = (REPO / doc).read_text(encoding="utf-8")
+            self.assertIn("scripts/windows/bootstrap.ps1 | iex", readme, doc)
+            self.assertIn("### macOS / Linux\n", readme, doc)
+            self.assertIn("### Windows\n", readme, doc)
+            self.assertLess(readme.index("### macOS / Linux\n"), readme.index("### Windows\n"))
+            self.assertIn("scripts/windows/bootstrap.ps1 \\| iex` |", readme, doc)  # 开头的对照表

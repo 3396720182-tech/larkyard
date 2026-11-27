@@ -175,6 +175,9 @@ function Install-Larkyard {
   } finally {
     Pop-Location
     foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n], 'Process') }
+    # The installer put the repo's bin on the user PATH: pick it up so `ticket ...` (e.g. the console's
+    # `ticket enroll` line) works in this same window
+    Update-SessionPath
   }
   if ($rc -ne 0) { Say "Not finished yet (exit $rc). Fix what is shown above, then run the same command again." }
 }

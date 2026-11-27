@@ -598,7 +598,7 @@ COMMANDS = {
 
 # 原生 Windows 第一版（spec §3.2）只支持从仓库目录安装（scripts\windows\install.ps1）：受管安装、自动更新、
 # 打包的 bridge 都靠符号链接和 launchd / systemd，还没做
-_WIN_UPDATE = "（原生 Windows 暂不支持：重跑一行安装命令（README「原生 Windows」），或在仓库目录里 git pull 再运行 scripts\\windows\\install.ps1）"
+_WIN_UPDATE = "（原生 Windows 暂不支持：重跑一行安装命令（README「安装 → Windows」），或在仓库目录里 git pull 再运行 scripts\\windows\\install.ps1）"
 WINDOWS_UNSUPPORTED = {
     "update": "ticket update" + _WIN_UPDATE,
     "migrate": "ticket migrate" + _WIN_UPDATE,
