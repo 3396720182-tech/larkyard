@@ -22,11 +22,11 @@
 
 ### Requirement: c2 直接升到 c3，只升一次
 
-守护进程 SHALL 在心跳前把清单是 c2、还没自动升过的设备换成 c3，并私信本人一句说明；本人之后换过清单（含退回 c2）SHALL NOT 再自动升；c1 SHALL NOT 自动升。
+守护进程 SHALL 在心跳前把清单是 c2、还没自动升过的设备静默换成 c3（SHALL NOT 私信）；本人之后换过清单（含退回 c2）SHALL NOT 再自动升；c1 SHALL NOT 自动升。
 
 #### Scenario: c2 设备升级后第一次心跳
 - **WHEN** 本机清单是 c2，控制台认识 c3
-- **THEN** 换成 c3，这一次心跳带 `usage`，私信本人一次
+- **THEN** 换成 c3，这一次心跳带 `usage`，不私信
 
 #### Scenario: 本人退回 c2
 - **WHEN** 自动升过之后本人执行 `ticket console accept c2`

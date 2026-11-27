@@ -983,29 +983,20 @@ def _usage_since(con) -> float:
 
 # ---------- 小迭代直接升级（c2 → c3） ----------
 # 管理员决定：c3 只比 c2 多了用量统计（写死的代号和数字，不收任何文字），算小迭代，不再逐人确认。
-# 本机是 c2 的，守护进程在心跳前直接换成 c3，私信本人一句说明（多了什么、怎么退回）。
+# 本机是 c2 的，守护进程在心跳前直接换成 c3，静默更新（管理员要求不私信；事件里记一条，ticket console show 看得到下一次上报的内容）。
 # 只自动升一次：本人之后用 ticket console accept 换过（包括退回 c2），就不再动。c1 不自动升（出错记录要本人确认）。
 AUTO_FROM = ("c2",)
 AUTO_KEY = "console.consent_auto"          # 自动升级 / 本人换清单后记下当时的最新版本：之后不再自动升
 
 
-def auto_upgrade_text(old: str) -> str:
-    return ("📋 控制台采集清单已从 %s 更新到 %s：心跳里多了用量统计——每天各大类（生图生视频、找素材、写文档等 7 类）"
-            "的工单数和做成几单、各项能力用了几次和成没成、最近连续没做成几单、正在跑的单最久多久没动静。"
-            "只有数字和代码里写死的代号，不收工单标题、原话和内容。"
-            "查看下一次上报的内容：ticket console show；想退回：终端里执行 ticket console accept %s。"
-            % (old, CONSENT_VERSION, old))
-
-
 def maybe_auto_upgrade(con) -> Optional[str]:
-    """守护进程：本机清单是 c2、还没自动升过 → 换成最新版并私信本人。返回换后的那句话；没换返回 None。
+    """守护进程：本机清单是 c2、还没自动升过 → 换成最新版（静默，不私信）。返回换后的那句话；没换返回 None。
     控制台还不认识新版本（ConsentUnknown）等失败抛 ValueError，下一次心跳再试。"""
     old = consent_version()
     if old not in AUTO_FROM or metrics.kv_get(con, AUTO_KEY) == CONSENT_VERSION:
         return None
     info = _switchable()
     text = switch_consent(con, info, CONSENT_VERSION, how="（版本升级自动更新）")
-    metrics.send_owner(con, auto_upgrade_text(old))
     return text
 
 

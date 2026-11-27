@@ -49,7 +49,7 @@ c1（add-console-enrollment D4）、c2（add-console-problem-reports D1）不变
 
 c3 只比 c2 多了用量统计（写死的代号和数字，不收任何文字），算小迭代，不再逐人确认。
 
-- 守护进程每次心跳前：本机清单是 c2、kv `console.consent_auto` 不是当前最新版 → 走和 `accept` 相同的换清单流程（`switch_consent`）换成 c3，私信本人一句说明：多了什么、`ticket console show` 看下一次上报、`ticket console accept c2` 退回。这一次心跳就按 c3 报；用量起点设成换的时刻，之前的不补报。
+- 守护进程每次心跳前：本机清单是 c2、kv `console.consent_auto` 不是当前最新版 → 走和 `accept` 相同的换清单流程（`switch_consent`）换成 c3，静默更新、不私信（管理员要求）；事件里记一条，本人用 `ticket console show` 看得到下一次上报的内容，`ticket console accept c2` 退回。这一次心跳就按 c3 报；用量起点设成换的时刻，之前的不补报。
 - 只升一次：`switch_consent`（自动或本人 `accept`）每次都把 `console.consent_auto` 记成当前最新版。本人退回 c2 后不再动；c3 入网后退回 c2 的也不动。
 - 控制台还不认识 c3（ConsentUnknown）：本机留在 c2，记一条事件（一天一条），不挡这次心跳，下一次再试。
 - c1 不自动升：c1 → c3 还多了出错记录，仍要本人在终端 `ticket console accept`。

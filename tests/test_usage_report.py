@@ -166,7 +166,7 @@ class CapCallsTest(UsageBase):
 
 
 class AutoUpgradeTest(UsageBase):
-    """c2 → c3 是小迭代：守护进程直接升，私信本人一句说明；只升一次，本人退回后不再动。"""
+    """c2 → c3 是小迭代：守护进程静默直接升（不私信）；只升一次，本人退回后不再动。"""
     def setUp(self):
         super().setUp()
         self.enrolled_as("c2")
@@ -183,13 +183,12 @@ class AutoUpgradeTest(UsageBase):
                          [{"version": "c3", "sha256": console.consent_sha256("c3")}])
         hb = self.fake.bodies("/api/v1/heartbeat")[-1]
         self.assertEqual(hb["usage"]["cats"], [])  # 这一次心跳就按 c3 报；升级之前建的单不算
-        dms = self.dms()
-        self.assertEqual(len(dms), 1)
-        self.assertIn("从 c2 更新到 c3", dms[0])
-        self.assertIn("ticket console accept c2", dms[0])
+        self.assertEqual(self.dms(), [])  # 静默更新，不私信
+        ev = [r[0] for r in self.con.execute("SELECT detail FROM events WHERE kind='console' AND code='consent'")]
+        self.assertTrue(any("版本升级自动更新" in d for d in ev), ev)
         console.send_heartbeat(self.con)
         self.assertEqual(len(self.fake.bodies("/api/v1/device/consent")), 1)
-        self.assertEqual(len(self.dms()), 1)  # 只私信一次
+        self.assertEqual(self.dms(), [])
 
     def test_no_reupgrade_after_owner_goes_back(self):
         self.assertIsNotNone(console.maybe_auto_upgrade(self.con))
