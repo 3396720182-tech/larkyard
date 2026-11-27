@@ -784,6 +784,7 @@ class Scheduler:
         # 到期：停止自动调度（auto_halted），但输入照样留好——压缩轮的追问原本就还是 pending，普通轮按重试的规则补上。
         # 原来只标 failed，压缩轮留着的追问让调度器下一拍又选中这张单，一直重试下去（外部评测 P1）。
         # 用户追问「继续」、放开、授权、换会话时清掉 auto_halted，连同留着的输入一起投递
+        metrics.end_outage(self.con, tid, "expired")
         with db.tx(self.con):
             self._requeue_inputs(r, t, add_input)
             core.touch_if(self.con, tid, ("running",), state="failed", pid=None, outage_since=None, auto_halted=1)
@@ -932,6 +933,8 @@ class Scheduler:
         reports = self.con.execute("SELECT * FROM reports WHERE ticket_id=? AND id>? AND status<>'progress'"
                                    " ORDER BY id", (tid, r.report_mark)).fetchall()
         if reports:
+            # 交上汇报了：模型接口是通的。之前在故障等待里的，记一条「已恢复」（控制台出错记录：持续多久、已恢复，T0109）
+            metrics.end_outage(self.con, tid, "recovered")
             core.touch_if(self.con, tid, ("running",),
                           state="failed" if reports[-1]["status"] == "failed" else "idle",
                           pid=None, retries=0, retry_at=0, outage_since=None)

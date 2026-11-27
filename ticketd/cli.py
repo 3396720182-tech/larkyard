@@ -442,8 +442,7 @@ def _workspace_drift() -> list:
     if st == "same":
         return ["✅ 主会话约定和本仓库的模板一致"]
     if st == "old":
-        from . import update
-        if update.is_managed():
+        if workspace.auto_sync():
             return ["⚠️ 主会话约定（%s）是没改过的旧版模板：守护进程下次启动时自动换成新版（先备份）" % live]
         return ["⚠️ 主会话约定（%s）是没改过的旧版模板：执行 scripts/setup-workspace.sh %s --force 换成新版（会先备份）"
                 % (live, live.parent)]

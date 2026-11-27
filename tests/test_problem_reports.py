@@ -141,12 +141,14 @@ class ProblemsTest(ProblemsBase):
 
     def test_only_codes_no_text(self):
         """场景：带特殊字符串的报错。"""
+        # 同一张单一次故障只报第一条（T0109）：api_error、outage_start、retry 各放在另一张单上
+        t2, t3, t4 = (self.new_ticket(message="om_%d" % n) for n in (2, 3, 4))
         self.round_(self.tid, "failed")
         metrics.record(self.con, self.tid, "model_error", "认证失败 %s" % SECRET, code="auth")
-        metrics.record(self.con, self.tid, "api_error", SECRET, code="weird-code")
+        metrics.record(self.con, t2, "api_error", SECRET, code="weird-code")
         metrics.record(self.con, self.tid, "stall_abort", "卡在 %s" % SECRET)
         metrics.record(self.con, self.tid, "stall_flag", SECRET)                      # 只是提醒：不报
-        metrics.record(self.con, self.tid, "outage_start", SECRET)
+        metrics.record(self.con, t3, "outage_start", SECRET)
         metrics.record(self.con, self.tid, "lark_error", SECRET, code="230001")
         metrics.record(self.con, self.tid, "lark_error", "", code="Rate-Limit!")
         metrics.record(self.con, self.tid, "delivery_dead", SECRET)
@@ -157,7 +159,7 @@ class ProblemsTest(ProblemsBase):
         metrics.record(self.con, metrics.SYSTEM_TICKET, "update", SECRET, code="bad_hash")  # 心跳 update 里已有：不报
         self.round_(self.tid, "stopped")      # 用户自己停的：不报
         self.round_(self.tid, "blocked")      # 正常的「要你决定」：不报
-        self.round_(self.tid, "retry")
+        self.round_(t4, "retry")
         console.send_heartbeat(self.con)
         raw = self.fake.calls[-1]["body"]
         self.assertNotIn(SECRET.encode("utf-8"), raw)
@@ -165,10 +167,10 @@ class ProblemsTest(ProblemsBase):
         got = sorted((i["step"], i["code"], i["ticket"]) for i in p["items"])
         t = self.tid
         self.assertEqual(got, sorted([
-            ("round", "failed", t), ("model", "auth", t), ("model", "other", t), ("stall", "stall_abort", t),
-            ("outage", "outage_start", t), ("feishu", "e230001", t), ("feishu", "other", t),
+            ("round", "failed", t), ("model", "auth", t), ("model", "other", t2), ("stall", "stall_abort", t),
+            ("outage", "outage_start", t3), ("feishu", "e230001", t), ("feishu", "other", t),
             ("feishu", "delivery_dead", t), ("media", "video_fail", t), ("skills", "skills_failed", None),
-            ("round", "retry", t)]))
+            ("round", "retry", t4)]))
         self.assertEqual(p["more"], 0)
         for i in p["items"]:
             self.assertEqual(set(i), {"at", "ticket", "step", "code"})
@@ -208,7 +210,8 @@ class ProblemsTest(ProblemsBase):
         self.assertEqual(len(json.loads(self.fake.calls[-1]["body"])["problems"]["items"]), 2)
         console.send_heartbeat(self.con)
         self.assertEqual(json.loads(self.fake.calls[-1]["body"])["problems"], {"items": [], "more": 0})
-        self.round_(self.tid, "compact_failed")
+        self.round_(self.tid, "ready", time.time() + 100)   # 之后有一轮交上了汇报：上一次故障结束，下面是新的一次
+        self.round_(self.tid, "compact_failed", time.time() + 200)
         console.send_heartbeat(self.con)
         self.assertEqual([i["code"] for i in json.loads(self.fake.calls[-1]["body"])["problems"]["items"]],
                          ["compact_failed"])
@@ -238,6 +241,127 @@ class ProblemsTest(ProblemsBase):
         console.send_heartbeat(self.con)  # 发送成功后从现在算起
         self.round_(self.tid, "retry")
         self.assertEqual([i["code"] for i in console.build_heartbeat(self.con)["problems"]["items"]], ["retry"])
+
+
+class OutageOnceTest(ProblemsBase):
+    """一次故障只记一条，恢复时补一条「持续多久、已恢复」（T0109）。原来故障等待里每 15 分钟自动重试一次，
+    每次记一条模型接口错误、一条「中断后重试」，一次 4 小时的故障刷出二十多条。用真的调度器和假 claude 走一遍。"""
+
+    def setUp(self):
+        super().setUp()
+        from ticketd import core
+        from ticketd.scheduler import Scheduler
+        self.core = core
+        self.sched = Scheduler(self.con)
+        self.enrolled_as("c2")
+        os.environ["TICKETD_OUTAGE_RETRY_HOURS"] = "24"
+        os.environ["TICKETD_OUTAGE_RETRY_EVERY"] = "3600"
+
+    def tearDown(self):
+        self.sched.shutdown()
+        super().tearDown()
+
+    def settled(self, tid):
+        return tid not in self.sched.running and self.core.get(self.con, tid)["state"] in ("idle", "failed")
+
+    def rounds(self, tid):
+        return self.con.execute("SELECT COUNT(*) FROM rounds WHERE ticket_id=?", (tid,)).fetchone()[0]
+
+    def retry_now(self, tid):
+        n = self.rounds(tid)
+        self.con.execute("UPDATE tickets SET retry_at=0 WHERE id=?", (tid,))
+        self.wait(lambda: self.rounds(tid) > n and self.settled(tid), self.sched)
+
+    def beat(self):
+        console.send_heartbeat(self.con)
+        return [(i["step"], i["code"], i["ticket"]) for i in json.loads(self.fake.calls[-1]["body"])["problems"]["items"]]
+
+    def test_network_outage_reports_once_then_recovered(self):
+        tid = self.new_ticket(request="[[fake:transient_until_marker]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None and self.settled(tid), self.sched)
+        # 首次 + 3 次短重试 + 进入故障等待：本机照样记 4 条模型接口错误、4 个「中断后重试」轮次、1 条进入故障等待
+        kinds = [r[0] for r in self.con.execute("SELECT kind FROM events WHERE ticket_id=? ORDER BY id", (tid,))]
+        self.assertEqual(kinds.count("model_error"), 4)
+        self.assertEqual(kinds.count("outage_start"), 1)
+        self.assertEqual(self.beat(), [("model", "overloaded", tid)])   # 控制台只收第一条
+        for _ in range(3):   # 故障等待里的自动重试：每次照样失败，控制台不再多记
+            self.retry_now(tid)
+        self.assertEqual(self.beat(), [])
+        open(os.path.join(self.core.get(self.con, tid)["workdir"], ".recovered"), "w").close()
+        self.retry_now(tid)
+        self.assertEqual(self.core.last_report(self.con, tid)["status"], "ready")
+        self.assertEqual(self.beat(), [("outage", "recovered", tid)])
+        end = self.con.execute("SELECT code, seconds FROM events WHERE ticket_id=? AND kind='outage_end'",
+                               (tid,)).fetchall()
+        self.assertEqual([e["code"] for e in end], ["recovered"])
+        self.assertGreaterEqual(end[0]["seconds"], 0)
+        # 恢复之后再出故障：是新的一次，照常报第一条
+        self.core.send_followup(self.con, tid, "om_2", "再来一次 [[fake:transient]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None and self.settled(tid), self.sched)
+        self.assertEqual(self.beat(), [("model", "overloaded", tid)])
+        # 别的单不受影响：它自己的第一次故障照报
+        other = self.new_ticket(request="[[fake:transient_once]]", message="om_9")
+        self.wait(lambda: (self.core.last_report(self.con, other) or {"status": ""})["status"] == "ready"
+                  and self.settled(other), self.sched)
+        self.assertEqual(self.beat(), [("model", "overloaded", other)])   # 短重试就恢复了：不补「已恢复」
+
+    def test_followup_during_outage_keeps_one_fault(self):
+        """故障等待中用户追问「继续」（会清掉 outage_since）、还是失败：仍是同一次故障，恢复时从最初算起。"""
+        tid = self.new_ticket(request="[[fake:balance_until_marker]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None and self.settled(tid), self.sched)
+        first = self.con.execute("SELECT created_at FROM events WHERE ticket_id=? AND kind='outage_start'",
+                                 (tid,)).fetchone()[0]
+        self.assertEqual(self.beat(), [("model", "balance", tid)])
+        self.core.send_followup(self.con, tid, "om_2", "继续 [[fake:balance_until_marker]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None and self.settled(tid), self.sched)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM events WHERE ticket_id=? AND kind='outage_start'",
+                                          (tid,)).fetchone()[0], 2)   # 本机照记第二次进入
+        self.assertEqual(self.beat(), [])
+        self.assertEqual(metrics.open_outage_since(self.con, tid), first)
+        open(os.path.join(self.core.get(self.con, tid)["workdir"], ".topped_up"), "w").close()
+        self.retry_now(tid)
+        self.assertEqual(self.beat(), [("outage", "recovered", tid)])
+        self.assertIsNone(metrics.open_outage_since(self.con, tid))
+
+    def test_expired_outage_closes_without_recovered(self):
+        os.environ["TICKETD_OUTAGE_RETRY_HOURS"] = "1"
+        tid = self.new_ticket(request="[[fake:balance]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None and self.settled(tid), self.sched)
+        self.assertEqual(self.beat(), [("model", "balance", tid)])
+        self.con.execute("UPDATE tickets SET outage_since=? WHERE id=?", (time.time() - 7200, tid))
+        self.retry_now(tid)
+        self.assertEqual(self.core.get(self.con, tid)["state"], "failed")
+        # 到期那一轮照常报「汇报失败」，不报「已恢复」；故障到此结束
+        self.assertEqual(self.beat(), [("round", "failed", tid)])
+        self.assertEqual([r[0] for r in self.con.execute(
+            "SELECT code FROM events WHERE ticket_id=? AND kind='outage_end'", (tid,))], ["expired"])
+        self.assertIsNone(metrics.open_outage_since(self.con, tid))
+        self.assertIsNone(metrics.end_outage(self.con, tid, "recovered"))   # 没有在等的：什么也不记
+        # 之后用户「继续」、还是余额不足：新的一次故障，照常报
+        self.core.send_followup(self.con, tid, "om_2", "继续 [[fake:balance]]")
+        self.wait(lambda: self.core.get(self.con, tid)["outage_since"] is not None and self.settled(tid), self.sched)
+        self.assertEqual(self.beat(), [("model", "balance", tid)])
+
+    def test_api_error_in_a_round_that_reports_ends_the_fault(self):
+        """轮中途记了 api_error、接口缓过来这一轮照样交上汇报：这次故障到此结束，几天后的新故障照报（审查意见）。"""
+        tid = self.new_ticket(request="[[fake:noreport]]")
+        now = time.time()
+
+        def ev(kind, at, code):
+            self.con.execute("INSERT INTO events(ticket_id, kind, detail, created_at, code) VALUES(?,?,?,?,?)",
+                             (tid, kind, "", at, code))
+        ev("api_error", now - 3 * 86400, "overloaded")
+        self.con.execute("INSERT INTO rounds(ticket_id, started_at, ended_at, cost_usd, outcome) VALUES(?,?,?,?,?)",
+                         (tid, now - 3 * 86400 - 60, now - 3 * 86400 + 60, 0.1, "ready"))
+        ev("model_error", now - 10, "network")
+        self.assertEqual(self.beat(), [("model", "overloaded", tid), ("model", "network", tid)])
+
+    def test_outage_end_not_in_telemetry(self):
+        from ticketd import telemetry
+        tid = self.new_ticket(request="[[fake:noreport]]")
+        metrics.record(self.con, tid, "outage_start", "x")
+        self.assertIsNotNone(metrics.end_outage(self.con, tid, "recovered"))
+        self.assertIn("outage_end", metrics.DETAIL_KINDS)   # 匿名统计的事件计数不读它（统计字段不变）
 
 
 class DiagTest(ProblemsBase):

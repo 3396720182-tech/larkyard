@@ -69,12 +69,55 @@ class WorkspaceSyncTest(TicketdTestCase):
         self.assertEqual(self.md.read_text(encoding="utf-8"), self.want)
 
     def test_not_managed_never_syncs(self):
-        from ticketd import update, cli
+        from ticketd import update, cli, host
         self.md.write_text(workspace.render(OLD, "/opt/x"), encoding="utf-8")
-        with mock.patch.object(update, "is_managed", return_value=False):
+        # 显式 mock 平台：CI 也会在真 Windows 上跑（那里克隆也自动同步，见 test_windows_clone_syncs）
+        with mock.patch.object(update, "is_managed", return_value=False), \
+                mock.patch.object(host, "system", return_value="darwin"):
             self.assertIsNone(workspace.sync())
             self.assertIn("setup-workspace.sh", cli._workspace_drift()[0])
         self.assertEqual(self.md.read_text(encoding="utf-8"), workspace.render(OLD, "/opt/x"))
+
+    def test_windows_root_is_recognized(self):
+        """Windows 的安装向导在 Git Bash 里渲染（pwd -W），根目录是 C:/Users/…（T0109）。原来只认 / 开头的，
+        认不出 → 当成手改过 → 自检 ❌、也不自动换新版。"""
+        for root in ("C:/apps/larkyard", "d:/工作/larkyard", "C:\\apps\\larkyard"):
+            with self.subTest(root=root):
+                self.md.write_text(workspace.render(OLD, root), encoding="utf-8")
+                self.assertEqual(workspace.original_root(self.md.read_text(encoding="utf-8")), root)
+                self.assertEqual(workspace.state()[0], "old")
+                self.md.write_text(workspace.render(self.tmpl, root), encoding="utf-8")
+                with mock.patch.object(workspace, "target_root", side_effect=lambda r: r):   # 这台 Mac 上没有 C:/…
+                    self.assertEqual(workspace.state()[0], "same")
+        # 「path:/x」里的 h: 不是盘符：照旧认出 /x
+        self.assertEqual(workspace.ROOT_RE.findall("see path:/opt/x/bin/ticket"), ["/opt/x"])
+        # 路径里有空格：靠本机已知的根目录（Windows 上 Path 是 C:\…，渲染出来是 C:/…）
+        from pathlib import PureWindowsPath
+        from ticketd import update
+        win = PureWindowsPath("C:\\My Apps\\larkyard")
+        with mock.patch.object(update, "current_link", return_value=win):
+            self.assertEqual(workspace.original_root(workspace.render(OLD, "C:/My Apps/larkyard")),
+                             "C:/My Apps/larkyard")
+
+    def test_windows_clone_syncs(self):
+        """Windows 的正式安装是一份克隆（还没有受管安装）：Windows 上从克隆运行也照常自动同步；macOS / Linux 的克隆不动。"""
+        from ticketd import cli, host, update
+        other = self.tmp / "clone"
+        (other / "bin").mkdir(parents=True)
+        (other / "bin" / "ticket").write_text("", encoding="utf-8")
+        self.md.write_text(workspace.render(OLD, str(other)), encoding="utf-8")
+        with mock.patch.object(update, "is_managed", return_value=False):
+            for name in ("darwin", "linux"):
+                with mock.patch.object(host, "system", return_value=name):
+                    self.assertFalse(workspace.auto_sync())
+                    self.assertIsNone(workspace.sync())
+            for name in ("windows", "win32"):   # 原生 Windows 分支映射成 windows；main 上是 sys.platform 原样
+                with mock.patch.object(host, "system", return_value=name):
+                    self.assertTrue(workspace.auto_sync())
+                    self.assertIn("守护进程下次启动时自动换成新版", cli._workspace_drift()[0])
+            with mock.patch.object(host, "system", return_value="windows"):
+                self.assertTrue(workspace.sync())
+        self.assertEqual(self.md.read_text(encoding="utf-8"), workspace.render(self.tmpl, str(other)))
 
     def test_changed_after_backup_is_not_overwritten(self):
         old = workspace.render(OLD, "/opt/x")

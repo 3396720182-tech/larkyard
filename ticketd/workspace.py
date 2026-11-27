@@ -9,6 +9,10 @@
 - 把里面的 `<根目录>/bin/ticket` 的根目录换回 @LARKYARD@ 之后，逐字等于发过的某一版模板（workspace/CLAUDE.md.history
   里的摘要）：说明没人手改过，先备份成 CLAUDE.md.bak-<时间>，再换成本版模板（根目录用受管安装的 current）。
 - 其他情况（手改过、找不到工作目录、读不了）：不动，`ticket doctor` 照旧提示由人决定。私人约定写在 CLAUDE.local.md。
+
+Windows（T0109）：安装向导在 Git Bash 里渲染，根目录写成 `C:/Users/…/larkyard`（`pwd -W`）。原来只认 / 开头的根目录，
+Windows 的认不出 → 当成手改过 → 自检报 ❌，也不自动换新版。现在盘符开头的也认；Windows 的正式安装就是一份克隆
+（还没有受管安装），所以 Windows 上从克隆运行也照常自动同步。
 """
 from __future__ import annotations
 
@@ -23,7 +27,8 @@ from typing import Optional, Tuple
 from . import config
 
 PLACEHOLDER = "@LARKYARD@"
-ROOT_RE = re.compile(r"(/[^\s`'\"()<>]*?)/bin/ticket(?![\w.-])")
+# 根目录：/ 开头，或 Windows 的盘符开头（C:/… 或 C:\…；盘符前面不能紧挨着字母数字，免得把「path:/x」认成盘符）
+ROOT_RE = re.compile(r"((?:(?<![\w])[A-Za-z]:)?[\\/][^\s`'\"()<>]*?)/bin/ticket(?![\w.-])")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -49,9 +54,23 @@ def bridge_workspace() -> str:
 
 
 def root() -> str:
-    """主会话里 ticket 的根目录：受管安装用跟着版本走的 current，否则是本仓库。"""
+    """主会话里 ticket 的根目录：受管安装用跟着版本走的 current，否则是本仓库。
+    用 / 分隔（as_posix）：Windows 上和安装向导渲染的 C:/Users/… 写法一致；macOS / Linux 上不变。"""
     from . import update
-    return str(update.current_link() if update.is_managed() else config.REPO)
+    return (update.current_link() if update.is_managed() else config.REPO).as_posix()
+
+
+def _windows() -> bool:
+    # main 上 host.system() 在 Windows 原样返回 sys.platform（win32）；原生 Windows 分支把它映射成 windows
+    from . import host
+    return host.system() in ("windows", "win32")
+
+
+def auto_sync() -> bool:
+    """守护进程启动时会不会自动换旧版模板：受管安装会；Windows 的正式安装是克隆（还没有受管安装），也会。
+    macOS / Linux 上从克隆、worktree 起的守护进程（开发时）不碰真实的主会话约定。"""
+    from . import update
+    return update.is_managed() or _windows()
 
 
 def render(text: str, at: str) -> str:
@@ -81,7 +100,10 @@ def original_root(text: str) -> Optional[str]:
     先试本机已知的根目录（路径里有空格、括号也认得），再试从 `<根>/bin/ticket` 里认出来的。只换一种根目录：
     混着两种写法的，换完摘要对不上，算手改过。"""
     from . import update
-    cands = [str(update.current_link()), str(config.REPO)] + sorted(set(ROOT_RE.findall(text)))
+    known_roots = []
+    for p in (update.current_link(), config.REPO):
+        known_roots += [str(p), p.as_posix()]   # Windows：C:\… 和 C:/… 两种写法都试
+    cands = known_roots + sorted(set(ROOT_RE.findall(text)))
     ok = known()
     for r in dict.fromkeys(cands):
         if r and (r + "/bin/ticket") in text and digest(text.replace(r, PLACEHOLDER)) in ok:
@@ -120,9 +142,8 @@ def state(ws: str = "") -> Tuple[str, Path]:
 
 def sync(ws: str = "", now: Optional[float] = None) -> Optional[str]:
     """守护进程启动时调用：没手改过的旧版主会话约定换成本版，返回备份路径；没换返回 None。读写出错照样抛出。
-    只在受管安装里做（开发时从克隆、worktree 起的守护进程不碰真实的主会话约定）。"""
-    from . import update
-    if not update.is_managed():
+    只在 auto_sync() 为真时做（开发时从克隆、worktree 起的守护进程不碰真实的主会话约定）。"""
+    if not auto_sync():
         return None
     st, live = state(ws)
     if st != "old":

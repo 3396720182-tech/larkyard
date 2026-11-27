@@ -30,7 +30,8 @@ EVENT_LABELS = {
 # 只为细分统计记的事件（模型接口错误归类、飞书错误码、投递方式、媒体上传）：数量多，不进 ticket stats 的「事件」一行
 # update（自动更新的事件）也在这里：它有自己的 `ticket update status`，匿名统计不读它（统计字段不变）
 # console（控制台接入的事件）同理：入网与否不改变匿名统计的内容
-DETAIL_KINDS = ("model_error", "lark_error", "delivery", "media", "update", "console")
+# outage_end（故障等待结束，T0109）只给控制台的出错记录划出「一次故障」的边界，匿名统计不读它
+DETAIL_KINDS = ("model_error", "lark_error", "delivery", "media", "update", "console", "outage_end")
 
 
 # ---------- 落库 ----------
@@ -45,6 +46,35 @@ def record(con, ticket_id: str, kind: str, detail: str = "", code: str = "",
                     (ticket_id, kind, templates.short(detail, 300), db.now(), code or "", seconds, size))
     except Exception:
         pass
+
+
+# ---------- 故障等待的起止（T0109） ----------
+# 一次故障等待 = 这张单的 outage_start 到下一条 outage_end。outage_end 的 code：recovered（又交上汇报了，模型接口恢复）、
+# expired（到时限还没恢复，记失败）。用户中途追问「继续」会清掉 tickets.outage_since，所以起止按事件算，不看那一列。
+OUTAGE_END_CODES = ("recovered", "expired")
+
+
+def open_outage_since(con, ticket_id: str) -> Optional[float]:
+    """这张单还没结束的那次故障等待从什么时候开始（中途追问后再次进入的不重新起算）；没有在等的返回 None。"""
+    end = con.execute("SELECT COALESCE(MAX(id), 0) FROM events WHERE ticket_id=? AND kind='outage_end'",
+                      (ticket_id,)).fetchone()[0]
+    row = con.execute("SELECT MIN(created_at) FROM events WHERE ticket_id=? AND kind='outage_start' AND id>?",
+                      (ticket_id, end)).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def end_outage(con, ticket_id: str, code: str) -> Optional[float]:
+    """故障等待结束时调用：记一条 outage_end（seconds = 持续多久），返回秒数；没有在等的什么也不做，返回 None。永不抛异常。"""
+    try:
+        since = open_outage_since(con, ticket_id)
+    except Exception:
+        return None
+    if since is None:
+        return None
+    took = max(0.0, db.now() - since)
+    record(con, ticket_id, "outage_end", "故障等待结束（%s），持续 %d 分钟" % (code, int(took // 60)), code=code,
+           seconds=took)
+    return took
 
 
 def kv_get(con, key: str) -> Optional[str]:

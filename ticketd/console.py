@@ -867,6 +867,12 @@ def _costs_bad(con, now: float) -> bool:
     return _costs_cache["bad"]
 
 
+# 心跳里的自检不带控制台这一项（T0109）：它查的是「最近 30 分钟有没有成功上报」，电脑睡眠 / 断网超过 30 分钟后，
+# 醒来的第一次心跳自己报「控制台不通过」——能收到这条心跳就说明是通的，是误报；连没连上控制台本来就按心跳时间判断。
+# 本机 ticket doctor 照常显示这一项。
+HEARTBEAT_SKIP = ("console",)
+
+
 def _doctor_part(con, now: Optional[float] = None) -> dict:
     from . import cli
     now = time.time() if now is None else now
@@ -878,6 +884,8 @@ def _doctor_part(con, now: Optional[float] = None) -> dict:
         return {"ok": False, "failed": ["doctor"]}
     failed = []
     for cid, line in checks:
+        if cid in HEARTBEAT_SKIP:
+            continue
         if line.startswith("❌") and DOCTOR_ID_RE.match(cid) and cid not in failed:
             failed.append(cid)
     return {"ok": not failed, "failed": failed[:20]}
@@ -896,7 +904,14 @@ ROUND_PROBLEMS = ("failed", "retry", "compact_failed")
 MODEL_CODES = ("balance", "auth", "rate_limit", "overloaded", "network", "server_5xx", "client_4xx", "other")
 LARK_CODES = ("rate_limit", "network", "api_other", "other")
 EVENT_PROBLEM_KINDS = ("model_error", "api_error", "stall_interrupt", "stall_abort", "outage_start", "delivery_dead",
-                       "card_giveup", "media_stuck", "lark_error", "media", KIND)
+                       "card_giveup", "media_stuck", "lark_error", "media", KIND, "outage_end")
+# 一次故障只记一条（T0109）：模型接口出错后，同一张单接下来的自动重试（短重试、故障等待里每 15 分钟一次）每次都会
+# 再记一条模型接口错误、一条「中断后重试」（4 小时故障刷出二十多条）。同一张单从第一条模型接口错误起、到下一次交上汇报
+# （或故障等待到期）之前，只报第一条；这期间的重试轮、进入故障等待、后来的模型接口错误都不再报。
+# 故障等待结束时报一条 outage / recovered（控制台按这张单上一条模型接口记录算持续多久）。
+FAULT_EVENT_KINDS = ("model_error", "api_error")
+FOLLOW_EVENT_KINDS = FAULT_EVENT_KINDS + ("outage_start",)
+FOLLOW_ROUND_OUTCOMES = ("retry", "compact_failed")   # 重试中的轮次：不算「这次故障结束了」
 
 
 def _problem_of(kind: str, code: str) -> Optional[tuple]:
@@ -908,6 +923,8 @@ def _problem_of(kind: str, code: str) -> Optional[tuple]:
         return "stall", kind
     if kind == "outage_start":
         return "outage", kind
+    if kind == "outage_end":
+        return ("outage", "recovered") if code == "recovered" else None   # 到期的那一轮本来就会记「汇报失败」
     if kind in ("delivery_dead", "card_giveup", "media_stuck"):
         return "feishu", kind
     if kind == "lark_error":
@@ -1012,6 +1029,42 @@ def _advance_cursor(con, advance: dict) -> None:
     metrics.kv_set(con, CURSOR_KEY, json.dumps(new, sort_keys=True))
 
 
+class _Episodes:
+    """按工单判断一条记录是不是「同一次故障里的后续」（见 FAULT_EVENT_KINDS 上面的说明）。读本机全部历史，不只是这一批：
+    故障的第一条可能在上一次心跳里已经报过了。每张单只查一次。"""
+
+    def __init__(self, con):
+        self.con, self.cache = con, {}
+
+    def _load(self, tid: str) -> tuple:
+        if tid not in self.cache:
+            faults = [(float(r["created_at"] or 0), r["id"]) for r in self.con.execute(
+                "SELECT id, created_at FROM events WHERE ticket_id=? AND kind IN (%s) ORDER BY id"
+                % ",".join("?" * len(FAULT_EVENT_KINDS)), (tid,) + FAULT_EVENT_KINDS)]
+            # 故障结束 = 之后有一轮没有以模型接口错误收尾（交上了汇报、被用户停下等）。进入故障等待的那一轮记的是 ticketd
+            # 自己发的 waiting 汇报，看结果分不出来，所以按这一轮里有没有 model_error 判断（只在没交汇报就退出时记）。
+            # api_error 不算：它是轮中途记的，接口缓过来、这一轮照样交上汇报的，这一轮就是故障结束
+            ended = [float(r[0] or 0) for r in self.con.execute(
+                "SELECT created_at FROM events WHERE ticket_id=? AND kind='model_error'", (tid,))]
+            bounds = [float(r["ended_at"] or 0) for r in self.con.execute(
+                "SELECT started_at, ended_at FROM rounds WHERE ticket_id=? AND outcome NOT IN (%s)"
+                % ",".join("?" * len(FOLLOW_ROUND_OUTCOMES)), (tid,) + FOLLOW_ROUND_OUTCOMES)
+                if not any(float(r["started_at"] or 0) <= t <= float(r["ended_at"] or 0) for t in ended)]
+            bounds += [float(r[0] or 0) for r in self.con.execute(
+                "SELECT created_at FROM events WHERE ticket_id=? AND kind='outage_end'", (tid,))]
+            self.cache[tid] = (faults, sorted(bounds))
+        return self.cache[tid]
+
+    def follows(self, tid: str, at: float, event_id: Optional[int] = None) -> bool:
+        """at 时刻的这条记录之前，同一次故障里已经有一条模型接口错误了（event_id：它本身是事件时按 id 比先后）。"""
+        faults, bounds = self._load(tid)
+        start = max((b for b in bounds if b < at), default=float("-inf"))
+        for t, i in faults:
+            if t > start and (i < event_id if event_id is not None else t <= at):
+                return True
+        return False
+
+
 def _problems_part(con) -> tuple:
     """(心跳里的 problems, 发送成功后游标要前移到的位置)。只读本机 events / rounds 的 id、时间、kind、code、outcome；
     没有游标（比如本机 kv 被清过）时从现在算起，不补报历史。"""
@@ -1020,16 +1073,20 @@ def _problems_part(con) -> tuple:
     if cur is None or cur["event"] > top["event"] or cur["round"] > top["round"]:
         return {"items": [], "more": 0}, dict(top, reset=True)  # 没有游标 / 库被换过（id 比游标小）：从现在算起
     found = []
+    episodes = _Episodes(con)
     marks = ",".join("?" * len(EVENT_PROBLEM_KINDS))
     for e in con.execute("SELECT id, ticket_id, kind, code, created_at FROM events WHERE id>? AND id<=? AND kind IN (%s)"
                          % marks, (cur["event"], top["event"]) + EVENT_PROBLEM_KINDS):
         p = _problem_of(e["kind"], e["code"])
-        if p:
-            found.append((float(e["created_at"] or 0), 0, e["id"], e["ticket_id"], p))
+        at = float(e["created_at"] or 0)
+        if p and not (e["kind"] in FOLLOW_EVENT_KINDS and episodes.follows(e["ticket_id"], at, e["id"])):
+            found.append((at, 0, e["id"], e["ticket_id"], p))
     marks = ",".join("?" * len(ROUND_PROBLEMS))
     for r in con.execute("SELECT id, ticket_id, outcome, ended_at FROM rounds WHERE id>? AND id<=? AND outcome IN (%s)"
                          % marks, (cur["round"], top["round"]) + ROUND_PROBLEMS):
-        found.append((float(r["ended_at"] or 0), 1, r["id"], r["ticket_id"], ("round", r["outcome"])))
+        at = float(r["ended_at"] or 0)
+        if not (r["outcome"] in FOLLOW_ROUND_OUTCOMES and episodes.follows(r["ticket_id"], at)):
+            found.append((at, 1, r["id"], r["ticket_id"], ("round", r["outcome"])))
     found.sort()
     keep = found[-PROBLEMS_MAX:]
     items = []

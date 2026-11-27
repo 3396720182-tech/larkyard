@@ -58,6 +58,12 @@ elif mode == "noreport":
 elif mode == "transient":
     sys.stderr.write("API Error: 529 overloaded\n")
     sys.exit(1)
+elif mode == "transient_until_marker":
+    # 网络 / 接口故障，直到测试放下 .recovered 标记（模拟恢复）
+    if not Path(".recovered").exists():
+        sys.stderr.write("API Error: 529 overloaded\n")
+        sys.exit(1)
+    report("--status", "ready", "--summary", "恢复后接着做完了")
 elif mode == "transient_once":
     marker = Path(".transient_done")
     if not marker.exists():

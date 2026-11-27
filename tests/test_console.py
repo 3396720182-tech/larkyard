@@ -877,7 +877,7 @@ class DoctorTest(ConsoleBase):
         for cid, line in cli.doctor_checks(self.con):
             self.assertIn(cid, cli.DOCTOR_IDS)
         hb = console.build_heartbeat(self.con)
-        bad = sorted({cid for cid, line in cli.doctor_checks(self.con) if line.startswith("❌")})
+        bad = sorted({cid for cid, line in cli.doctor_checks(self.con) if line.startswith("❌") and cid != "console"})
         self.assertEqual(sorted(hb["doctor"]["failed"]), bad)
         self.assertEqual(hb["doctor"]["ok"], not bad)
         self.assertIn("owner", bad)  # 测试环境里 config.env 没有 TICKETD_OWNER
@@ -892,6 +892,9 @@ class DoctorTest(ConsoleBase):
         line = console.doctor_line(self.con)
         self.assertTrue(line.startswith("❌ 控制台：最近 30 分钟没有成功上报"), line)
         self.assertIn("连不上控制台", line)
+        # 心跳里的自检不带这一项（T0109）：睡眠 / 断网醒来的第一次心跳不再自报「控制台不通过」；本机 doctor 照常显示
+        self.assertIn(("console", line), cli.doctor_checks(self.con))
+        self.assertNotIn("console", console.build_heartbeat(self.con)["doctor"]["failed"])
         os.environ["TICKETD_UPDATE_URL"] = "https://updates.example.com/u"
         self.assertIn("更新源不是控制台", console.doctor_line(self.con))
         self.assertNotIn(TOKEN, self.cli("doctor")[1])
