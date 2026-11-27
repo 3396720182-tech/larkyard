@@ -26,6 +26,108 @@ jobs:
       - name: Card variants render
         run: /usr/bin/python3 scripts/validate_cards.py --dump > /dev/null
 
+  windows:
+    name: native Windows (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 真调 Windows 接口的用例（作业对象、进程、文件真实路径、联接点、文件锁、收汇报）+ mock 的平台分支
+      - name: Windows unit tests
+        run: python -m unittest discover -s tests -p "test_windows*.py" -v
+      - name: Stand-ins for claude and lark-cli
+        # 只验证服务能装、能起、能停；不跑 worker，也不发消息
+        run: |
+          $d = Join-Path $env:RUNNER_TEMP 'fakebin'
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Copy-Item (Get-Command cmd.exe).Source (Join-Path $d 'claude.exe')
+          Copy-Item (Get-Command cmd.exe).Source (Join-Path $d 'lark-cli.exe')
+          Add-Content $env:GITHUB_PATH $d
+      - name: Install
+        run: |
+          New-Item -ItemType Directory -Force (Join-Path $HOME '.ticketd') | Out-Null
+          Set-Content -Path (Join-Path $HOME '.ticketd\config.env') -Value 'TICKETD_OWNER=ou_owner'
+          $env:TICKETD_PYTHON = (Get-Command python).Source
+          powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Service is running
+        run: |
+          $hb = Join-Path $HOME '.ticketd\heartbeat'
+          for ($i = 0; $i -lt 30 -and -not (Test-Path $hb); $i++) { Start-Sleep 1 }
+          if (-not (Test-Path $hb)) { exit 1 }
+          if (-not (Select-String -Path (Join-Path $HOME '.ticketd\logs\daemon.out.log') -Pattern 'ticketd started' -Quiet)) { exit 1 }
+          $env:TICKETD_PYTHON = (Get-Command python).Source
+          bin\ticket.cmd ls
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -m ticketd.winsvc status
+      - name: Reinstall restarts the service
+        run: |
+          $env:TICKETD_PYTHON = (Get-Command python).Source
+          powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $n = (Select-String -Path (Join-Path $HOME '.ticketd\logs\daemon.out.log') -Pattern 'ticketd stopped').Count
+          if ($n -ne 1) { Write-Error "ticketd stopped x$n"; exit 1 }
+      - name: Uninstall
+        run: |
+          $env:TICKETD_PYTHON = (Get-Command python).Source
+          powershell -ExecutionPolicy Bypass -File scripts\windows\uninstall.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $s = python -m ticketd.winsvc status
+          if ($s -ne 'supervisor=stopped daemon=stopped') { Write-Error $s; exit 1 }
+          schtasks /Query /TN dev.larkyard.ticketd 2>$null
+          if ($LASTEXITCODE -eq 0) { Write-Error 'task still registered'; exit 1 }
+          if (-not (Test-Path (Join-Path $HOME '.ticketd\config.env'))) { exit 1 }
+          exit 0  # 上面 schtasks /Query 按预期返回 1；pwsh 会拿最后一条命令的退出码当这一步的结果
+      - name: Logs
+        if: failure()
+        run: |
+          Get-ChildItem (Join-Path $HOME '.ticketd\logs') -ErrorAction SilentlyContinue | ForEach-Object { "== $_"; Get-Content $_.FullName -Tail 50 }
+          schtasks /Query /V /FO LIST /TN dev.larkyard.ticketd 2>$null
+
+  windows-bootstrap:
+    # 一行安装（scripts/windows/bootstrap.ps1）在 Windows PowerShell 5.1 里按 irm | iex 的方式真跑：真装 npm 工具和
+    # Claude Code、真 clone 这个分支。CI 里没有终端，向导应停在「建飞书应用要扫码」；跑两遍，第二遍只快进、不重装
+    name: one-line install (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell
+    env:
+      LARKYARD_BRANCH: ${{ github.head_ref || github.ref_name }}
+      LARKYARD_REPO: ${{ github.event.pull_request.head.repo.clone_url || format('https://github.com/{0}.git', github.repository) }}
+      TICKETD_WIN_SANDBOX: "off"   # 不在 CI 里真装 sandbox-runtime 的系统账户和 WFP 规则
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the one-liner twice
+        run: |
+          $env:LARKYARD_DIR = Join-Path $env:RUNNER_TEMP 'larkyard'
+          foreach ($i in 1, 2) {
+            $log = Join-Path $env:RUNNER_TEMP "bootstrap-$i.log"
+            Invoke-Expression (Get-Content -Raw scripts\windows\bootstrap.ps1) *>&1 | Tee-Object -FilePath $log
+            $text = Get-Content -Raw $log
+            if ($text -match 'Stopped:|Traceback') { Write-Error "bootstrap or winsetup crashed on run $i"; exit 1 }
+            # 退出码 3 只用于「要在终端里扫码」：崩溃、其他失败都是 1
+            if ($text -notmatch 'Not finished yet \(exit 3\)') { Write-Error "winsetup did not stop at the QR step on run $i"; exit 1 }
+          }
+          if ((Get-Content -Raw (Join-Path $env:RUNNER_TEMP 'bootstrap-2.log')) -match 'npm install -g|Installing Claude Code|Cloning') {
+            Write-Error 'second run reinstalled something'; exit 1
+          }
+          foreach ($t in 'claude', 'lark-cli', 'lark-channel-bridge', 'srt') {
+            if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { Write-Error "$t missing after bootstrap"; exit 1 }
+          }
+          if (-not (Test-Path (Join-Path $env:LARKYARD_DIR '.git'))) { Write-Error 'repo not cloned'; exit 1 }
+          if (Get-Command Install-Larkyard -ErrorAction SilentlyContinue) { Write-Error 'function leaked into the session'; exit 1 }
+          exit 0
+
   telemetry-worker:
     name: telemetry backend (node)
     runs-on: ubuntu-latest

@@ -3,20 +3,107 @@
 调度器只调这里的函数，不直接跑 ps / lsof。
 - macOS：ps 和 lsof。
 - Linux（含 WSL2）：直接读 /proc，不依赖 ps / lsof（精简系统上常常没装 lsof）。
+- Windows：ctypes 调系统接口（winapi.py）。worker、沙箱外执行各自在一个命名作业（Job Object）里，
+  停止和清理残留都按作业结束整棵进程树（spawn / signal_group / kill_job），不用 scan / cwd_within。
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import signal
 import subprocess
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from . import host
 
 PROC = "/proc"  # 测试里换成假的 /proc 目录
+SIGKILL = getattr(signal, "SIGKILL", 9)  # Windows 的 signal 模块没有 SIGKILL
+
+
+# ---------- 启动和结束进程组（POSIX：会话 / 进程组；Windows：命名作业） ----------
+_JOBS: Dict[int, Tuple[str, object]] = {}  # Windows：pid → (作业名, 作业句柄)，守护进程活着期间持有句柄
+
+
+def job_name(key: str) -> str:
+    """一个 worker（按汇报目录）/ 一次沙箱外执行（按脚本路径）对应的作业名。带上路径的哈希：
+    两份安装（不同 TICKETD_HOME / 工单根目录）互不干扰；守护进程重启后按同一个 key 还能找回来。"""
+    return "Local\\ticketd-" + hashlib.sha256(os.path.normcase(key).encode("utf-8")).hexdigest()[:24]
+
+
+def spawn(args, job_key: str, **kw) -> subprocess.Popen:
+    """启动一个自成一组的进程：POSIX 上 start_new_session（组号即 pid）；Windows 上放进 job_name(job_key) 作业，
+    它以后起的子孙进程（含脱离父进程的后台进程）都在里面。Windows 上 args[0] 按 env 里的 PATH 解析成完整路径
+    （CreateProcess 不认 PATH 上的 .cmd，也不看传给子进程的 PATH）。"""
+    if not host.is_windows():
+        return subprocess.Popen(args, start_new_session=True, **kw)
+    from . import winapi
+    args = host.argv(args, (kw.get("env") or os.environ).get("PATH"))
+    name = job_name(job_key)
+    proc, job = winapi.popen_in_job(args, name, **kw)
+    _JOBS[proc.pid] = (name, job)
+    return proc
+
+
+def adopt(pid: int, job_key: str) -> None:
+    """守护进程重启后重新认领的进程（沙箱外执行）：记下它的作业名，之后 signal_group 能按作业结束它。"""
+    if host.is_windows() and pid:
+        _JOBS[pid] = (job_name(job_key), None)
+
+
+def signal_group(pid: int, sig: int, fallback: bool = True) -> None:
+    """给 pid 所在的整组进程发信号。POSIX：killpg，失败且 fallback 时只发给 pid。
+    Windows：没有可投递的信号，任何信号都是结束：作业已知就结束整个作业（含后台子孙进程），否则 fallback 时只结束 pid。
+    组长已退出时 fallback 必须为 False：pid 可能已被复用。"""
+    if host.is_windows():
+        known = _JOBS.get(pid)
+        if known is not None:
+            from . import winapi
+            if winapi.terminate_job(known[0]):
+                return
+            # 作业按名字找不到了（托管进程不在、句柄已关）：至少结束它本身
+        if fallback:
+            try:
+                os.kill(pid, sig)  # Windows 上是 TerminateProcess
+            except OSError:
+                pass
+        return
+    try:
+        os.killpg(pid, sig)
+        return
+    except (ProcessLookupError, PermissionError):
+        pass
+    if not fallback:
+        return
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def kill_job(job_key: str) -> int:
+    """Windows：结束 job_key 对应作业里还在跑的所有进程，返回个数（作业不存在为 0）。其他平台返回 0。"""
+    if not host.is_windows():
+        return 0
+    from . import winapi
+    return winapi.terminate_job(job_name(job_key))
+
+
+def forget(pid: int) -> None:
+    """进程已收割：放掉作业句柄（作业里没有进程之后系统随之回收它）。"""
+    known = _JOBS.pop(pid, None)
+    if known is not None and known[1] is not None:
+        from . import winapi
+        winapi.close_handle(known[1])
 
 
 def command_line(pid: int) -> str:
     """pid 的完整命令行；拿不到返回空串。"""
+    if host.is_windows():
+        from . import winapi
+        try:
+            return winapi.command_line(pid)
+        except OSError:
+            return ""
     if host.is_linux():
         try:
             raw = _proc_read(pid, "cmdline")
@@ -31,6 +118,9 @@ def command_line(pid: int) -> str:
 
 def is_gone(pid: int) -> bool:
     """pid 已退出或已是僵尸。"""
+    if host.is_windows():
+        from . import winapi
+        return not winapi.alive(pid)
     if host.is_linux():
         st = _proc_stat(pid)
         return st is None or st[0] in ("Z", "X")
@@ -96,11 +186,20 @@ def tree(root: int) -> List[Tuple[int, float, float]]:
     """root 的所有后代进程（不含 root）：[(pid, 已运行秒数, 累计 CPU 秒数)]。卡住处置用它找出当前这次工具调用起的
     进程、判断它们还在不在干活。拿不到返回空列表，永不抛异常。"""
     try:
-        table = _linux_table() if host.is_linux() else _darwin_table()
+        if host.is_windows():
+            from . import winapi
+            table = winapi.process_table()
+        else:
+            table = _linux_table() if host.is_linux() else _darwin_table()
     except Exception:
         return []
     kids: Dict[int, List[int]] = {}
-    for pid, (ppid, _, _) in table.items():
+    for pid, (ppid, age, _) in table.items():
+        if host.is_windows():
+            # Windows 不会把孤儿过继给别人，父进程退出后它的 pid 可能被复用：比父进程「年长」的不是它的子进程
+            parent = table.get(ppid)
+            if pid == ppid or parent is None or age < 0 or (parent[1] >= 0 and age > parent[1] + 1.0):
+                continue
         kids.setdefault(ppid, []).append(pid)
     out, stack, seen = [], [root], {root}
     while stack:

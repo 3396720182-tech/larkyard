@@ -113,14 +113,23 @@ def lark_env(profile: str) -> dict:
         "LARK_CHANNEL": "1", "LARK_CHANNEL_HOME": str(home), "LARK_CHANNEL_PROFILE": profile,
         "LARK_CHANNEL_CONFIG": str(home / "profiles" / profile / "lark-cli-source" / "config.json"),
         "LARKSUITE_CLI_CONFIG_DIR": str(home / "profiles" / profile / "lark-cli"),
-        "PATH": bridge.service_path(bridge.tool_dir("claude")),
     })
+    if not host.is_windows():
+        # 原生 Windows（winsetup）用 npm 装的 lark-cli，沿用当前 PATH；service_path 是 POSIX 的写法
+        env["PATH"] = bridge.service_path(bridge.tool_dir("claude"))
     return env
+
+
+def _lark_cmd(args: list) -> list:
+    if host.is_windows():
+        return host.argv(["lark-cli"] + args)  # npm 的 .cmd 包装脚本解析成 node + 脚本，参数不经 cmd.exe
+    return [str(bridge.lark_cli())] + args
 
 
 def _lark_json(args: list, profile: str, runner=subprocess.run) -> Optional[dict]:
     try:
-        p = runner([str(bridge.lark_cli())] + args, env=lark_env(profile), capture_output=True, text=True, timeout=30)
+        p = runner(_lark_cmd(args), env=lark_env(profile), capture_output=True, text=True, encoding="utf-8",
+                   errors="replace", timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     if p.returncode != 0:

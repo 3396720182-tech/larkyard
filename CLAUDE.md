@@ -8,7 +8,7 @@
 - `ticketd/`：派单服务（Python 3.9 标准库，零依赖）。`config.py` 是所有配置的唯一来源。
 - `bin/ticket`、`bin/ticketd`：入口脚本，默认用 `/usr/bin/python3`（`TICKETD_PYTHON` 可改）。
 - `launchd/`、`systemd/`：macOS / Linux 的服务模板，由 `scripts/install.sh` 渲染。
-- 平台差异只放在 `ticketd/host.py`、`ticketd/procs.py`、`ticketd/perms.py`、`ticketd/bridge.py`（bridge 服务和重启窗口）和 `scripts/install.sh` / `uninstall.sh`（spec §3.1、§13）。改这些地方时两个平台的分支都要有单测：Python 里 mock `host.system()`，脚本用 `tests/test_install.py` 的假 `uname` / `launchctl` / `systemctl`。macOS 的行为不能顺带改掉。
+- 平台差异只放在 `ticketd/host.py`、`ticketd/procs.py`、`ticketd/perms.py`、`ticketd/bridge.py`（bridge 服务和重启窗口）和 `scripts/install.sh` / `uninstall.sh`（spec §3.1、§13）；原生 Windows 另有 `ticketd/winapi.py`（ctypes）、`winsvc.py`（托管）、`wininstall.py` 和 `scripts/windows/`（spec §3.2），Windows 分支的用例在 `tests/test_windows.py`（真调系统接口的只在 CI 的 windows-latest 上跑）。改这些地方时两个平台的分支都要有单测：Python 里 mock `host.system()`，脚本用 `tests/test_install.py` 的假 `uname` / `launchctl` / `systemctl`。macOS 的行为不能顺带改掉。
 - `prompts/worker.md`：worker 的系统提示；`ticketd/worker.py` 里的 `ASSIGNMENT` 是每轮的任务卡。
 - `workspace/`：bridge 工作区的 `CLAUDE.md` 模板和个人覆盖示例。
 - `docs/spec.md`：设计规格。行为以它为准；改了行为要在对应章节写「调整」，说明改了什么、为什么。

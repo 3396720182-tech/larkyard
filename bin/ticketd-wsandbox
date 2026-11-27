@@ -1,0 +1,33 @@
+#!/bin/sh
+# ticketd 在原生 Windows 上给 Claude worker 的每条 Bash 命令套的沙箱（docs/spec.md §3.2）。
+# worker 环境里的 CLAUDE_CODE_SHELL_PREFIX 指向本文件：Claude Code 以 `ticketd-wsandbox '<整条命令>'` 调用，
+# $1 是它拼好的完整 shell 命令（含它自己的环境准备）。
+# sandbox-runtime（srt）以专用的 srt-sandbox 账户运行命令，只给一份干净的环境（PATH 和代理变量），所以把
+# TICKETD_SANDBOX_ENV 列出的变量（ticket report 要用的 TICKETD_SPOOL 等）、当前目录和命令一起写进工单目录里的
+# 一个脚本，再让 srt 里的 Git Bash 执行它。缺任何一样都不在沙箱外执行，直接失败。
+set -u
+for v in TICKETD_SRT TICKETD_SRT_SETTINGS TICKETD_BASH TICKETD_SANDBOX_DIR; do
+  eval "val=\${$v:-}"
+  if [ -z "$val" ]; then
+    echo "ticketd-wsandbox: 缺少 $v，拒绝在沙箱外执行" >&2
+    exit 126
+  fi
+done
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+mkdir -p "$TICKETD_SANDBOX_DIR" || exit 126
+f="$TICKETD_SANDBOX_DIR/cmd-$$-$(date +%s).sh"
+{
+  for n in ${TICKETD_SANDBOX_ENV:-}; do
+    case "$n" in *[!A-Za-z0-9_]*|'') continue;; esac
+    eval "isset=\${$n+x}"
+    [ -n "$isset" ] || continue
+    eval "val=\${$n}"
+    printf 'export %s=%s\n' "$n" "$(q "$val")"
+  done
+  printf 'cd %s || exit 1\n' "$(q "$PWD")"
+  printf '%s\n' "$1"
+} > "$f" || exit 126
+"$TICKETD_SRT" --settings "$TICKETD_SRT_SETTINGS" "$TICKETD_BASH" "$f"
+c=$?
+rm -f "$f"
+exit $c

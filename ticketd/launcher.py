@@ -14,12 +14,16 @@ update-state.json（ticketd/update.py 写，这里读和改）：
 试用期内另起一个看门狗进程，按单调时钟（睡眠不计时）等到试用期满 + 宽限还没确认（守护进程活着但卡死、
 自检一直不过），就记下 timed_out 并结束守护进程，服务管理器重新拉起时这里按超时切回。
 """
-import fcntl
 import json
 import os
 import signal
 import sys
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows：受管安装和这个启动器还不支持（spec §3.2），只要求模块能被导入
+    fcntl = None
 
 STATE = "update-state.json"
 MAX_STARTS = 3          # 试用期内第 3 次被拉起（前两次都退出了）就切回
@@ -50,12 +54,26 @@ class locked:
 
     def __enter__(self):
         self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        else:
+            import msvcrt
+            while True:
+                try:
+                    msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
         return self
 
     def __exit__(self, *exc):
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            else:
+                import msvcrt
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
         finally:
             os.close(self.fd)
 

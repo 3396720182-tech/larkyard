@@ -116,6 +116,27 @@ def codex_git_writable() -> bool:
     return _env("TICKETD_CODEX_GIT_WRITABLE", "1") != "0"
 
 
+def win_sandbox() -> str:
+    """Windows 上 Claude worker 的 Bash 命令用什么沙箱（spec §3.2）。Claude Code 自带的沙箱不支持原生 Windows。
+    srt（默认）= 每条 Bash 命令经 Anthropic 的 sandbox-runtime（srt，Windows 版为 alpha，要管理员装一次）运行；
+    off = 不套沙箱，只靠 Claude Code 的权限规则（只管它自己的读写工具，管不住 Bash 命令），要用户明确选。
+    其他平台不看这一项。"""
+    v = _env("TICKETD_WIN_SANDBOX", "srt").strip().lower()
+    return v if v in ("srt", "off") else "srt"
+
+
+def srt_bin() -> str:
+    """sandbox-runtime 的命令行（npm 全局装的 srt，或它的完整路径）。"""
+    return _env("TICKETD_SRT", "srt")
+
+
+def codex_win_sandbox() -> str:
+    """Windows 上 Codex worker 的沙箱实现（Codex 的 [windows] sandbox）：unelevated（默认，不要管理员，
+    当前用户的受限令牌 + ACL，不能禁读）/ elevated（要管理员先跑一次 codex sandbox setup）/ mxc（Windows 11 24H2+）。"""
+    v = _env("TICKETD_CODEX_WIN_SANDBOX", "unelevated").strip().lower()
+    return v if v in ("unelevated", "elevated", "mxc") else "unelevated"
+
+
 def lark_bin() -> str:
     return _env("TICKETD_LARK", "lark-cli")
 

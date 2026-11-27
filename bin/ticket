@@ -5,5 +5,8 @@ DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 # 默认用系统自带的 /usr/bin/python3（macOS 和常见 Linux 发行版都有）；TICKETD_PYTHON 可指定别的解释器（3.9+），
 # 没指定且 /usr/bin/python3 不存在时退回 PATH 上的 python3
 PY="${TICKETD_PYTHON:-/usr/bin/python3}"
-if [ -z "${TICKETD_PYTHON:-}" ] && [ ! -x "$PY" ]; then PY=python3; fi
+if [ -z "${TICKETD_PYTHON:-}" ] && [ ! -x "$PY" ]; then
+  # Windows 的 Git Bash：PATH 上的 python3 常是应用商店的占位程序，用 py 启动器（spec §3.2）
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) PY=py;; *) PY=python3;; esac
+fi
 exec "$PY" -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from ticketd.cli import main; sys.exit(main())' "$DIR" "$@"

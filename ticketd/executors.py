@@ -11,7 +11,7 @@ import shlex
 import time
 from typing import Callable, Dict, List
 
-from . import config, perms, skills, worker
+from . import config, host, perms, skills, worker
 
 NAMES = ("claude", "codex")
 
@@ -39,6 +39,7 @@ class ClaudeExecutor(Executor):
     name = "claude"
 
     def build_command(self, ticket, grant_paths, prompt_text, net=None):
+        worker.windows_preflight(ticket)  # Windows：Git Bash、sandbox-runtime 不在就不起（spec §3.2）
         settings = perms.write_settings(ticket["id"], ticket["workdir"], grant_paths, net)
         cmd = worker.build_command(ticket, settings, prompt_text)
         plugin = skills.plugin_dir()  # 控制台下发的技能（spec §12）：只给 worker 加载，每轮按当时装着的
@@ -75,6 +76,9 @@ class CodexExecutor(Executor):
             "-c", 'shell_environment_policy.exclude=["*TOKEN*","*KEY*","*SECRET*"]',
             "-c", "developer_instructions=" + _toml_str(prompt_text),
         ]
+        if host.is_windows():
+            # Windows：Codex 自带的原生沙箱（spec §3.2）。unelevated 不要管理员；elevated / mxc 见 TICKETD_CODEX_WIN_SANDBOX
+            args += ["-c", "windows.sandbox=" + _toml_str(config.codex_win_sandbox())]
         if config.codex_model():
             args += ["-m", config.codex_model()]
         return args
@@ -115,7 +119,10 @@ def _unwrap_shell(command: str) -> str:
         words = shlex.split(command)
     except ValueError:
         return command
-    if len(words) == 3 and words[0].rsplit("/", 1)[-1] in ("zsh", "bash", "sh") and words[1] in ("-c", "-lc"):
+    prog = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower() if words else ""
+    if prog.endswith(".exe"):
+        prog = prog[:-4]
+    if len(words) == 3 and prog in ("zsh", "bash", "sh", "powershell", "pwsh") and words[1] in ("-c", "-lc", "-Command"):
         return words[2]
     return command
 

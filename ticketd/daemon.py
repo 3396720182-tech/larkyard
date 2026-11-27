@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import os
 import signal
 import sys
@@ -9,7 +8,7 @@ import time
 import traceback
 from typing import Optional
 
-from . import card, config, console, db, metrics, outbox, telemetry, update
+from . import card, config, console, db, host, metrics, outbox, telemetry, update
 from .scheduler import Scheduler
 
 ALERT_INTERVAL = 600.0
@@ -275,11 +274,16 @@ def _sync_workspace() -> None:
         print("ticketd: 主会话约定已换成本版模板（旧的备份在 %s）" % bak, flush=True)
 
 
+def stop_request_path():
+    """Windows 上请求守护进程正常停机的文件（见 main）。"""
+    return config.db_dir() / "daemon.stop"
+
+
 def main(argv=None) -> int:
     config.db_dir().mkdir(parents=True, exist_ok=True)
     lock_file = open(config.db_dir() / "daemon.lock", "w")  # 整个运行期间保持打开
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        host.FileLock(lock_file.fileno()).acquire(blocking=False)
     except OSError:
         print("ticketd already running", file=sys.stderr, flush=True)
         return 1
@@ -294,6 +298,16 @@ def main(argv=None) -> int:
 
     signal.signal(signal.SIGTERM, handle)
     signal.signal(signal.SIGINT, handle)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, handle)  # Windows：控制台里按 Ctrl+Break
+    stop_file = stop_request_path()
+    if host.is_windows():
+        # Windows 没有可投递给别的进程的 SIGTERM：停服务（scripts/windows/*.ps1、winsvc）写这个文件，
+        # 守护进程每轮看一眼，按和收到停机信号一样的流程退出（spec §3.2）
+        try:
+            stop_file.unlink()
+        except OSError:
+            pass
     throttle = _ErrorThrottle()
     media = MediaLane()
     updater = update.Updater(con)  # 没配置更新源时不发请求；切回后的私信、试用期确认在这里
@@ -302,6 +316,8 @@ def main(argv=None) -> int:
     print("ticketd started", flush=True)
     code = 0
     while not stop["flag"]:
+        if host.is_windows() and stop_file.exists():
+            break
         media.ensure()
         _guarded(throttle, "tick", sched.tick)
         _guarded(throttle, "card", lambda: card.refresh(con))  # 先发新单的状态卡，再发结果消息
