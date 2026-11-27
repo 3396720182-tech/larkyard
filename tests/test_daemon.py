@@ -49,6 +49,12 @@ class DaemonTest(TicketdTestCase):
         for key in ("ticket report", "dropped", "可写目录", "外部文本"):
             self.assertIn(key, text)
 
+    def test_worker_prompt_says_what_to_do_without_gen_image(self):
+        # T0098：同事电脑没装上生图技能时，worker 要给一句能照着做的话，不能自己找 key / 换接口
+        text = (REPO / "prompts" / "worker.md").read_text(encoding="utf-8")
+        for key in ("larkyard:gen-image", "LARKYARD_GATEWAY_STATE", "not_enrolled", "诊断包", "不要自己找 key"):
+            self.assertIn(key, text)
+
     def test_second_daemon_refuses_to_start(self):
         a = subprocess.Popen([str(REPO / "bin" / "ticketd")], env=dict(os.environ),
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

@@ -476,6 +476,10 @@ worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `e
 - **子令牌**：worker 每轮启动时守护进程在本机签（不联网）：`lys_1.<sub_id>.<工单号>.<到期 Unix 秒>.<base64url(HMAC-SHA256(sub_key, 前面这一串))>`，到期 = 现在 + min(单轮时长上限 + 10 分钟, 12 小时)。放进 worker 的环境变量 `LARKYARD_GATEWAY_TOKEN`，网关地址放 `LARKYARD_GATEWAY_URL`（守护进程自己环境里的同名变量不继承）。控制台用令牌摘要和 server-hmac 推出同一把 `sub_key` 验签（库里不存钥匙），用量记到子令牌绑定的工单号；网关令牌失效时子令牌一起失效。子令牌不能提交导演组申请（申请流程已取消）。沙箱外执行的脚本拿不到子令牌。
 - **谁能用**：控制台「网关」页的导演组决定。gen-image（控制台对所有入网的人下发，见上面「下发技能」）看到子令牌就先查 `/api/v1/gateway/me`：在导演组走网关；不在导演组、但本机配了自己的火山 key 才用自己的；都没有回「还没开通生图，找管理员」。
 - **采集清单不变**：领令牌不上报新内容；走网关的调用是同事主动使用的服务，网关按人、按工单号记用量（T0060 起就是这样）。
+- **调整（2026-11-27，T0098 生图触发体检）**：
+  - 领失败后不再一律等一小时：连续失败第 1～4 次后分别隔 5、10、15、30 分钟再领，之后每小时一次（`kv console.gateway_claim_fails` 记连续失败次数，领到或被吊销时清零；领到时 `console.gateway_claim_next` 也清零）。原因：刚入网时领失败一次，同事头一个小时就用不了生图；控制台限每台设备每小时 10 次，头一个小时最多领 5 次。旧版控制台（没有 `sub_key`）仍是一天一次。
+  - 没有子令牌时 worker 环境里设 `LARKYARD_GATEWAY_STATE`：`not_enrolled`（没入网）、`stopped`（已停止上报）、`pending`（已入网、还没领到）；领到时不设（守护进程环境里的同名变量不继承）。worker 读不到控制台目录、`ticket console status` 在 worker 里看不到入网状态，gen-image 以前只能请同事去终端查；现在按它说一句能照着做的话（找管理员入网 / 10 分钟后再试 / 发诊断包）。值只是这三个代号，不含令牌和路径。
+  - worker 约定（`prompts/worker.md`「生图、生视频」）：本机没有 `larkyard:gen-image` 技能时不自己写代码调别的接口、不找 key，报 blocked，按 `LARKYARD_GATEWAY_STATE` 写下一步。
 
 **出错记录和诊断包**（2026-11-23，T0073 调整）：行为以 `openspec/changes/add-console-problem-reports/` 为准。管理员要能看到「谁、哪台电脑、哪一步坏了」，但不碰同事的工作内容。
 - **清单 c2**：`console.CONSENTS` 里 c1、c2 并存（c1 文本和哈希不变）。新入网用 c2；本机 `console.json` 的 `consent_version` 决定心跳带不带出错记录。已入网的 c1 设备只有本人在终端执行 `ticket console accept`（打印全文 → `yes` → `POST /api/v1/device/consent`，控制台确认后才改本机）才升级；`ticket console accept c1` 改回。c1 设备的 `ticket console status` / `show` 提示怎么开启。
