@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import bridge, config, host, update
+from . import bridge, config, db, host, update
 
 DEFAULT_WORKSPACE = "~/larkyard-workspace"
 OWNER_WAIT = 300.0
@@ -354,7 +354,19 @@ class Wizard:
         if ask and not self.t.yes("⑤ 现在授权用户身份吗？（传视频、导入文档要用；以后可以 ticket setup --user-auth）", False):
             self.t.say("⑤ 用户身份：跳过")
             return
-        self.runner([str(bridge.lark_cli()), "auth", "login"], env=lark_env(profile), **self.t.child_io())
+        from . import userauth
+        # 需要的权限预先带上，不用在授权页手选（T0107）
+        p = self.runner([str(bridge.lark_cli()), "auth", "login", "--scope", " ".join(userauth.SCOPES)],
+                        env=lark_env(profile), **self.t.child_io())
+        if getattr(p, "returncode", 1) == 0:
+            try:  # 让守护进程马上查一次：查到可用就补发之前因为没授权没导入的文档
+                con = db.connect()
+                try:
+                    userauth.request_recheck(con)
+                finally:
+                    con.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def step_check(self) -> None:
         ticket = str(update.current_link() / "bin" / "ticket")

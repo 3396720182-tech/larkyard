@@ -174,6 +174,35 @@ def _problems(con) -> str:
     return _section("最近 %d 天的出错记录（带原文，最近的在前）" % PROBLEM_DAYS, out)
 
 
+UPLOAD_ALERTS = ("稿子导入云文档失败", "稿子覆盖原云文档失败", "授权后补发稿子失败", "视频没能传到云空间", "飞书用户身份")
+ALERT_ROWS = 15
+FAILURE_ROWS = 10
+
+
+def _uploads(con) -> str:
+    """飞书用户身份的状态和最近的导入 / 上传失败原因（T0107：原来诊断包看不到原因原文，只在本机 alerts.log 里）。
+    授权链接只写有没有、几点到期，不写设备码。"""
+    from . import userauth
+    lines = []
+    try:
+        lines += ["- " + x for x in userauth.status_lines(con)]
+    except Exception as e:  # noqa: BLE001
+        lines.append("- 用户身份状态读不出来（%s）" % e.__class__.__name__)
+    since = time.time() - PROBLEM_DAYS * 86400
+    try:
+        rows = con.execute("SELECT path, reason, created_at FROM doc_failures WHERE created_at>=? "
+                           "ORDER BY created_at DESC LIMIT ?", (since, FAILURE_ROWS)).fetchall()
+    except Exception:  # noqa: BLE001  表还没建：从没导入失败过
+        rows = []
+    lines.append("最近 %d 天没导入成云文档的稿子（最近的在前）：" % PROBLEM_DAYS)
+    lines += ["- %s %s：%s" % (_t(r["created_at"]), Path(r["path"]).name, r["reason"]) for r in rows] or ["- 没有"]
+    lines.append("告警日志里导入 / 上传 / 授权相关的原文（最近的在前）：")
+    text = _tail_file(config.logs_dir() / "alerts.log", 256 * 1024)
+    hits = [x for x in text.splitlines() if any(k in x for k in UPLOAD_ALERTS)][-ALERT_ROWS:]
+    lines += ["- " + x for x in reversed(hits)] or ["- 没有"]
+    return _section("飞书用户身份和最近的上传失败", lines)
+
+
 def _ticket(con, tid: str) -> tuple:
     """(工单概况, 过程.log 路径, .stderr.log 路径)。"""
     t = core.get(con, tid)
@@ -200,7 +229,7 @@ def _ticket(con, tid: str) -> tuple:
 def build(con, ticket: Optional[str] = None) -> str:
     """诊断包全文（已打码，≤CONTENT_LIMIT 字节）。优先保留：版本 / 系统 / 控制台、doctor、出错记录、工单概况和汇报；
     过程.log 和 .stderr.log 的末尾按剩下的空间截。"""
-    parts = [redact(_header(con)), redact(_doctor(con)), redact(_problems(con))]
+    parts = [redact(_header(con)), redact(_doctor(con)), redact(_problems(con)), redact(_uploads(con))]
     logs = []
     if ticket:
         sec, log, err = _ticket(con, ticket)

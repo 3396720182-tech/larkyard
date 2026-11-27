@@ -71,6 +71,12 @@ def samples():
     out.append(("结果卡 稿子导入失败", templates.with_doc_failures(
         templates.result_card(tid, t()["title"], wd, "ready", "一句话结果", [wd + "/稿子.md"], None, ["读代码"], 600),
         [("稿子.md", wd + "/稿子.md", "strict mode: user identity disabled")], wd)))
+    # 缺飞书用户身份授权（T0107）：私信主人的授权卡片、授权后补发文档的卡片
+    from ticketd import userauth
+    out.append(("授权链接私信", userauth.link_card("https://accounts.feishu.cn/oauth/v1/device/verify?user_code=X", 4)))
+    title = "📄 授权好了，补上 %s 没导入的文档" % tid
+    out.append(("授权后补发文档", templates.card(title, title, "之前因为没授权飞书用户身份没导入", "green", templates.doc_buttons(
+        [("结果.md", "https://example.feishu.cn/docx/x"), ("表.xlsx", "https://example.feishu.cn/sheets/y")]))))
     c = templates.result_card(tid, t()["title"], wd, "ready", "一句话结果", [wd + "/结果.md"], None, ["读代码"], 600)
     c["body"]["elements"].insert(len(c["body"]["elements"]) - 1, templates.note(templates.cost_hint(tid, 88, 30)))
     out.append(("结果卡 成本提示", c))

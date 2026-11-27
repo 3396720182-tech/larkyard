@@ -316,10 +316,16 @@ def _resolve_videos(card, workdir, ticket_id, drive_uploader=None, uploader=None
                 continue
             start = _clock()
             ok, info = drive_uploader(video, workdir, ticket_id)
+            # 已经传上去、只是查链接失败的不算没授权（查链接用的权限不在自检必需的那几项里）
+            auth = not ok and con is not None and not info.startswith("已上传") and _user_auth_failed(con, info)
             if ok or not _is_transient(info):
-                _metric(con, ticket_id, "media", "video:ok" if ok else "video:fail", _clock() - start,
-                        _file_size(video, workdir))
+                # 没授权飞书用户身份记成 video:auth：同一原因只经自检项 user_auth 报一次，不算媒体失败（T0107）
+                _metric(con, ticket_id, "media", "video:ok" if ok else "video:auth" if auth else "video:fail",
+                        _clock() - start, _file_size(video, workdir))
             if ok:
+                if con is not None:
+                    from . import userauth
+                    userauth.mark_ok(con)
                 url = info
                 # 上传前后各算一次哈希，一致才缓存：上传途中文件被改写时不把旧哈希记到新内容的链接上
                 if con is not None and digest and _video_digest(video, workdir) == digest:
@@ -679,6 +685,12 @@ def _send_row(r, sender, card_sender, con, video_sender=None, card_patcher=None,
     return sender(r["reply_to"], text, idem + "-t")
 
 
+def _user_auth_failed(con, info: str) -> bool:
+    """用户身份调用失败是不是因为没授权（是就记下来、要求守护进程私信授权链接）。"""
+    from . import userauth  # userauth 依赖 templates / metrics，本模块被它们之外的很多模块先导入
+    return userauth.mark_failure(con, info)
+
+
 def _doc_sources(con, r):
     """这一行结果的 (工作目录, 产物列表)；不是结果行或查不到时返回 None。"""
     if r["report_id"] is None:
@@ -702,7 +714,8 @@ def _doc_links(con, r, allow_import: bool = True) -> list:
         return []
     from . import publish  # publish 依赖本模块的 alert / _parse_json
     try:
-        return publish.doc_links(con, r["ticket_id"], src[0], src[1], allow_import=allow_import)
+        return publish.doc_links(con, r["ticket_id"], src[0], src[1], allow_import=allow_import,
+                                 reply_to=r["reply_to"])
     except sqlite3.OperationalError:
         raise  # 库的问题交给 flush 分类（锁等待退避 / 故障告警），不当成导入失败吞掉
     except Exception as e:  # 导入是锦上添花：任何意外都不能挡住结果送达

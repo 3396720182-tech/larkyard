@@ -340,7 +340,7 @@ def _status_lines(con, t) -> list:
 
 # ticket doctor 每一项的稳定英文 id（控制台心跳的 doctor.failed 用它，改名要同步控制台；格式 ^[a-z0-9_.-]{1,40}$）
 DOCTOR_IDS = ("config", "config.unknown", "workspace", "costs", "owner", "daemon", "dm", "update", "telemetry",
-              "console", "bridge")
+              "console", "bridge", "user_auth")
 
 
 def doctor_checks(con, dm: bool = False, costs: bool = True) -> list:
@@ -402,10 +402,21 @@ def doctor_checks(con, dm: bool = False, costs: bool = True) -> list:
         lines.append(("bridge", bridge.doctor_line()))
     except Exception as e:
         lines.append(("bridge", "⚠️ bridge 状态读不出来：%r" % (e,)))
+    try:
+        from . import userauth  # 只读守护进程记下的结论（心跳每 5 分钟调一次，不在这里跑 lark-cli）
+        lines.append(("user_auth", userauth.doctor_line(con)))
+    except Exception as e:
+        lines.append(("user_auth", "⚠️ 飞书用户身份状态读不出来：%r" % (e,)))
     return lines
 
 
 def cmd_doctor(con, a) -> str:
+    if not (os.environ.get("TICKETD_TICKET") or os.environ.get("TICKETD_SPOOL")):
+        try:
+            from . import userauth
+            userauth.refresh(con)  # 终端里现查一次（worker 里读不了钥匙串，lark-cli 会报成「没有 token」，不查）
+        except Exception:  # noqa: BLE001
+            pass
     lines = [line for _, line in doctor_checks(con, dm=getattr(a, "dm", False))]
     bad = sum(1 for line in lines if line.startswith("❌"))
     lines.insert(0, "配置自检：%s" % ("没有发现问题" if not bad else "%d 个问题" % bad))

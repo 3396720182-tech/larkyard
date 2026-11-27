@@ -11,14 +11,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 import subprocess
 import time
 from pathlib import Path
 from typing import List, Tuple
 
-from . import config, db, outbox
+from . import config, db, outbox, userauth
 
 DOC_TYPES = {".md": "docx", ".markdown": "docx", ".txt": "docx", ".docx": "docx",
              ".xlsx": "sheet", ".csv": "sheet", ".pptx": "slides"}
@@ -42,6 +41,11 @@ CREATE TABLE IF NOT EXISTS doc_targets(
 CREATE TABLE IF NOT EXISTS doc_failures(
   path TEXT NOT NULL, mtime REAL NOT NULL, size INTEGER NOT NULL, reason TEXT NOT NULL, created_at REAL NOT NULL,
   PRIMARY KEY(path, mtime, size)
+);
+-- 因为没授权飞书用户身份没导入的稿子：授权完成后补发到原来那条结果下面（userauth.backfill，T0107）
+CREATE TABLE IF NOT EXISTS auth_backfill(
+  ticket_id TEXT NOT NULL, path TEXT NOT NULL, reply_to TEXT NOT NULL, created_at REAL NOT NULL,
+  PRIMARY KEY(ticket_id, path)
 );
 """
 
@@ -118,13 +122,8 @@ def _error_text(data: dict, raw: str) -> str:
 
 
 def reason_text(err: str) -> str:
-    """给用户看的失败原因：lark-cli 报错 JSON 里的 message，否则原文；不超过 80 字。"""
-    m = re.search(r'"message":\s*"((?:[^"\\]|\\.)*)"', err or "")
-    text = m.group(1) if m else (err or "未知原因")
-    if "调用 lark-cli 失败" in (err or ""):
-        text = "调用 lark-cli 失败（网络或超时）"
-    text = " ".join(text.split())
-    return text if len(text) <= 80 else text[:80] + "…"
+    """给用户看的失败原因：中文归类 + 下一步（userauth.reason_text，T0107：原来是 lark-cli 的英文原文）。"""
+    return userauth.reason_text(err, "导入文档")
 
 
 def failures(con, ticket_id: str, workdir: str, artifacts: List[str]) -> List[Tuple[str, str, str]]:
@@ -169,9 +168,10 @@ def has_pending(con, ticket_id: str, workdir: str, artifacts: List[str]) -> bool
 
 
 def doc_links(con, ticket_id: str, workdir: str, artifacts: List[str],
-              allow_import: bool = True) -> List[Tuple[str, str]]:
+              allow_import: bool = True, reply_to: str = "") -> List[Tuple[str, str]]:
     """返回 [(文件名, 云文档链接)]。单个文件导入失败只记告警，不影响其余文件和结果送达。
-    allow_import=False 时只返回缓存里已有的链接，不调 lark-cli。"""
+    allow_import=False 时只返回缓存里已有的链接，不调 lark-cli。
+    因为没授权飞书用户身份失败的：记成没授权、要求发授权链接，并记下 reply_to，授权后补发（userauth）。"""
     con.executescript(SCHEMA)
     links: List[Tuple[str, str]] = []
     for p in candidates(con, ticket_id, workdir, artifacts):
@@ -201,12 +201,18 @@ def doc_links(con, ticket_id: str, workdir: str, artifacts: List[str],
                 outbox.alert("%s 稿子导入云文档失败（%s）：%s" % (ticket_id, p.name, e))
                 con.execute("INSERT OR REPLACE INTO doc_failures VALUES(?,?,?,?,?)",
                             (str(p), st.st_mtime, st.st_size, reason_text(str(e)), db.now()))
-                if not outbox._is_transient(str(e)):
+                if userauth.mark_failure(con, str(e)):
+                    # 同一原因只报一次：不算媒体失败（不进出错记录），只经自检项 user_auth 上报
+                    userauth.remember(con, ticket_id, str(p), reply_to)
+                    outbox._metric(con, ticket_id, "media", "doc:auth", time.monotonic() - start, st.st_size)
+                elif not outbox._is_transient(str(e)):
                     outbox._metric(con, ticket_id, "media", "doc:fail", time.monotonic() - start, st.st_size)
                 continue
             con.execute("INSERT OR REPLACE INTO doc_targets VALUES(?,?,?,?)", (ticket_id, str(p), url, db.now()))
         con.execute("INSERT OR REPLACE INTO published VALUES(?,?,?,?,?)",
                     (str(p), st.st_mtime, st.st_size, url, db.now()))
+        userauth.forget(con, ticket_id, str(p))
+        userauth.mark_ok(con)
         outbox._metric(con, ticket_id, "media", "doc:ok", time.monotonic() - start, st.st_size)
         links.append((p.name, url))
     return links

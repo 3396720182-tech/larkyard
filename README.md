@@ -169,7 +169,7 @@ curl -fsSL <发布地址>/install.sh | sh
 
 1. 按 `install.sh` 里写死的两把发版公钥指纹核对发布地址上的公钥，验签通道清单，下载并核对包；任何一步不对就停下，`~/.ticketd` 下不写任何东西。指纹和本仓库 [`install.sh`](./install.sh) 里的是同一份，可以互相比对。
 2. 装成受管安装（`~/.ticketd/app`，第一天就能自动更新），下载 Node 和 lark-cli 到 `~/.ticketd`（核对 SHA-256）。
-3. 进入 `ticket setup` 向导：① 扫码建飞书应用（已有就跳过；用已有应用加 `--app-id`）→ ② 工作区（默认 `~/larkyard-workspace`，写好工作区约定）→ ③ 装 bridge 服务、ticketd 服务和每天 04:07 的 bridge 重启窗口 → ④ 用 bot 身份查应用所有者，显示名字让你确认，写进 `TICKETD_OWNER`（不是你就在飞书里给 bot 发一个 6 位码）→ ⑤ 可选：用户身份授权（传视频、导入文档要用）→ ⑥ 自检，并让守护进程给你发一条测试私信。
+3. 进入 `ticket setup` 向导：① 扫码建飞书应用（已有就跳过；用已有应用加 `--app-id`）→ ② 工作区（默认 `~/larkyard-workspace`，写好工作区约定）→ ③ 装 bridge 服务、ticketd 服务和每天 04:07 的 bridge 重启窗口 → ④ 用 bot 身份查应用所有者，显示名字让你确认，写进 `TICKETD_OWNER`（不是你就在飞书里给 bot 发一个 6 位码）→ ⑤ 可选：用户身份授权（传视频、导入文档要用；跳过也行，守护进程发现没授权会用机器人私信你一个授权链接，点开同意就好）→ ⑥ 自检，并让守护进程给你发一条测试私信。
 
 - 参数：`sh -s -- --profile <名字> --workspace <目录> --app-id <已有应用> --channel early|canary --no-setup`。
 - 内部员工：用控制台「添加设备」给的命令（多了 `--console <地址> --enroll <入网码>`，装完接着入网，不用手抄指纹）。

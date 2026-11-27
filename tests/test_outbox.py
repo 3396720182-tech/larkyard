@@ -297,7 +297,7 @@ class OutboxTest(TicketdTestCase):
         os.environ["FAKE_LARK_PERMANENT"] = "1"
         self.outbox.flush(self.con)
         sent = " ".join(self.sent()[-1])
-        self.assertIn("稿子.md 没能导入云文档：boom", sent)
+        self.assertIn("稿子.md 没能导入云文档：飞书没能导入文档（原因：boom）", sent)  # T0107：中文 + 下一步
         self.assertIn("本机文件：稿子.md", sent)
         # 文件改过之后旧的失败记录不再算数
         wd = self.core.get(self.con, tid)["workdir"]
