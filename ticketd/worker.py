@@ -210,7 +210,7 @@ def worker_env(ticket) -> dict:
     env["TICKETD_TICKET"] = ticket["id"]
     env["TICKETD_SPOOL"] = str(Path(ticket["workdir"]) / ".reports")
     env["PATH"] = str(config.bin_dir()) + os.pathsep + env.get("PATH", "")
-    for name in (gateway.ENV_TOKEN, gateway.ENV_URL):
+    for name in (gateway.ENV_TOKEN, gateway.ENV_URL, gateway.ENV_STATE):
         env.pop(name, None)  # 只认这一轮签的，不继承守护进程环境里的
     env.update(gateway.worker_env(ticket["id"]))  # 生图网关的子令牌（spec §12），没入网 / 没领到时为空
     if executor_of(ticket) == "codex" and config.codex_home():

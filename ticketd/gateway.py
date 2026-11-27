@@ -10,7 +10,10 @@ worker 每一轮启动时，守护进程用 sub_key 在本机给这一单签一�
 - `LARKYARD_GATEWAY_URL`：网关地址（路径和火山方舟一样，…/api/v3）。
 gen-image 等技能看到这两个变量就默认走网关（在导演组才能用，额度和用量按人记），见技能自己的说明。
 
-- 没领到（旧版控制台、网络问题、控制台限流）：不设这两个变量，下次心跳再领（最多每小时一次）。
+- 没领到（旧版控制台、网络问题、控制台限流）：不设这两个变量，过 5、10、15、30 分钟再领，之后每小时一次（T0098：
+  以前一律一小时后再领，刚入网时领失败一次，头一个小时就用不了）。
+- 没有子令牌时设 `LARKYARD_GATEWAY_STATE` 说为什么：`not_enrolled`（没入网）、`stopped`（已停止上报：设备被吊销 / 退出）、
+  `pending`（已入网、还没领到）。worker 读不到控制台目录，gen-image 靠它告诉同事下一步（T0098）。
 - 领到后每小时用网关令牌查一次自己（GET /api/v1/gateway/me）：被吊销（401）就删掉，下次心跳重新领。
 - 退出控制台（--leave）、设备被吊销：控制台目录整个删掉 / 心跳停止，不再签子令牌。
 """
@@ -30,7 +33,8 @@ from . import config, console, metrics
 
 CLAIM_PATH = "/api/v1/gateway-token"
 ME_PATH = "/api/v1/gateway/me"
-CLAIM_EVERY = 3600          # 没领到时最多每小时领一次（控制台限每台设备每小时 10 次）
+CLAIM_EVERY = 3600          # 连续领失败后最多每小时领一次（控制台限每台设备每小时 10 次）
+RETRY_STEPS = (300, 600, 900, 1800)   # 头几次失败后隔多久再领（T0098）；再往后按 CLAIM_EVERY
 CHECK_EVERY = 3600          # 领到后多久查一次还有没有效（被作废时，worker 最多这么久拿到的是失效的子令牌）
 OLD_CONSOLE_BACKOFF = 86400 # 旧版控制台（不给子令牌钥匙）一天才再试一次
 TTL_MARGIN = 600            # 子令牌比单轮时长上限多活一点（启动、收尾的时间）
@@ -39,8 +43,10 @@ GW_TOKEN_RE = re.compile(r"^lyg_[A-Za-z0-9_-]{20,90}$")
 SUB_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 TICKET_RE = re.compile(r"^T[0-9]{1,6}$")
 NEXT_KEY = "console.gateway_claim_next"   # kv：没领到时，下一次最早什么时候再领
+FAILS_KEY = "console.gateway_claim_fails" # kv：连续领失败了几次（领到 / 被吊销后清零）
 ENV_TOKEN = "LARKYARD_GATEWAY_TOKEN"
 ENV_URL = "LARKYARD_GATEWAY_URL"
+ENV_STATE = "LARKYARD_GATEWAY_STATE"
 
 
 def path() -> Path:
@@ -109,7 +115,13 @@ def ensure(con, token: str, now: Optional[float] = None) -> Optional[str]:
             nxt = 0.0
         if now < nxt <= now + OLD_CONSOLE_BACKOFF:   # 还没到下一次（比这还远说明时钟被拨过，不认）
             return None
-        metrics.kv_set(con, NEXT_KEY, str(now + CLAIM_EVERY))
+        try:
+            fails = max(0, int(metrics.kv_get(con, FAILS_KEY) or 0))
+        except ValueError:
+            fails = 0
+        # 先记下一次（领的时候进程被杀也不会每次心跳都领）、失败次数，领到再清零
+        metrics.kv_set(con, NEXT_KEY, str(now + (RETRY_STEPS[fails] if fails < len(RETRY_STEPS) else CLAIM_EVERY)))
+        metrics.kv_set(con, FAILS_KEY, str(min(fails + 1, 99)))
         try:
             claim(token, now)
         except console.ConsoleError as e:
@@ -117,6 +129,8 @@ def ensure(con, token: str, now: Optional[float] = None) -> Optional[str]:
                 # 旧版控制台：每领一次都作废上一枚、多一条审计，退到一天一次
                 metrics.kv_set(con, NEXT_KEY, str(now + OLD_CONSOLE_BACKOFF))
             raise
+        metrics.kv_set(con, FAILS_KEY, "0")
+        metrics.kv_set(con, NEXT_KEY, "0")   # 领到了：以后不管因为什么没了，下次心跳就能重领
         return "claimed"
     if not 0 <= now - float(have.get("checked_at") or 0) < CHECK_EVERY:
         try:
@@ -125,6 +139,7 @@ def ensure(con, token: str, now: Optional[float] = None) -> Optional[str]:
             if e.status == 401:
                 remove()
                 metrics.kv_set(con, NEXT_KEY, "0")  # 下次心跳马上重新领
+                metrics.kv_set(con, FAILS_KEY, "0")
                 return "dropped"
             raise
         have["checked_at"] = now
@@ -140,15 +155,20 @@ def mint(sub_id: int, sub_key: str, ticket: str, exp: int) -> str:
 
 
 def worker_env(ticket_id: str, now: Optional[float] = None) -> dict:
-    """这一轮 worker 要加的环境变量（不联网）；没入网、已停止上报、没领到网关令牌、工单号不对时为空。"""
+    """这一轮 worker 要加的环境变量（不联网）：领到了是子令牌和网关地址；没入网、已停止上报、还没领到时只有
+    LARKYARD_GATEWAY_STATE（说为什么）；工单号不对、读不了控制台目录时为空。"""
+    if not TICKET_RE.match(str(ticket_id)):
+        return {}
     try:
-        if not TICKET_RE.match(str(ticket_id)) or not console.enrolled() or console.stopped_path().exists():
-            return {}
+        if not console.enrolled():
+            return {ENV_STATE: "not_enrolled"}
+        if console.stopped_path().exists():
+            return {ENV_STATE: "stopped"}
         have = load()
     except OSError:
         return {}
     if have is None:
-        return {}
+        return {ENV_STATE: "pending"}
     now = time.time() if now is None else now
     exp = int(now + min(TTL_MAX, config.turn_timeout() + TTL_MARGIN))
     return {ENV_TOKEN: mint(have["sub_id"], have["sub_key"], ticket_id, exp), ENV_URL: have["base_url"]}

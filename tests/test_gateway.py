@@ -104,27 +104,65 @@ class GatewayTest(ConsoleBase):
         finally:
             del os.environ[gateway.ENV_TOKEN]
 
-    def test_no_env_when_stopped_or_not_enrolled_or_bad_ticket(self):
+    def test_no_token_when_stopped_or_not_enrolled_or_bad_ticket(self):
+        # 没有子令牌时告诉技能为什么（T0098）：worker 读不到控制台目录，gen-image 以前只能请同事去终端查
         self.beat()
         self.assertEqual(gateway.worker_env("not-a-ticket"), {})
         console._write_private(console.stopped_path(), b"DeviceRevoked\n")
-        self.assertEqual(gateway.worker_env("T1"), {})
+        self.assertEqual(gateway.worker_env("T1"), {gateway.ENV_STATE: "stopped"})
         console.remove_local()  # --leave：控制台目录连同网关令牌一起删
-        self.assertEqual(gateway.worker_env("T1"), {})
+        self.assertEqual(gateway.worker_env("T1"), {gateway.ENV_STATE: "not_enrolled"})
         self.assertFalse(gateway.path().exists())
 
-    def test_old_console_or_failure_retries_hourly(self):
+    def test_enrolled_but_not_claimed_yet_is_pending(self):
+        self.fake.routes[("POST", gateway.CLAIM_PATH)] = (503, {"error": {"code": "GatewayUnavailable"}})
+        self.beat()
+        self.assertEqual(gateway.worker_env("T1"), {gateway.ENV_STATE: "pending"})
+        self.fake.routes[("POST", gateway.CLAIM_PATH)] = (200, dict(CLAIM))
+        self.beat(time.time() + 400)
+        env = gateway.worker_env("T1")
+        self.assertIn(gateway.ENV_TOKEN, env)
+        self.assertNotIn(gateway.ENV_STATE, env)
+
+    def test_daemon_env_gateway_state_not_inherited(self):
+        t = self.ticket()
+        self.beat()
+        os.environ[gateway.ENV_STATE] = "not_enrolled"
+        try:
+            env = worker.worker_env(t)
+            self.assertNotIn(gateway.ENV_STATE, env)   # 领到了：只有子令牌，没有守护进程环境里留下的状态
+            self.assertIn(gateway.ENV_TOKEN, env)
+        finally:
+            del os.environ[gateway.ENV_STATE]
+
+    def test_failure_retries_soon_then_backs_off_to_hourly(self):
+        # T0098：以前领失败一律一小时后再领，刚入网的头一个小时可能用不了；现在 5 → 10 → 15 → 30 → 60 分钟
         self.fake.routes[("POST", gateway.CLAIM_PATH)] = (404, {"error": {"code": "NotFound"}})
-        t0 = time.time()
-        self.beat(t0)
+        t = time.time()
+        self.beat(t)
         self.assertIsNone(gateway.load())
         self.assertTrue(any(c == "gateway_failed" for c, _ in self.events()))
-        self.fake.calls.clear()
-        self.beat(t0 + 600)
-        self.assertEqual(self.fake.paths(), ["/api/v1/heartbeat"])   # 一小时内不再领
+        for gap in (300, 600, 900, 1800, 3600, 3600):
+            self.fake.calls.clear()
+            self.beat(t + gap - 30)
+            self.assertEqual(self.fake.paths(), ["/api/v1/heartbeat"], gap)   # 还没到下一次
+            self.fake.calls.clear()
+            t += gap + 1
+            self.beat(t)
+            self.assertEqual(self.fake.paths()[-1], gateway.CLAIM_PATH, gap)
         self.fake.routes[("POST", gateway.CLAIM_PATH)] = (200, dict(CLAIM))
-        self.beat(t0 + 3700)
+        t += 3601
+        self.beat(t)
         self.assertIsNotNone(gateway.load())
+        # 领到后被吊销：马上重领，退避从头算
+        gateway.remove()
+        self.fake.routes[("POST", gateway.CLAIM_PATH)] = (503, {"error": {"code": "GatewayUnavailable"}})
+        t += 600
+        self.beat(t)
+        self.fake.calls.clear()
+        t += 301
+        self.beat(t)
+        self.assertEqual(self.fake.paths()[-1], gateway.CLAIM_PATH)
 
     def test_response_without_sub_key_not_saved_and_backs_off_a_day(self):
         self.fake.routes[("POST", gateway.CLAIM_PATH)] = (200, {"gateway_token": GTOK,
