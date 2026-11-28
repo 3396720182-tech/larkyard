@@ -73,7 +73,7 @@ Codex worker 的几点细节：
 | 执行器 | `ticketd/executors.py` | 把「用哪个 agent CLI 跑一轮」从调度器里拆出来：Claude Code 和 Codex 各一个实现，Codex 的事件翻译成同一种格式，状态卡、卡死检测、重试两边共用 |
 | 工作区约定 | `workspace/CLAUDE.md.tmpl` | 放进 bridge 工作目录的 `CLAUDE.md`：注意力原则、派单规则、追问与控制命令、诚实交付 |
 | 个人覆盖 | `workspace/CLAUDE.local.example.md`、`config.example.env` | 只属于你自己的偏好和配置，不进仓库 |
-| 打包的 bridge | `vendor/bridge.lock.json`、`vendor/runtime.json`、`scripts/build_bridge.py`、`ticketd/bridge.py` | 发版包里带的 bridge（收发飞书消息、驱动主会话，固定在 `vendor/bridge.lock.json` 记录的版本上），以及 Node、lark-cli 的版本和 SHA-256；安装到 `~/.ticketd`，服务定义由 Larkyard 写，不依赖 nvm / npm |
+| 打包的 bridge | `bridge/`、`vendor/runtime.json`、`scripts/build_bridge.py`、`ticketd/bridge.py`、`ticketd/bridgeidle.py` | 发版包里带的 bridge（收发飞书消息、驱动主会话；源码在 `bridge/`，发版时从 tag 构建），以及 Node、lark-cli 的版本和 SHA-256；安装到 `~/.ticketd`，服务定义由 Larkyard 写，不依赖 nvm / npm |
 | 一行安装 | `install.sh`、`ticketd/bootstrap.py`、`ticketd/setup.py` | 核对发版公钥和签名 → 装成受管安装 → 装运行时 → `ticket setup` 向导（扫码建应用、工作区、服务、认主人） |
 | 签名自动更新 | `ticketd/update.py`、`ticketd/updsig.py`、`ticketd/launcher.py`、`scripts/release.py` | 发布者本机签名发版；守护进程验签、空闲时安装；版本目录外的启动器管试用期，新版本自检不过自动切回（默认关闭，一行安装的已启用） |
 | 升级旧安装 | `ticketd/migrate.py`、`scripts/upgrade-offline.sh` | 把早期版本或 clone 装的 Larkyard 一条命令转成受管安装 + 打包的 bridge；发布地址打不开时用离线升级包 |
@@ -111,7 +111,7 @@ Codex worker 的几点细节：
 ```
 发布者的电脑（私钥只在这里）
   技能：同一把主私钥签名（命名空间 larkyard-skill）→ 交给控制台按人分发
-  git tag ─▶ scripts/build_bridge.py（按 vendor/bridge.lock.json 构建 bridge）
+  git tag ─▶ scripts/build_bridge.py（从这个 tag 的 bridge/ 源码构建 bridge）
           ─▶ scripts/release.py release（打包，主私钥签 canary / early / stable 三份清单）
           ─▶ release.py publish / publish-installer
                       │
@@ -124,7 +124,7 @@ Codex worker 的几点细节：
           │
           └─▶ 已装的机器：ticketd 每小时检查一次
                 验签、核对 SHA-256 → 空闲时切换 current → 启动器试用期（默认 10 分钟）→ 自检不过自动切回
-                bridge 不随之重启：新版本带的 bridge 在每天 04:07 的窗口换上，90 秒连不上飞书就切回
+                bridge 不随之重启：新版本带的 bridge 等它空闲 15 分钟再换上（最晚每天 04:07），90 秒连不上飞书就切回
 
   已入网的机器（可选）：ticketd 每 5 分钟向控制台报一次心跳
         技能摘要变了 → 领取 → 用信任的主公钥逐个验签（有一个不过整批不装）→ 换到 ~/.ticketd/skills/current
@@ -250,7 +250,7 @@ sudo loginctl enable-linger "$USER"
 
 **验证**：在飞书里给 bot 发一件要做几分钟的事。应该先收到开单回执，接着出现状态卡；在终端里 `ticket ls` 能看到这张单（一行安装的 `ticket` 在 `~/.ticketd/app/current/bin/`）。服务日志在 `~/.ticketd/logs/`，bridge 的在它的 profile 目录下的 `logs/`。
 
-**bridge**：`ticket bridge status` 看在用的 bridge、Node、lark-cli 版本和服务入口；Larkyard 自动更新只重启 ticketd，不打断主会话，新版本带的 bridge 在每天 04:07 的重启窗口换上（版本没变就不重启），急用可以 `ticket bridge restart`（会打断进行中的回复）。重启后 90 秒内没连上飞书会自动切回原来的 bridge 并私信你。
+**bridge**：`ticket bridge status` 看在用的 bridge、Node、lark-cli 版本和服务入口；Larkyard 自动更新只重启 ticketd，不打断主会话。新版本带的 bridge 由守护进程在 bridge 空闲时换上：每 5 分钟看一次 bridge 自己的日志，没有在跑的主会话、连续 15 分钟（`TICKETD_BRIDGE_IDLE_MINUTES`）没收到消息就重启一次 bridge；每天 04:07 的重启窗口照旧兜底（版本没变就不重启）。急用可以 `ticket bridge restart`（会打断进行中的回复）。重启后 90 秒内没连上飞书会自动切回原来的 bridge 并私信你。
 
 **卸载**：`scripts/uninstall.sh`（macOS 卸 launchd 服务，Linux 停掉并删除 systemd 用户服务；数据目录和工单目录保留）；bridge 服务用打包的 bridge 自带的 `unregister` 命令卸（`ticket bridge status` 的「启动命令」一行是它的完整入口，把其中的 `run …` 换成 `unregister`），每天的重启窗口删掉 `dev.larkyard.bridge-restart`；工作区的 `CLAUDE.md` 用 `setup-workspace.sh` 留下的备份还原。
 
@@ -292,6 +292,7 @@ sudo loginctl enable-linger "$USER"
 | `TICKETD_UPDATE_EVERY` | `3600` | 多久检查一次新版本（秒，下限 600），每次另加 0～1/6 间隔的随机抖动 |
 | `TICKETD_UPDATE_PROBATION` | `600` | 新版本的试用期（秒）：这之内没通过自检，启动器自动切回上一个版本 |
 | `TICKETD_UPDATE_STALE_DAYS` | `30` | 本机通道当前清单的签名时间早于这么多天，`ticket doctor` 标黄（可能被冻结在旧清单上） |
+| `TICKETD_BRIDGE_IDLE_MINUTES` | `15` | 新版本带的 bridge 待生效时，bridge 连续这么多分钟没人用（没收到消息、没有在跑的主会话）就自动换上；`0` = 只在每天 04:07 换 |
 
 安装时的变量：`TICKETD_HOME`（默认 `~/.ticketd`）、`TICKETD_LABEL`（默认 `dev.larkyard.ticketd`，Linux 上是 systemd 服务名）、bridge 的数据目录和 profile（变量名见 `scripts/install.sh` 开头）、`TICKETD_PYTHON`（Python 解释器，默认 `/usr/bin/python3`；`bin/ticket`、`bin/ticketd` 也认它；Linux 上总是写进服务环境，macOS 上显式指定时写进 plist）。
 
@@ -321,7 +322,7 @@ TICKETD_UPDATE_URL=https://updates.example.com/larkyard
 - 退回原来的就地运行：`~/.ticketd/app/current/bin/ticket update adopt --undo`（服务改回原克隆、工作区的 ticket 路径改回，原克隆要还在原来的位置），再删掉 `TICKETD_UPDATE_URL`。原克隆比正在运行的版本旧时会提示：退回后跑的是旧代码（数据库迁移只增不删，旧代码能照常读写）；要保持新版本先在克隆里 `git pull`。
 - 守护进程起不来、命令也用不了时：`ln -sfn versions/<旧版本> ~/.ticketd/app/current`，然后 `launchctl kickstart -k gui/$(id -u)/dev.larkyard.ticketd`（Linux：`systemctl --user restart dev.larkyard.ticketd`）。
 
-发布者：先 `scripts/build_bridge.py --out <目录>` 按 `vendor/bridge.lock.json` 构建要打包的 bridge（要 git、Node、pnpm），`release.py release --tag vX --key <主私钥> --bridge <目录>` 把它放进包的 `vendor/bridge/`（核对提交和内容摘要）；`release.py publish-installer --url <发布地址> --main <主公钥> --backup <备份公钥> --to <更新源>` 发布一行安装脚本和两把公钥（脚本里的指纹必须就是这两把，换钥后先改仓库里的 `install.sh`）。`scripts/release.py` 在你自己的电脑上从 git tag 打包、一次签齐 canary / early / stable 三份清单（`ssh-keygen -Y sign`，只接受 Ed25519），另能签回滚清单（最长 7 天有效）、按 7 天窗口预签 12 周暂停标记、用离线备份私钥签换钥清单；`release.py publish` 把签好的文件放到更新源。更新源上没有私钥。
+发布者：先 `scripts/build_bridge.py --ref vX --out <目录>` 从这个 tag 的 `bridge/` 源码构建要打包的 bridge（要 git、Node、pnpm），`release.py release --tag vX --key <主私钥> --bridge <目录>` 把它放进包的 `vendor/bridge/`（核对源码标识和内容摘要；`bridge/` 源码本身不进包）；`release.py publish-installer --url <发布地址> --main <主公钥> --backup <备份公钥> --to <更新源>` 发布一行安装脚本和两把公钥（脚本里的指纹必须就是这两把，换钥后先改仓库里的 `install.sh`）。`scripts/release.py` 在你自己的电脑上从 git tag 打包、一次签齐 canary / early / stable 三份清单（`ssh-keygen -Y sign`，只接受 Ed25519），另能签回滚清单（最长 7 天有效）、按 7 天窗口预签 12 周暂停标记、用离线备份私钥签换钥清单；`release.py publish` 把签好的文件放到更新源。更新源上没有私钥。
 - 撤回：已下载、还没装的版本，用一份指回当前版本的回滚清单撤回（客户端丢掉待装的包）；只把通道清单撤下（404）和更新源暂时不可达区分不了，不算撤回。
 - 序号全局递增：回滚清单、暂停标记和发布清单共用一个序号。提前签好、晚些才放出去的发布清单，如果中间签过回滚清单，序号会比客户端见过的小而被当成重放拒绝，要重新签。
 - 主私钥泄露：先发布当前窗口的暂停标记，再用离线备份私钥 `release.py rekey` 签一份换钥清单并发布；客户端换成新主公钥，旧主私钥签的东西全部失效。
@@ -376,7 +377,7 @@ bin/ticket doctor [--dm]                            # 配置自检：和守护�
 - Linux / WSL2 上的验证目前只有单测（mock 平台分支）和 CI（ubuntu-latest 上跑全部单测、真装一次 systemd 用户服务），还没有像 macOS 那样端到端实测过（`docs/spec.md` §6 的沙箱结论来自 macOS）。尤其没实测：Claude Code / Codex 的 bubblewrap 沙箱下 worker 的读写边界、Codex 授权仓库里 `.git` 是否只读（`TICKETD_CODEX_GIT_WRITABLE` 在 Linux 上的效果）、worker 沙箱里 lark-cli 的只读操作。
 - Linux 上 Claude Code 沙箱里的命令在独立的网络命名空间里，连不到宿主机 `localhost` 上的服务；WSL2 里 worker 默认也调不了 Windows 程序（`cmd.exe`、`/mnt/c/...` 下的 exe）。
 - WSL2 可能在所有 WSL 终端都关掉一段时间后停掉整个发行版，ticketd 和 bridge 也随之停止；要常驻就保持一个 WSL 终端开着，或用 Windows 任务计划在登录时启动一个常驻的 `wsl.exe` 进程。这一条随 WSL 版本变化，本仓库没有验证。
-- 打包的 bridge 固定在 `vendor/bridge.lock.json` 记录的版本上，只随 Larkyard 发版更新。
+- 打包的 bridge 由本仓库 `bridge/` 的源码构建，只随 Larkyard 发版更新；不再跟进上游，上游的修复需要时手工挑着搬。
 - 一行安装的扫码建应用（`ticket setup` 调 bridge 的 `profile create`）和「用 bot 身份查应用所有者」没在新租户上端到端实测过（单测和临时 HOME 里用替身走过全流程）；查不到所有者时会改用 6 位码。
 - 依赖 bridge 注入到每条消息顶部的 `<bridge_context>` 字段（`chatId`、`messageIds`、`senderId`）；bridge 改了格式时，工作区约定里的派单命令需要跟着改。
 - 主会话（bridge 里做判断和派单的那个会话）目前只在 Claude Code 上写过、验证过：工作区约定是 `CLAUDE.md`。bridge 的 Codex 主会话（profile `agentKind: "codex"`）还没验证；能路由给 Codex 的是 worker。

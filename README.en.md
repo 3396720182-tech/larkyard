@@ -73,7 +73,7 @@ A few details about Codex workers:
 | Executors | `ticketd/executors.py` | Separates "which agent CLI runs a turn" from the scheduler: one implementation for Claude Code and one for Codex; Codex events are translated into the same shape, so status cards, stall detection and retries are shared |
 | Workspace conventions | `workspace/CLAUDE.md.tmpl` | `CLAUDE.md` for the bridge workspace: the attention principle, dispatch rules, follow-ups and control commands, honest delivery |
 | Personal overrides | `workspace/CLAUDE.local.example.md`, `config.example.env` | Your own preferences and settings, never committed |
-| Bundled bridge | `vendor/bridge.lock.json`, `vendor/runtime.json`, `scripts/build_bridge.py`, `ticketd/bridge.py` | The bridge (Feishu messaging, drives the bridge session) pinned in `vendor/bridge.lock.json`, plus the Node and lark-cli versions and SHA-256s; installed under `~/.ticketd` with service definitions written by Larkyard, independent of nvm / npm |
+| Bundled bridge | `bridge/`, `vendor/runtime.json`, `scripts/build_bridge.py`, `ticketd/bridge.py`, `ticketd/bridgeidle.py` | The bridge (Feishu messaging, drives the bridge session; source in `bridge/`, built from the tag at release time), plus the Node and lark-cli versions and SHA-256s; installed under `~/.ticketd` with service definitions written by Larkyard, independent of nvm / npm |
 | One-line install | `install.sh`, `ticketd/bootstrap.py`, `ticketd/setup.py` | Check the release keys and signature → managed install → runtimes → the `ticket setup` wizard (QR app creation, workspace, services, owner detection) |
 | Signed self-update | `ticketd/update.py`, `ticketd/updsig.py`, `ticketd/launcher.py`, `scripts/release.py` | The publisher signs releases on their own machine; the daemon verifies and installs when idle; a launcher outside the version directories runs a probation period and switches back if the new version fails its self-check (off by default; on for one-line installs) |
 | Upgrading old installs | `ticketd/migrate.py`, `scripts/upgrade-offline.sh` | Turns an early or clone-based install into a managed install with the bundled bridge in one command; an offline upgrade bundle for when the release URL is unreachable |
@@ -111,7 +111,7 @@ you ──Feishu──▶ bridge (bundled) ────────────�
 ```
 publisher's machine (private keys live only here)
   skills: signed with the same main key (namespace larkyard-skill) → handed to the console for per-person delivery
-  git tag ─▶ scripts/build_bridge.py (builds the bridge pinned in vendor/bridge.lock.json)
+  git tag ─▶ scripts/build_bridge.py (builds the bridge from the tag's bridge/ source)
           ─▶ scripts/release.py release (package; main key signs canary / early / stable manifests)
           ─▶ release.py publish / publish-installer
                       │
@@ -124,7 +124,7 @@ publisher's machine (private keys live only here)
           │
           └─▶ installed machine: ticketd checks hourly
                 verify signature and SHA-256 → switch current when idle → launcher probation (10 min default) → switch back on failure
-                the bridge is not restarted: a new bundled bridge goes live in the daily 04:07 window, rolled back if it can't reach Feishu in 90 s
+                the bridge is not restarted: a new bundled bridge goes live once it has been idle 15 min (04:07 at the latest), rolled back if it can't reach Feishu in 90 s
 
   enrolled machine (optional): ticketd sends the console a heartbeat every 5 minutes
         skills digest changed → fetch → verify each against the trusted main key (one failure rejects the batch) → swap into ~/.ticketd/skills/current
@@ -351,8 +351,8 @@ bin/ticket doctor [--dm]                            # config check: environment 
 - On Linux / WSL2 the only verification so far is the unit tests (mocking the platform) and CI (all unit tests plus a real systemd user-service install on ubuntu-latest); there has been no end-to-end run like on macOS (the sandbox findings in `docs/spec.md` §6 come from macOS). Not yet measured in particular: the read/write boundary of workers under Claude Code's and Codex's bubblewrap sandboxes, whether `.git` in granted repos is read-only under Codex (what `TICKETD_CODEX_GIT_WRITABLE` does on Linux), and read-only lark-cli calls inside the worker sandbox.
 - On Linux, commands in Claude Code's sandbox run in their own network namespace and can't reach services on the host's `localhost`; in WSL2 workers can't launch Windows programs (`cmd.exe`, exes under `/mnt/c/...`) by default either.
 - WSL2 may shut the whole distribution down some time after the last WSL terminal closes, taking ticketd and the bridge with it. To keep them running, keep a WSL terminal open or have Windows Task Scheduler start a long-running `wsl.exe` process at logon. This depends on the WSL version and has not been verified here.
-- The bundled bridge is pinned to the version in `vendor/bridge.lock.json` and only changes with a Larkyard release.
-- Larkyard's own auto-update restarts only ticketd, never the bridge; a new bundled bridge goes live in the daily 04:07 restart window (no restart if unchanged) or with `ticket bridge restart`. A bridge that doesn't reconnect within 90 seconds is switched back and you get a DM.
+- The bundled bridge is built from the `bridge/` source in this repository and only changes with a Larkyard release; upstream is no longer followed, fixes from it are picked by hand when needed.
+- Larkyard's own auto-update restarts only ticketd, never the bridge mid-reply; a new bundled bridge goes live when the bridge is idle (the daemon reads the bridge's own log every 5 minutes: no bridge session running and no message for 15 minutes, `TICKETD_BRIDGE_IDLE_MINUTES`), with the daily 04:07 restart window as a backstop (no restart if unchanged), or with `ticket bridge restart`. A bridge that doesn't reconnect within 90 seconds is switched back and you get a DM.
 - QR app creation in the wizard (the bridge's `profile create`) and looking up the app owner as the bot have not been run end to end on a fresh tenant (unit tests and a throwaway-HOME run with stand-ins cover the flow); if the owner can't be looked up, the 6-digit code is used.
 - Relies on the `<bridge_context>` fields the bridge injects at the top of every message (`chatId`, `messageIds`, `senderId`); if the bridge changes them, the dispatch command in the workspace conventions must follow.
 - The bridge session (the one that triages and dispatches) has only been written for and tested on Claude Code: the workspace conventions are a `CLAUDE.md`. A Codex bridge session (profile `agentKind: "codex"`) is untested; what can be routed to Codex is the worker.

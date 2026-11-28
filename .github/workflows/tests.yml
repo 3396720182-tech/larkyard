@@ -26,6 +26,36 @@ jobs:
       - name: Card variants render
         run: /usr/bin/python3 scripts/validate_cards.py --dump > /dev/null
 
+  bridge:
+    # 打包进发版包的 bridge 的源码（bridge/，T0112 起在本仓库里维护）
+    name: bridge (node, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: bridge
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable pnpm
+        run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: bridge/pnpm-lock.yaml
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Test
+        run: pnpm test
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+
   telemetry-worker:
     name: telemetry backend (node)
     runs-on: ubuntu-latest

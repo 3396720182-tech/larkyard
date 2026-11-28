@@ -278,7 +278,8 @@ if __name__ == "__main__":
 
 
 class ReleaseBridgeTest(unittest.TestCase):
-    """tag 带 vendor/bridge.lock.json：必须给 --bridge，核对提交和内容，放进 vendor/bridge/，可复现。"""
+    """tag 里有 bridge/ 源码（T0112 起）：必须给 --bridge，BRIDGE.json 的 commit 要等于 <tag>:bridge 的树对象号，
+    放进 vendor/bridge/，源码本身不进包，可复现。"""
     run_tool = ReleaseTest.run_tool
     release = ReleaseTest.release
     write_version = ReleaseTest.write_version
@@ -287,16 +288,15 @@ class ReleaseBridgeTest(unittest.TestCase):
         ReleaseTest.setUp(self)
         from ticketd import bridge
         self.bridge_mod = bridge
-        (self.repo / "vendor").mkdir()
-        (self.repo / "vendor" / "bridge.lock.json").write_text(json.dumps({"repo": "x", "commit": "c" * 40,
-                                                                          "version": "0.7.1"}))
-        git(self.repo, "add", "-A")
-        git(self.repo, "commit", "-qm", "lock")
-        git(self.repo, "tag", "v0.3.1")
+        (self.repo / "bridge" / "src").mkdir(parents=True)
+        (self.repo / "bridge" / "package.json").write_text('{"name": "b", "version": "0.7.1"}\n')
+        (self.repo / "bridge" / "src" / "index.ts").write_text("export const x = 1;\n")
         self.write_version("0.3.1")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-qm", "v")
-        git(self.repo, "tag", "-f", "v0.3.1")
+        git(self.repo, "tag", "v0.3.1")
+        self.tree = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "v0.3.1:bridge"], capture_output=True,
+                                   text=True, check=True).stdout.strip()
         self.bdir = self.tmp / "bridge-out"
         (self.bdir / "bin").mkdir(parents=True)
         (self.bdir / "bin" / "lark-channel-bridge.mjs").write_text("// entry\n")
@@ -304,8 +304,8 @@ class ReleaseBridgeTest(unittest.TestCase):
         (self.bdir / "node_modules" / "dep" / "index.js").write_text("module.exports = 1\n")
         self.stamp()
 
-    def stamp(self, commit="c" * 40):
-        info = {"repo": "x", "commit": commit, "version": "0.7.1",
+    def stamp(self, commit=None):
+        info = {"repo": "larkyard", "commit": commit or self.tree, "version": "0.7.1",
                 "tree_sha256": self.bridge_mod.tree_digest(self.bdir)}
         (self.bdir / "BRIDGE.json").write_text(json.dumps(info))
 
@@ -322,6 +322,8 @@ class ReleaseBridgeTest(unittest.TestCase):
         self.assertIn("larkyard-0.3.1/vendor/bridge/bin/lark-channel-bridge.mjs", names)
         self.assertIn("larkyard-0.3.1/vendor/bridge/node_modules/dep/index.js", names)
         self.assertIn("larkyard-0.3.1/vendor/bridge/BRIDGE.json", names)
+        self.assertFalse([n for n in names if n.startswith("larkyard-0.3.1/bridge/")], "源码不进包")
+        self.assertIn("larkyard-0.3.1/ticketd/__init__.py", names)
         a = pkg.read_bytes()
         pkg.unlink()
         self.assertEqual(self.release("v0.3.1", "--bridge", str(self.bdir))[0], 0)
@@ -333,11 +335,11 @@ class ReleaseBridgeTest(unittest.TestCase):
         self.assertEqual(self.bridge_mod.tree_digest(dest / "vendor" / "bridge"),
                          json.loads((self.bdir / "BRIDGE.json").read_text())["tree_sha256"])
 
-    def test_wrong_commit_or_modified_tree_refused(self):
+    def test_wrong_source_or_modified_tree_refused(self):
         self.stamp(commit="d" * 40)
         code, out, err = self.release("v0.3.1", "--bridge", str(self.bdir))
         self.assertEqual(code, 1)
-        self.assertIn("锁文件", err)
+        self.assertIn("重新构建", err)
         self.stamp()
         (self.bdir / "node_modules" / "dep" / "index.js").write_text("evil\n")
         code, out, err = self.release("v0.3.1", "--bridge", str(self.bdir))
@@ -345,9 +347,27 @@ class ReleaseBridgeTest(unittest.TestCase):
         self.assertIn("不一致", err)
         self.assertFalse((self.out / "packages" / "larkyard-0.3.1.tar.gz").exists())
 
-    def test_bridge_for_tag_without_lock_refused(self):
+    def test_bridge_for_tag_without_source_refused(self):
         code, out, err = self.release("v0.3.0", "--bridge", str(self.bdir))
         self.assertEqual(code, 1)
+        self.assertIn("没有 bridge/", err)
+
+    def test_older_tag_with_lock_file_still_checked(self):
+        """T0112 以前的 tag 只有 vendor/bridge.lock.json：仍按锁文件里的提交核对（重打老版本用）。"""
+        git(self.repo, "checkout", "-q", "v0.3.0")
+        (self.repo / "vendor").mkdir()
+        (self.repo / "vendor" / "bridge.lock.json").write_text(json.dumps({"repo": "x", "commit": "c" * 40,
+                                                                          "version": "0.7.1"}))
+        self.write_version("0.2.9")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "old")
+        git(self.repo, "tag", "v0.2.9")
+        code, out, err = self.release("v0.2.9", "--bridge", str(self.bdir))
+        self.assertEqual(code, 1)
+        self.assertIn("重新构建", err)
+        self.stamp(commit="c" * 40)
+        code, out, err = self.release("v0.2.9", "--bridge", str(self.bdir))
+        self.assertEqual(code, 0, err)
 
 
 class PublishInstallerTest(unittest.TestCase):

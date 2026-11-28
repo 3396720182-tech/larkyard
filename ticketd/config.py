@@ -279,6 +279,15 @@ def update_every() -> int:
         return 3600
 
 
+def bridge_idle_minutes() -> int:
+    """新版本带的 bridge 待生效时，bridge 连续这么多分钟没人用（没收到消息、没有在跑的主会话）就由守护进程自动换上
+    （T0112）；0 = 关掉，只在每天 04:07 的重启窗口换。"""
+    try:
+        return max(0, int(_env("TICKETD_BRIDGE_IDLE_MINUTES", "15")))
+    except ValueError:
+        return 15
+
+
 def update_probation() -> int:
     """新版本的试用期（秒）：这之内没通过自检就由启动器切回上一个版本。"""
     try:

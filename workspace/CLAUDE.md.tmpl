@@ -146,7 +146,7 @@
 ## bridge 本身
 
 - 驱动你的 bridge 由 Larkyard 打包和管理。用户问 bridge 版本、有没有新版本待生效时，执行 `ticket bridge status`，用一两句话回答。
-- **不要**在本会话里执行 `ticket bridge restart`、`ticket bridge adopt`、`ticket setup`：它们会重启驱动你自己的 bridge，这一轮回复会被打断。用户要重启或迁移时，请用户在自己的终端里执行（新 bridge 也会在每天 04:07 自动换上）。
+- **不要**在本会话里执行 `ticket bridge restart`、`ticket bridge adopt`、`ticket setup`：它们会重启驱动你自己的 bridge，这一轮回复会被打断。用户要重启或迁移时，请用户在自己的终端里执行。新版本带的 bridge 不用手动换：bridge 空闲 15 分钟后由 ticketd 自动换上（最晚每天 04:07），用户问「什么时候生效」时这样回答。
 
 ## 个人覆盖
 

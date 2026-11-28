@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""按 vendor/bridge.lock.json 构建要打包进发版包的 lark-channel-bridge（只在发版机器上跑）。
+"""从仓库里的 bridge/ 源码构建要打包进发版包的 bridge（只在发版机器上跑）。
 
-  scripts/build_bridge.py --out <输出目录> [--cache <克隆缓存目录>] [--source <本地 fork 克隆>]
+  scripts/build_bridge.py --out <输出目录> [--ref <提交或 tag，默认 HEAD>] [--work <构建目录>]
 
-步骤：clone / fetch fork → 检出锁文件里的提交（核对 HEAD 和 package.json 版本）→ pnpm install --frozen-lockfile →
+步骤：取 <ref> 里 bridge/ 的 git 树（只用已提交的内容，不读工作树）→ 解到构建目录 → pnpm install --frozen-lockfile →
 pnpm build（含 Web 控制台）→ 组装输出目录：package.json、LICENSE、README*、bin/、dist/、按锁文件装的扁平生产依赖
 （pnpm --config.node-linker=hoisted，去掉 .bin、.pnpm、.modules.yaml 这类元数据）、THIRD_PARTY_NOTICES.md、BRIDGE.json。
+BRIDGE.json 的 commit 是 <ref>:bridge 的 git 树对象号（40 位）：源码一个字节不变它就不变，release.py 按它核对。
 输出目录里不能有链接；某个依赖既没有许可证文件也没有 license 字段就失败。需要 git、node、pnpm（corepack）和网络。
-之后：release.py release --tag vX --key <主私钥> --bridge <输出目录>
+之后：release.py release --tag vX --key <主私钥> --bridge <输出目录>（--ref 要和 tag 指向同一份 bridge/）
 """
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -39,35 +42,41 @@ def run(argv, cwd=None, env=None) -> str:
     return p.stdout
 
 
-def load_lock(repo: Path = REPO) -> dict:
-    lock = json.loads((repo / "vendor" / "bridge.lock.json").read_text(encoding="utf-8"))
-    for k in ("repo", "commit", "version"):
-        if not lock.get(k):
-            raise BuildError("bridge.lock.json 缺 %s" % k)
-    if len(lock["commit"]) != 40:
-        raise BuildError("bridge.lock.json 的 commit 要写 40 位")
-    return lock
+SOURCE_DIR = "bridge"
 
 
-def checkout(lock: dict, cache: Path, source: str = "") -> Path:
-    src = cache / "src"
-    if not (src / ".git").exists():
-        cache.mkdir(parents=True, exist_ok=True)
-        run(["git", "clone", "--quiet", source or lock["repo"], str(src)])
-    else:
-        run(["git", "-C", str(src), "fetch", "--quiet", source or lock["repo"], "+refs/heads/*:refs/remotes/lock/*"])
+def source_tree(repo: Path, ref: str) -> str:
+    """<ref>:bridge 的树对象号；ref 里没有 bridge/ 就失败。"""
     try:
-        run(["git", "-C", str(src), "-c", "advice.detachedHead=false", "checkout", "--quiet", "--force", lock["commit"]])
+        tree = run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "%s:%s" % (ref, SOURCE_DIR)]).strip()
+        kind = run(["git", "-C", str(repo), "cat-file", "-t", tree]).strip()
     except BuildError:
-        raise BuildError("fork 上没有提交 %s" % lock["commit"])
-    head = run(["git", "-C", str(src), "rev-parse", "HEAD"]).strip()
-    if head != lock["commit"]:
-        raise BuildError("检出的是 %s，不是锁文件里的 %s" % (head, lock["commit"]))
-    run(["git", "-C", str(src), "clean", "-fdxq", "-e", "node_modules"])
+        raise BuildError("%s 里没有 %s/ 源码" % (ref, SOURCE_DIR))
+    if kind != "tree" or len(tree) != 40:
+        raise BuildError("%s:%s 的树对象号不对：%s" % (ref, SOURCE_DIR, tree))
+    return tree
+
+
+def export_source(repo: Path, ref: str, work: Path) -> tuple:
+    """把 <ref>:bridge 解到 work/src（先清空）。返回 (树对象号, package.json 版本, 源码目录)。"""
+    tree = source_tree(repo, ref)
+    src = work / "src"
+    if src.exists():
+        shutil.rmtree(str(src))
+    src.mkdir(parents=True)
+    p = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", tree], capture_output=True)
+    if p.returncode != 0:
+        raise BuildError("git archive 失败：%s" % p.stderr.decode("utf-8", "replace").strip()[-800:])
+    with tarfile.open(fileobj=io.BytesIO(p.stdout)) as tf:
+        for m in tf.getmembers():
+            parts = m.name.split("/")
+            if m.name.startswith("/") or ".." in parts or not (m.isfile() or m.isdir()):
+                raise BuildError("bridge 源码里有不支持的条目：%s" % m.name)
+        tf.extractall(str(src))
     ver = json.loads((src / "package.json").read_text(encoding="utf-8")).get("version")
-    if ver != lock["version"]:
-        raise BuildError("package.json 的版本是 %s，锁文件写的是 %s" % (ver, lock["version"]))
-    return src
+    if not ver:
+        raise BuildError("bridge/package.json 没有 version")
+    return tree, ver, src
 
 
 def notices(node_modules: Path) -> str:
@@ -91,9 +100,8 @@ def notices(node_modules: Path) -> str:
     return "".join(parts)
 
 
-def build(out: Path, cache: Path, source: str = "", repo: Path = REPO) -> dict:
-    lock = load_lock(repo)
-    src = checkout(lock, cache, source)
+def build(out: Path, work: Path, ref: str = "HEAD", repo: Path = REPO) -> dict:
+    tree, version, src = export_source(repo, ref, work)
     env = dict(os.environ, CI="1")
     run(["pnpm", "install", "--frozen-lockfile"], cwd=src, env=env)
     run(["pnpm", "build"], cwd=src, env=env)
@@ -132,19 +140,19 @@ def build(out: Path, cache: Path, source: str = "", repo: Path = REPO) -> dict:
         digest = tree_digest(out)
     except BridgeError as e:
         raise BuildError(str(e))
-    info = {"repo": lock["repo"], "commit": lock["commit"], "version": lock["version"], "tree_sha256": digest}
+    info = {"repo": "larkyard", "source": SOURCE_DIR + "/", "commit": tree, "version": version, "tree_sha256": digest}
     (out / "BRIDGE.json").write_text(json.dumps(info, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     return info
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="build_bridge.py", description="按 vendor/bridge.lock.json 构建打包用的 bridge")
+    ap = argparse.ArgumentParser(prog="build_bridge.py", description="从仓库里的 bridge/ 源码构建打包用的 bridge")
     ap.add_argument("--out", required=True, help="输出目录（会被清空重建）")
-    ap.add_argument("--cache", default=str(Path.home() / ".larkyard-release" / "bridge-cache"), help="fork 克隆的缓存目录")
-    ap.add_argument("--source", default="", help="从这个本地克隆取提交（默认锁文件里的仓库地址）")
+    ap.add_argument("--ref", default="HEAD", help="取这个提交或 tag 里的 bridge/（默认 HEAD）")
+    ap.add_argument("--work", default=str(Path.home() / ".larkyard-release" / "bridge-build"), help="构建目录（每次清空源码）")
     a = ap.parse_args(argv)
     try:
-        info = build(Path(a.out).resolve(), Path(a.cache).expanduser(), a.source)
+        info = build(Path(a.out).resolve(), Path(a.work).expanduser(), a.ref)
     except (BuildError, OSError, ValueError) as e:
         print("build_bridge: %s" % e, file=sys.stderr)
         return 1

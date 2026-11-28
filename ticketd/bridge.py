@@ -32,6 +32,11 @@ TICKET_BIN_ENV = "LARKYARD_TICKET_BIN"         # bridge 派单用的 ticket 命�
 BRIDGE_ENTRY = Path("bin") / "lark-channel-bridge.mjs"
 PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64")
 ONLINE_EVENTS = (("ws", "connected"), ("supervisor", "profile-online"))
+STARTED_EVENT = ("supervisor", "profile-online")   # bridge 进程起来、profile 上线（重连不记这一条）
+# 「有人在用」的日志事件（空闲换新，T0112）：收消息、排队、并发池、会话、回复卡片、斜杠命令、会议里的动作
+ACTIVITY_PHASES = frozenset(("intake", "queue", "pool", "run", "agent", "flush", "prompt", "session", "card",
+                             "outbound", "reaction", "command", "stream", "quote", "media", "attachment", "meeting"))
+ACTIVITY_NOISE = frozenset((("meeting", "poll-failed"), ("meeting", "poll-page")))  # 卡住的会议轮询会一直刷
 _UNSAFE_UNIT = re.compile(r'[\s%$"\\]')
 
 
@@ -699,6 +704,52 @@ def online_since(profile: str, since: float, home: Optional[Path] = None) -> boo
     return False
 
 
+def _log_tail(p: Path, limit: int = 2 << 20) -> Optional[list]:
+    try:
+        with open(str(p), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - limit))
+            return f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+
+
+def activity(profile: str, home: Optional[Path] = None, now: Optional[float] = None) -> dict:
+    """从 bridge 自己的日志看它在不在忙（空闲换新用，T0112）。返回 {logs, busy, last}：
+    logs = 今天或昨天的日志至少读到一份；busy = 最近一次启动之后，并发池最后报的 active 大于 0（有主会话在跑）；
+    last = 最近一条「有人在用」的事件的时间（收到消息、排队、跑会话、回复、会议里的动作），没有为 None。
+    bridge 的其他日志（SDK 报错、长连接保活、会议轮询失败）一直在刷，不算有人在用。"""
+    logs = Path(home or lc_home()) / "profiles" / profile / "logs"
+    now = time.time() if now is None else now
+    lines, seen = [], False
+    for day in (1, 0):  # 先昨天再今天：按时间顺序走
+        tail = _log_tail(logs / ("bridge-%s.jsonl" % time.strftime("%Y%m%d", time.localtime(now - day * 86400))))
+        if tail is not None:
+            seen = True
+            lines += tail
+    active, last = 0, None
+    for line in lines:
+        if '"phase"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        key = (d.get("phase"), d.get("event"))
+        if key == STARTED_EVENT:
+            active = 0  # 进程刚起来，池子是空的（上一个进程没报 released 就被杀了也一样）
+            continue
+        if key[0] == "pool" and isinstance(d.get("active"), int):
+            active = d["active"]
+        if key[0] in ACTIVITY_PHASES and key not in ACTIVITY_NOISE:
+            ts = _parse_ts(d.get("ts", ""))
+            if ts is not None and (last is None or ts > last):
+                last = ts
+    return {"logs": seen, "busy": active > 0, "last": last}
+
+
 def wait_online(profile: str, since: float, timeout: float = HEALTH_WAIT, sleep=time.sleep, clock=time.time,
                 home: Optional[Path] = None) -> bool:
     deadline = clock() + timeout
@@ -724,26 +775,63 @@ def stale(app_current: Optional[Path] = None) -> Optional[tuple]:
     return cur.resolve(), new, old
 
 
+def service_outdated(sf: Path) -> bool:
+    """Larkyard 写的 bridge 服务文件缺了现在的模板该有的环境（refresh_service 会重写它）。"""
+    from . import update
+    return service_env(sf).get(TICKET_BIN_ENV) != str(update.app_dir() / "current" / "bin" / "ticket")
+
+
 def refresh_service(profile: str, sf: Path) -> bool:
     """Larkyard 写的 bridge 服务文件缺了它该有的环境（目前是 LARKYARD_TICKET_BIN：会议待办派单、工单快速通道都靠它）时
     按现在的模板重写，原有的 PATH、LARK_CHANNEL_HOME 和日志位置照旧。服务文件只在 setup / adopt 时写、自动更新不重写，
     较早接管的机器一直缺这个变量。返回是否重写了（重写了要重新加载服务，光重启进程读不到新环境）。"""
-    from . import update
-    env = service_env(sf)
-    want = str(update.app_dir() / "current" / "bin" / "ticket")
-    if env.get(TICKET_BIN_ENV) == want:
+    if not service_outdated(sf):
         return False
+    env = service_env(sf)
     out, err = service_logs(sf)
     _write(sf, render_bridge_service(profile, env.get("PATH") or service_path(),
                                      home=Path(env.get("LARK_CHANNEL_HOME") or lc_home()), stdout=out, stderr=err))
     return True
 
 
+def switch_unfinished(st: Optional[dict] = None) -> bool:
+    """上一次重启切了 bridge 链接、还没来得及重启服务就被打断（进程被杀、Ctrl-C）：链接已是新的、跑的还是旧进程，
+    stale() 看不出来。切链接时记 switching，记下这次重启的结果（last_restart）时清掉。"""
+    st = read_state() if st is None else st
+    return bool(st.get("switching"))
+
+
+class RestartBusy(BridgeError):
+    """另一个 bridge 重启正在进行（每天的重启任务、空闲换新、手动 restart 互斥）。"""
+
+
+def _restart_lock():
+    """拿到就返回打开的锁文件（关掉即释放），已被占用抛 RestartBusy。"""
+    import fcntl
+    bridge_home().mkdir(parents=True, exist_ok=True)
+    f = open(str(bridge_home() / "restart.lock"), "w")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        raise RestartBusy("另一个 bridge 重启正在进行，稍后再试")
+    return f
+
+
 def restart(profile: str = "", if_stale: bool = False, services: Optional[Services] = None,
-            fetch=fetch_verified, wait=wait_online, notify=None) -> list:
-    """切到当前版本带的 bridge（必要时）、确保运行时、重启 bridge 服务、确认在线；不在线就切回再重启一次。"""
-    from . import update
+            fetch=fetch_verified, wait=wait_online, notify=None, how: str = "") -> list:
+    """切到当前版本带的 bridge（必要时）、确保运行时、重启 bridge 服务、确认在线；不在线就切回再重启一次。
+    how 记进 last_restart（idle = 守护进程空闲时自动换的）。同一时间只有一个重启在做。"""
     _refuse_in_worker("ticket bridge restart")
+    lock = _restart_lock()
+    try:
+        return _restart(profile, if_stale, services, fetch, wait, notify, how)
+    finally:
+        lock.close()
+
+
+def _restart(profile, if_stale, services, fetch, wait, notify, how) -> list:
+    from . import update
     services = services or Services()
     profile = profile_name(profile)
     sf = bridge_service_file(profile)
@@ -757,14 +845,27 @@ def restart(profile: str = "", if_stale: bool = False, services: Optional[Servic
         target = None
     else:
         target = stale()
-    refreshed = refresh_service(profile, sf)
-    if if_stale and not target and not refreshed:
+    unfinished = switch_unfinished()
+    if if_stale and not target and not service_outdated(sf) and not unfinished:
         return ["bridge 已是当前版本带的那一份，不用重启"]
+    if unfinished and not target:
+        out.append("上次换到一半（改了链接或服务文件、没来得及重启 bridge），这次补上")
+    st = read_state()
+    st["switching"] = int(time.time())  # 从这里起改链接、改服务文件；记下结果（last_restart）时清掉
+    write_state(st)
+    refreshed = refresh_service(profile, sf)
     if refreshed:
         out.append("bridge 服务补上了 %s（重新加载服务）" % TICKET_BIN_ENV)
     home = Path(service_env(sf).get("LARK_CHANNEL_HOME") or lc_home())
     cur = Path(update.current_link()).resolve()
-    out += ensure_runtime(cur, fetch=fetch)
+    try:
+        out += ensure_runtime(cur, fetch=fetch)
+    except BaseException:
+        if not refreshed and not unfinished:  # 什么都还没改：不留「换到一半」
+            st = read_state()
+            st.pop("switching", None)
+            write_state(st)
+        raise
     old = ""
     st = read_state()
     if target:
@@ -788,12 +889,14 @@ def restart(profile: str = "", if_stale: bool = False, services: Optional[Servic
                        "tree_sha256": info.get("tree_sha256")})
             write_state(st)
         st = read_state()
-        st["last_restart"] = {"at": int(started), "ok": False, "why": "服务重启失败：%s" % e}
+        st["last_restart"] = _last(started, False, how, "服务重启失败：%s" % e)
+        st.pop("switching", None)
         write_state(st)
         raise
     if wait(profile, started - 1, home=home):
         st = read_state()
-        st["last_restart"] = {"at": int(started), "ok": True}
+        st["last_restart"] = _last(started, True, how)
+        st.pop("switching", None)
         write_state(st)
         update_pending_clear()
         out.append("bridge 已重启并连上飞书")
@@ -811,7 +914,8 @@ def restart(profile: str = "", if_stale: bool = False, services: Optional[Servic
         back = wait(profile, time.time() - 1, home=home)
         why += "，已切回原来的 bridge（%s）" % ("已连上" if back else "仍没连上，请看 bridge 日志")
     st = read_state()
-    st["last_restart"] = {"at": int(started), "ok": False, "why": why}
+    st["last_restart"] = _last(started, False, how, why)
+    st.pop("switching", None)
     write_state(st)
     if notify:
         try:
@@ -819,6 +923,15 @@ def restart(profile: str = "", if_stale: bool = False, services: Optional[Servic
         except Exception:
             pass
     raise BridgeError(why)
+
+
+def _last(started: float, ok: bool, how: str, why: str = "") -> dict:
+    d = {"at": int(started), "ok": ok}
+    if how:
+        d["how"] = how
+    if not ok:
+        d["why"] = why
+    return d
 
 
 def update_pending_clear() -> None:
@@ -879,8 +992,9 @@ def status_lines(profile: str = "") -> list:
     lines.append("lark-cli：%s（%s）" % (rv.get("lark_cli") or "未安装", lark_cli()))
     lr = read_state().get("last_restart")
     if lr:
-        lines.append("上次重启：%s %s%s" % (time.strftime("%m-%d %H:%M", time.localtime(lr.get("at", 0))),
-                                        "成功" if lr.get("ok") else "失败", "" if lr.get("ok") else "（%s）" % lr.get("why", "")))
+        lines.append("上次重启：%s %s%s%s" % (time.strftime("%m-%d %H:%M", time.localtime(lr.get("at", 0))),
+                                          "空闲时自动换新，" if lr.get("how") == "idle" else "",
+                                          "成功" if lr.get("ok") else "失败", "" if lr.get("ok") else "（%s）" % lr.get("why", "")))
     if read_state().get("adopted"):
         lines.append("迁移：已从分开安装迁移（ticket bridge adopt --undo 可以退回）")
     return lines
@@ -904,7 +1018,10 @@ def doctor_line(profile: str = "") -> str:
     if lr and not lr.get("ok"):
         return "❌ bridge：上次重启失败（%s）" % lr.get("why", "")
     if stale():
-        return "⚠️ bridge：新版本带的 bridge 待生效：每天 04:07 自动换上，或现在 ticket bridge restart（会打断进行中的回复）"
+        return ("⚠️ bridge：新版本带的 bridge 待生效：bridge 空闲 %d 分钟后自动换上（最晚每天 04:07），"
+                "或现在 ticket bridge restart（会打断进行中的回复）" % config.bridge_idle_minutes()
+                if config.bridge_idle_minutes() > 0 else
+                "⚠️ bridge：新版本带的 bridge 待生效：每天 04:07 自动换上，或现在 ticket bridge restart（会打断进行中的回复）")
     using = bridge_info(bridge_link()) or {}
     return "✅ bridge：Larkyard 管理 · %s（%s）" % (using.get("version", "?"), str(using.get("commit", ""))[:12])
 
