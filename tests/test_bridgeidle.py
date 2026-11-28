@@ -31,7 +31,7 @@ class LogMixin:
 
 class ActivityTest(LogMixin, BridgeTestBase):
     def test_no_logs(self):
-        self.assertEqual(bridge.activity("claude"), {"logs": False, "busy": False, "last": None})
+        self.assertEqual(bridge.activity("claude"), {"logs": False, "busy": False, "unknown": False, "last": None})
 
     def test_pool_counts_and_noise(self):
         now = time.time()
@@ -53,8 +53,34 @@ class ActivityTest(LogMixin, BridgeTestBase):
     def test_restart_resets_pool(self):
         now = time.time()
         self.log(now - 900, "pool", "acquired", active=1)  # 上一个进程没报 released 就被杀了
-        self.log(now - 800, "supervisor", "profile-online")
+        self.log(now - 600, "supervisor", "profile-online")
         self.assertFalse(bridge.activity("claude", now=now)["busy"])
+
+    def test_run_started_just_before_profile_online_is_kept(self):
+        """profile-online 记在长连接连上之后：补投的消息可能先开了会话，计数不能被清掉。"""
+        now = time.time()
+        self.log(now - 7200, "pool", "acquired", active=1)
+        self.log(now - 7200 + 5, "supervisor", "profile-online")
+        self.assertTrue(bridge.activity("claude", now=now)["busy"])
+
+    def test_quiet_days_use_the_latest_files(self):
+        now = time.time()
+        self.log(now - 5 * 86400, "pool", "released", active=0)  # 之后几天一行都没写
+        a = bridge.activity("claude", now=now)
+        self.assertTrue(a["logs"])
+        self.assertFalse(a["busy"])
+        self.assertFalse(a["unknown"])
+
+    def test_truncated_window_without_pool_events_is_unknown(self):
+        from unittest import mock
+        now = time.time()
+        self.log(now - 3000, "pool", "acquired", active=1)
+        for i in range(200):
+            self.log(now - 2000 + i, "sdk", "error", msg="x" * 100)
+        with mock.patch("ticketd.bridge.ACTIVITY_SCAN", 4096):
+            a = bridge.activity("claude", now=now)
+        self.assertTrue(a["unknown"])  # 开始的那条被挤出读的范围：不能当空闲
+        self.assertFalse(bridge.activity("claude", now=now)["unknown"])
 
     def test_reads_yesterday_too(self):
         now = time.time()
@@ -80,6 +106,10 @@ class IdleSwapMixin(LogMixin):
         self.online = True
         self.sent = []
         self.now = time.time()
+        os.environ["LARK_CHANNEL"] = "1"  # ticketd 服务的环境里就有（launchd / systemd 模板）
+
+    def call_restart(self, **kw):
+        return self.restart_fn()("claude", if_stale=True, in_daemon=True, **kw)
 
     def restart_fn(self):
         return functools.partial(bridge.restart, services=self.svc, fetch=self.fetch,
@@ -188,7 +218,7 @@ class IdleSwapMixin(LogMixin):
         held = bridge._restart_lock()
         try:
             with self.assertRaises(bridge.RestartBusy):
-                self.restart_fn()("claude", if_stale=True)
+                self.call_restart()
             self.quiet()
             self.assertTrue(self.run_lane(self.lane()))  # 每天的任务正在做：空闲换新让给它，不记失败
             self.assertNotIn("idle_attempt", bridge.read_state())
@@ -207,16 +237,41 @@ class IdleSwapMixin(LogMixin):
         self.quiet()
         self.assertEqual(bridgeidle.due(self.now)[2], "unfinished")
         self.assertTrue(self.run_lane(self.lane()))
-        self.assertEqual(self.svc.calls, [("restart", bridge.bridge_label("claude"))])
+        self.assertEqual([c[0] for c in self.svc.calls], ["load"])  # 被打断的那次可能改过服务文件：重新加载
         self.assertFalse(bridge.switch_unfinished())
-        out = self.restart_fn()("claude", if_stale=True)
+        out = self.call_restart()
         self.assertIn("不用重启", out[0])
+
+    def test_cli_restart_in_bridge_session_still_refused(self):
+        self.make_current("0.4.0", commit="2" * 40)
+        with self.assertRaises(bridge.BridgeError):
+            self.restart_fn()("claude", if_stale=True)  # 主会话里（LARK_CHANNEL=1）执行会把自己杀掉
+        self.assertEqual(self.svc.calls, [])
+        os.environ["TICKETD_TICKET"] = "T0001"
+        with self.assertRaises(bridge.BridgeError):
+            self.call_restart()  # worker 里一律不行
+
+    def test_someone_shows_up_while_runtime_downloads(self):
+        from unittest import mock
+        self.make_current("0.4.0", commit="2" * 40)
+        self.quiet()
+
+        def slow_runtime(*a, **k):
+            self.log(self.now, "pool", "acquired", active=1)  # 下载运行时期间来了一条消息
+            return ["Node 25.0.0"]
+        with mock.patch("ticketd.bridge.ensure_runtime", side_effect=slow_runtime):
+            self.assertTrue(self.run_lane(self.lane()))
+        self.assertEqual(self.svc.calls, [])
+        self.assertEqual(bridge.bridge_version_dir(), "0.3.0")
+        st = bridge.read_state()
+        self.assertNotIn("switching", st)
+        self.assertNotIn("idle_attempt", st)  # 不算失败，下次空闲再换
 
     def test_runtime_failure_leaves_no_unfinished_mark(self):
         self.make_current("0.4.0", commit="2" * 40, runtime=self.runtime_json(node_sha="e" * 64, node_v="25.0.0"))
         self.blobs.pop("e" * 64, None)
         with self.assertRaises(bridge.BridgeError):
-            self.restart_fn()("claude", if_stale=True)
+            self.call_restart()
         self.assertFalse(bridge.switch_unfinished())
         self.assertEqual(bridge.bridge_version_dir(), "0.3.0")
 

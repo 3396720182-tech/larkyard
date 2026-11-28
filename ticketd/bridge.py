@@ -704,50 +704,70 @@ def online_since(profile: str, since: float, home: Optional[Path] = None) -> boo
     return False
 
 
-def _log_tail(p: Path, limit: int = 2 << 20) -> Optional[list]:
+ACTIVITY_SCAN = 8 << 20      # 每份日志最多读最后 8MB（一直在刷的噪声一天几 MB，要盖住一次长会话）
+STARTUP_GRACE = 120.0       # 进程起来后、记 profile-online 之前就开始的会话（重连后补投的消息）
+
+
+def _log_tail(p: Path, limit: Optional[int] = None) -> Optional[tuple]:
+    """(行列表, 是否截掉了开头)；读不了返回 None。"""
+    limit = ACTIVITY_SCAN if limit is None else limit
     try:
         with open(str(p), "rb") as f:
             f.seek(0, 2)
-            f.seek(max(0, f.tell() - limit))
-            return f.read().decode("utf-8", "replace").splitlines()
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            return f.read().decode("utf-8", "replace").splitlines(), size > limit
     except OSError:
         return None
 
 
 def activity(profile: str, home: Optional[Path] = None, now: Optional[float] = None) -> dict:
-    """从 bridge 自己的日志看它在不在忙（空闲换新用，T0112）。返回 {logs, busy, last}：
-    logs = 今天或昨天的日志至少读到一份；busy = 最近一次启动之后，并发池最后报的 active 大于 0（有主会话在跑）；
+    """从 bridge 自己的日志看它在不在忙（空闲换新用，T0112）。返回 {logs, busy, unknown, last}：
+    logs = 读到了日志（最近的两份 bridge-<日期>.jsonl；安静的日子 bridge 一行都不写，所以不按今天昨天找）；
+    busy = 最近一次启动之后，并发池最后报的 active 大于 0（有主会话在跑）；
+    unknown = 读的范围被截断、里面又没有任何并发池或启动事件：看不出在不在忙（不能当空闲）；
     last = 最近一条「有人在用」的事件的时间（收到消息、排队、跑会话、回复、会议里的动作），没有为 None。
     bridge 的其他日志（SDK 报错、长连接保活、会议轮询失败）一直在刷，不算有人在用。"""
-    logs = Path(home or lc_home()) / "profiles" / profile / "logs"
-    now = time.time() if now is None else now
-    lines, seen = [], False
-    for day in (1, 0):  # 先昨天再今天：按时间顺序走
-        tail = _log_tail(logs / ("bridge-%s.jsonl" % time.strftime("%Y%m%d", time.localtime(now - day * 86400))))
-        if tail is not None:
-            seen = True
-            lines += tail
-    active, last = 0, None
+    d = Path(home or lc_home()) / "profiles" / profile / "logs"
+    try:
+        files = sorted(p for p in d.glob("bridge-*.jsonl") if re.fullmatch(r"bridge-\d{8}\.jsonl", p.name))[-2:]
+    except OSError:
+        files = []
+    lines, seen, cut = [], False, False
+    for f in files:  # 按日期从旧到新：按时间顺序走
+        got = _log_tail(f)
+        if got is None:
+            continue
+        seen = True
+        if got[1]:  # 开头被截掉了：前面那份接不上，从这里重新算
+            lines, cut = list(got[0]), True
+        else:
+            lines += got[0]
+    active, last, pool_ts, anchored = 0, None, None, False
     for line in lines:
         if '"phase"' not in line:
             continue
         try:
-            d = json.loads(line)
+            ev = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(d, dict):
+        if not isinstance(ev, dict):
             continue
-        key = (d.get("phase"), d.get("event"))
+        key = (ev.get("phase"), ev.get("event"))
+        ts = _parse_ts(ev.get("ts", ""))
         if key == STARTED_EVENT:
-            active = 0  # 进程刚起来，池子是空的（上一个进程没报 released 就被杀了也一样）
+            anchored = True
+            # 进程刚起来，池子是空的（上一个进程没报 released 就被杀了也一样）；但 profile-online 记在长连接连上之后，
+            # 这之前不久的并发池事件可能已经是新进程的（补投的消息），留着它的计数
+            if pool_ts is None or ts is None or ts - pool_ts > STARTUP_GRACE:
+                active = 0
             continue
-        if key[0] == "pool" and isinstance(d.get("active"), int):
-            active = d["active"]
+        if key[0] == "pool" and isinstance(ev.get("active"), int):
+            active, pool_ts, anchored = ev["active"], ts, True
         if key[0] in ACTIVITY_PHASES and key not in ACTIVITY_NOISE:
-            ts = _parse_ts(d.get("ts", ""))
             if ts is not None and (last is None or ts > last):
                 last = ts
-    return {"logs": seen, "busy": active > 0, "last": last}
+    return {"logs": seen, "busy": active > 0, "unknown": cut and not anchored, "last": last}
 
 
 def wait_online(profile: str, since: float, timeout: float = HEALTH_WAIT, sleep=time.sleep, clock=time.time,
@@ -819,18 +839,26 @@ def _restart_lock():
 
 
 def restart(profile: str = "", if_stale: bool = False, services: Optional[Services] = None,
-            fetch=fetch_verified, wait=wait_online, notify=None, how: str = "") -> list:
+            fetch=fetch_verified, wait=wait_online, notify=None, how: str = "", in_daemon: bool = False,
+            guard=None) -> list:
     """切到当前版本带的 bridge（必要时）、确保运行时、重启 bridge 服务、确认在线；不在线就切回再重启一次。
-    how 记进 last_restart（idle = 守护进程空闲时自动换的）。同一时间只有一个重启在做。"""
-    _refuse_in_worker("ticket bridge restart")
+    how 记进 last_restart（idle = 守护进程空闲时自动换的）。同一时间只有一个重启在做。
+    in_daemon：守护进程自己调用（空闲换新）。ticketd 服务的环境里也有 LARK_CHANNEL=1，但它不是 bridge 的子进程，
+    重启 bridge 不会连带杀掉自己，所以不按这个变量拒绝（worker 照样拒绝）。
+    guard：运行时准备好、动手改之前再调一次，返回非空（原因）就抛 NotIdle、什么都不改。"""
+    _refuse_in_worker("ticket bridge restart", restarts=not in_daemon)
     lock = _restart_lock()
     try:
-        return _restart(profile, if_stale, services, fetch, wait, notify, how)
+        return _restart(profile, if_stale, services, fetch, wait, notify, how, guard)
     finally:
         lock.close()
 
 
-def _restart(profile, if_stale, services, fetch, wait, notify, how) -> list:
+class NotIdle(BridgeError):
+    """空闲换新准备好之后再看一眼，bridge 又有人在用了：这次不换，什么都没改。"""
+
+
+def _restart(profile, if_stale, services, fetch, wait, notify, how, guard=None) -> list:
     from . import update
     services = services or Services()
     profile = profile_name(profile)
@@ -850,22 +878,19 @@ def _restart(profile, if_stale, services, fetch, wait, notify, how) -> list:
         return ["bridge 已是当前版本带的那一份，不用重启"]
     if unfinished and not target:
         out.append("上次换到一半（改了链接或服务文件、没来得及重启 bridge），这次补上")
+    home = Path(service_env(sf).get("LARK_CHANNEL_HOME") or lc_home())
+    cur = Path(update.current_link()).resolve()
+    out += ensure_runtime(cur, fetch=fetch)  # 可能要下载几分钟；失败就什么都不改
+    if guard is not None:
+        why = guard()
+        if why:
+            raise NotIdle(why)
     st = read_state()
-    st["switching"] = int(time.time())  # 从这里起改链接、改服务文件；记下结果（last_restart）时清掉
+    st["switching"] = int(time.time())  # 从这里起改服务文件、切链接；记下结果（last_restart）时清掉
     write_state(st)
     refreshed = refresh_service(profile, sf)
     if refreshed:
         out.append("bridge 服务补上了 %s（重新加载服务）" % TICKET_BIN_ENV)
-    home = Path(service_env(sf).get("LARK_CHANNEL_HOME") or lc_home())
-    cur = Path(update.current_link()).resolve()
-    try:
-        out += ensure_runtime(cur, fetch=fetch)
-    except BaseException:
-        if not refreshed and not unfinished:  # 什么都还没改：不留「换到一半」
-            st = read_state()
-            st.pop("switching", None)
-            write_state(st)
-        raise
     old = ""
     st = read_state()
     if target:
@@ -876,7 +901,7 @@ def _restart(profile, if_stale, services, fetch, wait, notify, how) -> list:
         out.append("bridge → %s（%s）" % (target[1].get("version"), str(target[1].get("commit"))[:12]))
     started = time.time()
     try:
-        if refreshed:
+        if refreshed or unfinished:  # 服务文件改过（这次或被打断的上一次）：重新加载，光重启读不到新环境
             services.load(bridge_label(profile), sf)
         else:
             services.restart(bridge_label(profile))
@@ -890,7 +915,8 @@ def _restart(profile, if_stale, services, fetch, wait, notify, how) -> list:
             write_state(st)
         st = read_state()
         st["last_restart"] = _last(started, False, how, "服务重启失败：%s" % e)
-        st.pop("switching", None)
+        if not (refreshed or unfinished):  # 服务文件已经改了却没加载上：留着标记，下次（每天的窗口）再加载
+            st.pop("switching", None)
         write_state(st)
         raise
     if wait(profile, started - 1, home=home):

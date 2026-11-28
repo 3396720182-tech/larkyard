@@ -48,22 +48,43 @@ def due(now: Optional[float] = None, hold: bool = False) -> tuple:
     last = bridge.read_state().get("idle_attempt") or {}
     if last.get("key") == key and not last.get("ok") and now - float(last.get("at") or 0) < FAIL_BACKOFF:
         return "上次空闲换新失败，等每天的重启窗口", "", ""
-    home = bridge.service_env(sf).get("LARK_CHANNEL_HOME") or None
-    act = bridge.activity(profile, home=home, now=now)
-    if not act["logs"]:
-        return "读不到 bridge 日志", "", ""
-    if act["busy"]:
-        return "bridge 有主会话在跑", "", ""
-    if act["last"] is not None and now - act["last"] < quiet * 60:
-        return "bridge %d 分钟内有人用过" % quiet, "", ""
+    why = idle_why(profile, now)
+    if why:
+        return why, "", ""
     return "", profile, key
 
 
-def _record(key: str, ok: bool, now: float, why: str = "") -> None:
+def idle_why(profile: str, now: Optional[float] = None) -> str:
+    """bridge 不空闲的原因；空串 = 空闲。看的是 bridge 自己的日志（bridge.activity）。"""
     from . import bridge
-    st = bridge.read_state()
-    st["idle_attempt"] = {"key": key, "ok": ok, "at": int(now), **({"why": why} if why else {})}
-    bridge.write_state(st)
+    now = time.time() if now is None else now
+    quiet = config.bridge_idle_minutes()
+    home = bridge.service_env(bridge.bridge_service_file(profile)).get("LARK_CHANNEL_HOME") or None
+    act = bridge.activity(profile, home=home, now=now)
+    if not act["logs"]:
+        return "读不到 bridge 日志"
+    if act["busy"]:
+        return "bridge 有主会话在跑"
+    if act["unknown"]:
+        return "日志里看不出 bridge 在不在忙"
+    if act["last"] is not None and now - act["last"] < quiet * 60:
+        return "bridge %d 分钟内有人用过" % quiet
+    return ""
+
+
+def _record(key: str, ok: bool, now: float, why: str = "") -> None:
+    """在重启锁里改 state.json（别的重启这时正在写它就不记：这条只用于退避，丢一次没关系）。"""
+    from . import bridge
+    try:
+        lock = bridge._restart_lock()
+    except bridge.RestartBusy:
+        return
+    try:
+        st = bridge.read_state()
+        st["idle_attempt"] = {"key": key, "ok": ok, "at": int(now), **({"why": why} if why else {})}
+        bridge.write_state(st)
+    finally:
+        lock.close()
 
 
 class Lane:
@@ -106,9 +127,13 @@ class Lane:
         from . import bridge
         restart = self._restart or bridge.restart
         try:
-            lines = restart(profile, if_stale=True, notify=self._notify or _notify_owner, how="idle")
+            lines = restart(profile, if_stale=True, notify=self._notify or _notify_owner, how="idle", in_daemon=True,
+                            guard=lambda: idle_why(profile, self.clock()))  # 下载运行时可能要几分钟：动手前再看一眼
         except bridge.RestartBusy:
             return  # 每天的重启任务或手动 restart 正在做：交给它
+        except bridge.NotIdle as e:
+            self.log("ticketd: bridge 空闲换新：准备好时又有人在用（%s），下次再换" % e, flush=True)
+            return
         except Exception as e:  # noqa: BLE001  restart 已经切回、记了 last_restart、私信过
             self.log("ticketd: bridge 空闲换新失败：%s" % e, flush=True)
             try:
