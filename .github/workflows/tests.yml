@@ -42,11 +42,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Enable pnpm
         run: corepack enable
+      # 不开 setup-node 的 pnpm 缓存：它在仓库根目录取 pnpm store 路径，和 bridge/ 里按 packageManager 选中的 pnpm 不一致，
+      # 收尾保存缓存时找不到目录，整个任务会被判失败
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: pnpm
-          cache-dependency-path: bridge/pnpm-lock.yaml
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Test
