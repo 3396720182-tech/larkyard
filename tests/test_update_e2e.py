@@ -53,6 +53,8 @@ class SelfUpdateE2E(unittest.TestCase):
         files = subprocess.run(["git", "-C", str(REPO), "ls-files", "-co", "--exclude-standard", "-z"],
                                capture_output=True, text=True, check=True).stdout.split("\0")
         for f in filter(None, files):
+            if f.startswith(("bridge/", "vendor/bridge.lock.json")):
+                continue  # 打包 bridge 要先构建（build_bridge.py），这里只测 Larkyard 自己的更新
             s = REPO / f
             if s.is_file():
                 d = self.repo / f

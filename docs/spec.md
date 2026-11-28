@@ -510,7 +510,7 @@ worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `e
 
 行为以 `openspec/changes/vendor-bridge-one-line-install/specs/`（`vendored-bridge`、`one-line-install`、`bridge-adopt`）为准，设计取舍见同目录的 `design.md`。架构不变：bridge 仍驱动主会话；这一节只管 bridge 怎么来、怎么装、怎么换。
 
-**来源和构建**：`vendor/bridge.lock.json` 写 fork 地址、40 位提交号和版本号。`scripts/build_bridge.py` 只按这个提交构建（检出后核对 `HEAD` 和 `package.json` 版本），输出 `bin/`、`dist/`、`package.json`、`LICENSE`、扁平的生产依赖（pnpm `node-linker=hoisted`，去掉 `.bin`、`.pnpm`、`.modules.yaml` 和依赖里的链接）、`THIRD_PARTY_NOTICES.md`（每个依赖的许可证文件，没有就写 `license` 字段，两者都没有就失败）、`BRIDGE.json`（`repo`、`commit`、`version`、`tree_sha256`）。`tree_sha256` = 按路径排序的「路径、权限（644/755）、内容 SHA-256」逐行再取 SHA-256，`BRIDGE.json` 本身不算，遇到链接或特殊文件就失败；构建、发版和本机共用 `bridge.tree_digest`。没有选单文件打包：`qrcode-terminal` 的八进制转义在 ESM 严格模式下编不过，飞书 SDK 读 `__dirname/../package.json`。
+**来源和构建**（**调整（2026-11-28，T0112）**：源码并入本仓库 `bridge/`，锁文件取消，见 §13.y）：`vendor/bridge.lock.json` 写 fork 地址、40 位提交号和版本号。`scripts/build_bridge.py` 只按这个提交构建（检出后核对 `HEAD` 和 `package.json` 版本），输出 `bin/`、`dist/`、`package.json`、`LICENSE`、扁平的生产依赖（pnpm `node-linker=hoisted`，去掉 `.bin`、`.pnpm`、`.modules.yaml` 和依赖里的链接）、`THIRD_PARTY_NOTICES.md`（每个依赖的许可证文件，没有就写 `license` 字段，两者都没有就失败）、`BRIDGE.json`（`repo`、`commit`、`version`、`tree_sha256`）。`tree_sha256` = 按路径排序的「路径、权限（644/755）、内容 SHA-256」逐行再取 SHA-256，`BRIDGE.json` 本身不算，遇到链接或特殊文件就失败；构建、发版和本机共用 `bridge.tree_digest`。没有选单文件打包：`qrcode-terminal` 的八进制转义在 ESM 严格模式下编不过，飞书 SDK 读 `__dirname/../package.json`。
 
 **发版**：tag 带锁文件时 `release.py release` 必须给 `--bridge`，`BRIDGE.json` 的提交等于锁文件、`tree_sha256` 等于目录实际内容才打包；文件放在包内 `vendor/bridge/` 下，按现有规则固定时间和权限（同一 tag、同一 bridge 字节相同），和仓库里被跟踪的文件重名就拒绝。清单字段不变，老客户端照常装（多出来的只是普通文件，`update.extract` 本来就只收普通文件和目录）。实测包约 5.6 MB（bridge 解开约 44 MB）。`publish-installer` 把 `install.sh`（填好默认发布地址）和 `keys/main.pub`、`keys/backup.pub` 放到更新源根目录，脚本里的指纹必须就是这两把（换钥后先改仓库里的 `install.sh`）。
 
@@ -518,7 +518,7 @@ worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `e
 
 **bridge 服务**：入口是 `~/.ticketd/runtime/node/bin/node ~/.ticketd/bridge/current/bin/lark-channel-bridge.mjs run --profile <p>`，服务名、日志位置和 bridge 自己装的一样（`lark-channel-bridge status/stop` 照常），环境里多一个 `LARKYARD_MANAGED=1` 用来认出是 Larkyard 写的。PATH：固定目录的 Node、`~/.ticketd/bin`、claude（和 codex）所在目录、系统目录。macOS 用 `plistlib` 生成，Linux 的 unit 拒绝含空白和 `% $ " \` 的路径。bridge 每次启动按自己的 Node 和入口重写 `~/.lark-channel/secrets-getter`，所以也指向固定目录；首次启动时 PATH 上有 lark-cli，bridge 自己执行 `config bind`（不在终端里也会做，只是不会用 npm 装 lark-cli）。
 
-**换 bridge**：`bridge/current` 是单独的链接，不直接用 `app/current`：Larkyard 自己更新（切 `current`）时正在跑的 bridge 不受影响。新版本确认后 `update.confirm` 调 `bridge.note_pending`：带的 bridge 和在用的不同（`commit` + `tree_sha256`）就记 `kv bridge.pending`，`ticket doctor` 显示待生效。每天 04:07 的 `ticket bridge restart --if-stale`：相同就什么都不做；不同就先 `ensure_runtime`（失败不切换）→ 切链接、`state.json` 记 `previous` → 服务管理器重启（launchd `kickstart -k`、systemd `restart`）→ 最多 90 秒看 bridge 当天和前一天的日志里重启之后有没有 `ws/connected` 或 `supervisor/profile-online` → 没有就切回 `previous`、再重启、私信主用户、`state.json` 记失败（`ticket doctor` 标红）。不在白天自动重启：bridge 没有「有没有进行中的回复」的对外接口，从外面猜空闲会打断主会话。Larkyard 切回旧版本后，下一个窗口发现不同，bridge 也跟着换回。`update.prune` 保留 `bridge/current` 和 `previous` 指向的版本目录。
+**换 bridge**：`bridge/current` 是单独的链接，不直接用 `app/current`：Larkyard 自己更新（切 `current`）时正在跑的 bridge 不受影响。新版本确认后 `update.confirm` 调 `bridge.note_pending`：带的 bridge 和在用的不同（`commit` + `tree_sha256`）就记 `kv bridge.pending`，`ticket doctor` 显示待生效。每天 04:07 的 `ticket bridge restart --if-stale`：相同就什么都不做；不同就先 `ensure_runtime`（失败不切换）→ 切链接、`state.json` 记 `previous` → 服务管理器重启（launchd `kickstart -k`、systemd `restart`）→ 最多 90 秒看 bridge 当天和前一天的日志里重启之后有没有 `ws/connected` 或 `supervisor/profile-online` → 没有就切回 `previous`、再重启、私信主用户、`state.json` 记失败（`ticket doctor` 标红）。不在白天自动重启：bridge 没有「有没有进行中的回复」的对外接口，从外面猜空闲会打断主会话。**调整（2026-11-28，T0112）**：改为空闲时也换，见 §13.y。Larkyard 切回旧版本后，下一个窗口发现不同，bridge 也跟着换回。`update.prune` 保留 `bridge/current` 和 `previous` 指向的版本目录。
 
 **一行安装**：`install.sh`（POSIX sh）只做核对：两把公钥按内置指纹（或 `--release-key` / `--backup-key`）核对 → `ssh-keygen -Y verify` 验通道清单 → 用 Python 检查清单字段 → 下载包、核对大小和 SHA-256 → 用系统 `tar` 只解出包里的 `ticketd/` → `python3 -m ticketd.bootstrap`。任何一步不对就停，`~/.ticketd` 下不写东西。发布地址只收 `https://`（`file://` 用于测试，会警告）。`bootstrap` 用包里同一份 `updsig` 再验一遍，然后：解包到 `versions/<版本>`（`update.unpack`）、拷启动器、切 `current`、写 `update-state.json`（`confirmed`）→ 主公钥或备份公钥和本机信任的不同才 `update.trust` → 序号不小于 `update.max_seq` 就按 `update._accept` 记下这份清单（守护进程第一次检查不会把它当新版本）→ `config.env` 不存在就从示例生成，只补没写过的 `TICKETD_UPDATE_URL` / `TICKETD_UPDATE_CHANNEL` → `ensure_runtime` → 没有 `bridge/current` 就建。已是这个版本只补缺的步骤；本机版本更高就不降级。之后 `install.sh` 从 `/dev/tty` 运行 `ticket setup`（没有终端就提示以后再跑）；带 `--enroll` 时接着 `ticket enroll <--console> <码> --release-key <内置指纹> --backup-key <内置指纹>`。脚本里的变量后面紧跟中文时写 `${变量}`：macOS 的 `/bin/sh`（bash 3.2）在 UTF-8 环境里会把中文字节当成变量名的一部分（`tests/test_install.py` 检查所有 `.sh`）。
 
@@ -560,6 +560,28 @@ worker 判断靠环境变量，worker 去掉变量再用伪终端可以发起 `e
 - 存量机器补环境变量：bridge 服务文件只在 `ticket setup` / `ticket bridge adopt` 时生成，自动更新不重写，较早接管的机器上一直没有 `LARKYARD_TICKET_BIN`（会议纪要的「派成工单」靠 PATH 兜底才能用，快速通道则不会启用）。`bridge.refresh_service` 在每次 `ticket bridge restart`（含每天 `--if-stale` 的定时重启和升级后的重启）时检查：缺这个变量或路径不对就按现在的模板重写，原有的 PATH、`LARK_CHANNEL_HOME`、日志位置照旧，并用 `load`（macOS bootout + bootstrap，Linux daemon-reload + restart）让新环境生效——光 kickstart 读不到改过的 plist；即使 bridge 已是当前版本，`--if-stale` 也会为此重启一次。两个平台都有单测。
 - 还没覆盖：原生 Windows（PR #43）用的是 npm 上的上游 bridge，没有这条快速通道；以后 Windows 改用打包的 bridge 时，`ticket.cmd` 不能被 Node 直接 spawn（新版 Node 拒绝不经 shell 执行 .cmd / .bat），执行器要改成经 shell 调用，并在 windows-latest 上补测试。
 - 测试（先写测试）：fork 里意图判断、路由、真实进程的执行器的单测，以及经 `startChannel` 跑完整收消息流程、用真实可执行的假 `ticket` 验证主会话一次都没启动的集成测试；fork 全部 837 个测试、类型检查、构建通过。
+
+### 13.y 源码并入仓库、空闲换新（2026-11-28，T0112）
+
+起因：0.3.13 的工单快速通道已经发出去，但新 bridge 要等到每天 04:07 的窗口才换上，当天白天一直「待生效」；改 bridge 要在 fork 和本仓库各提一次。用户的决定：bridge 闲下来就换；源码搬进来自己维护，不再跟上游同步。
+
+**源码并入仓库**
+- `bridge/` 是 fork 提交 804f150（上游 0.7.1 + 会议、附件、工单快速通道）的快照，fork 的历史留在 fork 仓库里。改动只有：去掉 fork 自己的 CI（并进 `.github/workflows/tests.yml` 的 `bridge` 任务，ubuntu + macOS，Node 20：test、typecheck、build）、一个测试里的应用 id 换成占位值、示例邮箱和文档链接的行标上 `check-private: ignore`。`bridge/LICENSE`（上游 MIT）保留，`NOTICE.md` 改成说明源码在这里。
+- `vendor/bridge.lock.json` 取消。`scripts/build_bridge.py --ref <tag>` 用 `git archive <tag>:bridge` 取已提交的源码（不读工作树），在构建目录里 `pnpm install --frozen-lockfile`、`pnpm build`，其余组装步骤不变。`BRIDGE.json` 的 `commit` 改为 `<tag>:bridge` 的 git 树对象号（40 位，源码一个字节不变它就不变；字段名不变，老客户端照常比较），`repo` 写 `larkyard`，多一个 `source: "bridge/"`。
+- `release.py release`：tag 里有 `bridge/` 时必须给 `--bridge`，`BRIDGE.json` 的 `commit` 必须等于这个 tag 的 `bridge/` 树对象号；更早的 tag 照旧按它的锁文件核对（重打老版本用）。`bridge/` 源码不进发版包（包里只有构建好的 `vendor/bridge/`）。
+- 实测：从 `bridge/` 构建出的 `dist/` 和 `node_modules/` 与 0.3.13 发出去的逐字节相同（只有 `README.md` 多了标注、`BRIDGE.json` 换了标识）；bridge 的 837 个测试在沙箱里 825 个通过，12 个是 UI 服务要在本机监听端口（沙箱禁止）。
+
+**空闲换新**（`ticketd/bridgeidle.py`，守护进程主循环每拍调 `Lane.tick`）
+- 节奏：每 5 分钟看一次（和控制台心跳同一节奏），只读文件、不发请求；真正的重启在后台线程里做，调的就是 `bridge.restart(if_stale=True, how="idle")`（同样的 `ensure_runtime`、切链接、90 秒在线确认、连不上切回并私信主用户）。
+- 什么时候换（`bridgeidle.due`）：`TICKETD_BRIDGE_IDLE_MINUTES`（默认 15，0 = 关掉）大于 0；调度器没有在装 Larkyard 更新（`update_hold`）；bridge 服务是 Larkyard 写的；Larkyard 不在试用期；有要换的东西——当前版本带的 bridge 和在用的不同、服务文件缺现在模板的环境（`service_outdated`，目前是 `LARKYARD_TICKET_BIN`）、或上次换到一半（见下）；同一个目标上次空闲换新失败还不到 24 小时的不再试（每天的窗口照旧）；bridge 空闲。
+- 空闲怎么看（`bridge.activity`，读 bridge 日志目录里日期最新的两份 `bridge-<日期>.jsonl`，各最后 8MB；安静的日子 bridge 一行都不写，所以不按今天昨天找）：按时间顺序走，`pool acquired / released` 带的 `active` 是当前在跑的主会话数，最后的 `active` 大于 0 算忙；`supervisor/profile-online`（进程起来）把计数清零——但它记在长连接连上之后，重启后补投的消息可能先开了会话，所以它之前 120 秒内的并发池计数留着。「有人在用」的事件：`intake`、`queue`、`pool`、`run`、`agent`、`flush`、`prompt`、`session`、`card`、`outbound`、`reaction`、`command`、`stream`、`quote`、`media`、`attachment`、`meeting`（不含一直在刷的 `poll-failed` / `poll-page`）；SDK 报错、长连接保活、`lark-info` 这些一直在刷的不算。最近一条「有人在用」早于 15 分钟（或读到的范围里没有）才算空闲；日志读不到不换；读的范围被截断、里面又没有任何并发池或启动事件（一次很长的会话的开头被噪声挤出去了）算「看不出」，不换。这些事件旧 bridge（0.3.13 及以前）就有，所以 0.3.13 待生效的机器升级到带这个功能的版本后，空闲时就会换上快速通道。
+- 动手前再看一眼：`ensure_runtime` 可能要下载几分钟，`restart` 的 `guard` 在运行时准备好、改任何东西之前再判断一次空闲，这时有人在用就抛 `NotIdle`、什么都不改、不算失败。
+- 守护进程里能重启：ticketd 服务的环境里本来就有 `LARK_CHANNEL=1`（launchd / systemd 模板），`restart` 原来见到它就拒绝（防主会话把自己杀掉）。守护进程不是 bridge 的子进程，空闲换新传 `in_daemon=True` 跳过这一条；worker 照样拒绝，命令行和主会话照旧拒绝。
+- 和别的重启互斥：`bridge.restart` 在 `~/.ticketd/bridge/restart.lock` 上拿非阻塞的 flock，拿不到抛 `RestartBusy`（每天的任务、手动 restart、空闲换新同一时间只有一个在做）；空闲换新遇到它直接让出、不记失败。守护进程在换 bridge 期间不调 `Updater.tick`（不装更新、不切回；最多几分钟），免得按退出码 75 退出时把换到一半的重启打断。
+- 换到一半：`restart` 在改服务文件、切链接之前记 `state.json` 的 `switching`，记下这次的结果（`last_restart`）时清掉；只有运行时准备失败、还什么都没改时也清掉。进程在中间被杀（守护进程退出、Ctrl-C）时链接或服务文件已经是新的、跑的还是旧进程，`stale()` 看不出来；`switch_unfinished()` 看到 `switching` 就让空闲换新和 `restart --if-stale` 再做一次，并且用重新加载服务（被打断的那次可能已经改了服务文件）。服务文件改了、加载却失败时标记留着，下一次再加载；空闲换新退避期间由每天的窗口重试。空闲换新记退避（`idle_attempt`）也在重启锁里写，拿不到锁就不记。
+- 记录：`last_restart` 多一个 `how: "idle"`（`ticket bridge status` 显示「空闲时自动换新」），`state.json` 的 `idle_attempt` 记最近一次空闲换新的目标、时间、成败。成功不发消息；失败由 `restart` 私信一次（和每天的窗口一样）。`ticket doctor` 的待生效提示改为「bridge 空闲 15 分钟后自动换上（最晚每天 04:07）」，主会话约定同步（上一版模板的摘要进 `CLAUDE.md.history`）。
+- 没覆盖的：日志判断不到的活动——会议里机器人只在听、没有提问时不写日志，空闲换新可能在会议中重启 bridge（会议状态本来就落盘，重启后 `resume` 接上，和每天的窗口一样）；主会话在跑时 `pool` 有记录，不会被打断。
+- 测试：`tests/test_bridgeidle.py`（日志判断含启动宽限、截断看不出、安静几天、两个平台的空闲换新、5 分钟节奏、失败退避、互斥、换到一半补救、服务环境补齐、下载期间来人不换、守护进程环境里的 LARK_CHANNEL）、`tests/test_build_bridge.py`（取源码）、`tests/test_release.py`（按树对象号核对、源码不进包、老 tag 按锁文件）。
 
 ## 14. 升级已有安装（2026-11-21，T0056）
 

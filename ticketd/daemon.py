@@ -9,7 +9,7 @@ import time
 import traceback
 from typing import Optional
 
-from . import card, config, console, db, metrics, outbox, telemetry, update, userauth
+from . import bridgeidle, card, config, console, db, metrics, outbox, telemetry, update, userauth
 from .scheduler import Scheduler
 
 ALERT_INTERVAL = 600.0
@@ -299,6 +299,7 @@ def main(argv=None) -> int:
     updater = update.Updater(con)  # 没配置更新源时不发请求；切回后的私信、试用期确认在这里
     beat = console.Heartbeat()  # 没入网时只看一眼 ~/.ticketd/console/，不发请求；入网后每 5 分钟在后台线程报一次
     auth = userauth.Lane()  # 飞书用户身份：定时查、缺授权时私信授权链接、授权后补发文档，都在后台线程里做
+    swap = bridgeidle.Lane()  # 新版本带的 bridge 待生效时，bridge 空闲就在后台线程里换上（每 5 分钟看一次日志）
     _sync_workspace()
     print("ticketd started", flush=True)
     code = 0
@@ -312,13 +313,15 @@ def main(argv=None) -> int:
         _guarded(throttle, "telemetry", lambda: telemetry.maybe_send(con))  # 默认关闭；开启后每天一份，发送在单独线程
         _guarded(throttle, "console", beat.tick)
         _guarded(throttle, "userauth", lambda: auth.tick(con))
+        _guarded(throttle, "bridge", lambda: swap.tick(hold=sched.update_hold))
         _beat()
         restart = {"go": False}
 
         def _upd():
             # 自检只看调度本身有没有在报错：飞书不通、发件箱报错这类旧版本一样会有的问题不算（不然一次断网就会误切回）
             restart["go"] = updater.tick(sched, media, healthy="tick" not in throttle.state)
-        _guarded(throttle, "update", _upd)
+        if not swap.busy():  # 正在换 bridge 时不装更新、不切回（退出会打断换到一半的重启）；最多几分钟
+            _guarded(throttle, "update", _upd)
         if restart["go"]:
             # 已切换版本：按停机流程退出，launchd（KeepAlive）/ systemd（Restart=always）经启动器拉起新版本
             print("ticketd restarting for update", flush=True)

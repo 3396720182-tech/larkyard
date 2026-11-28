@@ -24,13 +24,14 @@
 4. 新增配置项：加在 `ticketd/config.py`（经 `_env` 读取，自动支持 `config.env`），同步 `config.example.env` 和 README 的配置表。
 5. 用户可见的变化记到 `CHANGELOG.md`。
 
-## 上游边界
+## bridge 源码（`bridge/`）
 
-发版包里的 lark-channel-bridge 来自我们的 fork（`vendor/bridge.lock.json` 记录的固定提交，spec §13）。
-- bridge 的改动只进 fork 源码，带单测；不在本仓库里放 bridge 代码或补丁，也不再改 bridge 的编译产物。
-- 跟进上游：每季度或有需要的修复时，在 fork 上 rebase 到上游新版本、跑 fork 的测试，再改锁文件、`scripts/build_bridge.py` 构建、`release.py release --bridge` 发版。
-- 通用修复同时给上游提 PR，不等合并。
-- 只有 Larkyard 自己需要、上游不会要的改动（比如模型选项）留在 fork 的 `larkyard/vendor` 分支上。
+发版包里的 bridge 由本仓库 `bridge/` 下的源码构建（TypeScript，pnpm；T0112 起，spec §13「源码并入仓库」）。原来的 fork 和上游都不再跟进。
+- bridge 的改动直接改 `bridge/`，测试先行：`cd bridge && pnpm install && pnpm test && pnpm typecheck`（CI 的 `bridge` 任务在 ubuntu 和 macOS 上跑）。沙箱里 `tests/integration/ui/server.test.ts` 的 12 个用例要在本机监听端口，会失败，属环境限制；在 bridge 驱动的会话里跑时先清掉 `LARK_CHANNEL*`、`LARKSUITE_CLI_CONFIG_DIR`，否则 2 个用例会读到本机的 profile。
+- 不改编译产物；发版时 `scripts/build_bridge.py --ref <tag> --out <目录>` 从这个 tag 已提交的 `bridge/` 构建，`release.py release --bridge <目录>` 核对它的 `commit` 就是 `<tag>:bridge` 的树对象号。`bridge/` 源码本身不进发版包。
+- ticketd 读 bridge 日志里的几类事件判断它在线和空闲（`ticketd/bridge.py` 的 `ONLINE_EVENTS`、`STARTED_EVENT`、`ACTIVITY_PHASES`；并发池的 `pool acquired/released` 带 `active`）。改 bridge 的日志时别改掉这些。
+- `bridge/LICENSE`（上游 MIT 版权声明）和 `NOTICE.md` 要留着。
+- 上游以后的修复不会自动过来；需要时手工挑着搬，提交说明里写清来源。
 
 ## 去敏（每次提交前检查）
 

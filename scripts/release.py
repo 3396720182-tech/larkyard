@@ -2,7 +2,7 @@
 """Larkyard 的发版工具（openspec add-signed-self-update，格式见 docs/spec.md §11）。只在发布者自己的电脑上跑。
 
   release.py release  --tag v0.3.0 --key <主私钥> --bridge <build_bridge.py 的输出目录> [--min-from 0.2.0] [--notes ...]
-        从 tag 打出可复现的版本包（tag 带 vendor/bridge.lock.json 时必须给 --bridge，放进包的 vendor/bridge/），
+        从 tag 打出可复现的版本包（tag 里有 bridge/ 源码时必须给 --bridge，放进包的 vendor/bridge/；源码本身不进包），
         一次签齐 canary / early / stable 三份清单
   release.py rollback --version 0.2.1 --channel stable --key <主私钥> [--hours 72]
         给已发布过的旧版本签一份回滚清单（有效期默认 72 小时，最长 7 天），不重新打包
@@ -90,29 +90,46 @@ def check_clean(repo: Path) -> None:
         raise ReleaseError("工作树有未提交的改动，先提交或还原")
 
 
-def bridge_files(repo: Path, commit: str, bridge_dir) -> list:
-    """tag 带 vendor/bridge.lock.json 时：核对 --bridge 目录（BRIDGE.json 的提交 = 锁文件、tree_sha256 = 实际内容），
-    返回 [(包内相对路径, 权限, 内容)]，放到 vendor/bridge/ 下。tag 没有锁文件时不能给 --bridge。"""
+BRIDGE_SOURCE = "bridge/"   # 仓库里的 bridge 源码（T0112 起）：发版包只带 build_bridge.py 构建出的 vendor/bridge/
+
+
+def _bridge_want(repo: Path, commit: str) -> "str | None":
+    """这个 tag 要求的 bridge 标识（BRIDGE.json 的 commit）：有 bridge/ 源码时是它的 git 树对象号；
+    更早的 tag 用 vendor/bridge.lock.json 里 fork 的提交号；都没有返回 None（不打包 bridge）。"""
+    try:
+        tree = _git(repo, "rev-parse", "--verify", "--quiet", "%s:bridge" % commit).strip()
+        if _git(repo, "cat-file", "-t", tree).strip() == "tree":
+            return tree
+    except ReleaseError:
+        pass
     try:
         raw = _git(repo, "show", "%s:vendor/bridge.lock.json" % commit)
     except ReleaseError:
-        raw = None
+        return None
     try:
-        lock = json.loads(raw) if raw is not None else None
+        lock = json.loads(raw)
     except ValueError as e:
         raise ReleaseError("vendor/bridge.lock.json 不是合法的 JSON：%s" % e)
-    if lock is None:
+    return str((lock or {}).get("commit") or "")
+
+
+def bridge_files(repo: Path, commit: str, bridge_dir) -> list:
+    """tag 带 bridge 时：核对 --bridge 目录（BRIDGE.json 的 commit = 这个 tag 的 bridge/ 树对象号（老 tag 是锁文件里的提交）、
+    tree_sha256 = 实际内容），返回 [(包内相对路径, 权限, 内容)]，放到 vendor/bridge/ 下。tag 不带 bridge 时不能给 --bridge。"""
+    want = _bridge_want(repo, commit)
+    if want is None:
         if bridge_dir:
-            raise ReleaseError("这个 tag 没有 vendor/bridge.lock.json，不能打包 bridge")
+            raise ReleaseError("这个 tag 里没有 bridge/ 源码，不能打包 bridge")
         return []
     if not bridge_dir:
-        raise ReleaseError("这个 tag 要打包 bridge：先 scripts/build_bridge.py --out <目录>，再加 --bridge <目录>")
+        raise ReleaseError("这个 tag 要打包 bridge：先 scripts/build_bridge.py --ref <tag> --out <目录>，再加 --bridge <目录>")
     d = Path(bridge_dir)
     info = _bridge.bridge_info(d)
     if not info:
         raise ReleaseError("%s 里没有有效的 BRIDGE.json" % d)
-    if info.get("commit") != lock.get("commit"):
-        raise ReleaseError("bridge 目录是提交 %s 构建的，锁文件要的是 %s" % (info.get("commit"), lock.get("commit")))
+    if info.get("commit") != want:
+        raise ReleaseError("bridge 目录是从 %s 构建的，这个 tag 的 bridge 源码是 %s（用 build_bridge.py --ref <tag> 重新构建）"
+                           % (info.get("commit"), want))
     try:
         actual = _bridge.tree_digest(d)
     except _bridge.BridgeError as e:
@@ -132,7 +149,7 @@ def bridge_files(repo: Path, commit: str, bridge_dir) -> list:
 
 
 def build_package(repo: Path, commit: str, version: str, mtime: int, extra=()) -> bytes:
-    """只含该提交里被跟踪的文件（加上 extra：打包的 bridge）；固定 mtime（提交时间）、属主、权限和排序，
+    """只含该提交里被跟踪的文件（bridge/ 源码除外；加上 extra：构建好的 bridge）；固定 mtime（提交时间）、属主、权限和排序，
     gzip 头不带时间：同一 tag、同一 bridge 两次打包字节相同。"""
     prefix = "larkyard-%s" % version
     entries = []
@@ -140,6 +157,8 @@ def build_package(repo: Path, commit: str, version: str, mtime: int, extra=()) -
         if not line:
             continue
         meta, path = line.split("\t", 1)
+        if path.startswith(BRIDGE_SOURCE):
+            continue  # 源码不进包：客户端只用构建好的 vendor/bridge/
         mode, typ, obj = meta.split()
         if typ != "blob" or mode not in ("100644", "100755"):
             raise ReleaseError("不支持打包链接或子模块：%s" % path)
@@ -570,7 +589,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--min-from", default="0.0.0", help="最低可升级起点版本")
     r.add_argument("--notes", default="")
     r.add_argument("--repo", default=str(REPO))
-    r.add_argument("--bridge", help="scripts/build_bridge.py 的输出目录（tag 带 vendor/bridge.lock.json 时必须给）")
+    r.add_argument("--bridge", help="scripts/build_bridge.py --ref <tag> 的输出目录（tag 里有 bridge/ 源码时必须给）")
     rb = sub.add_parser("rollback")
     rb.add_argument("--version", required=True)
     rb.add_argument("--channel", required=True)
